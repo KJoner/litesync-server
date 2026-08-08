@@ -2,7 +2,9 @@
 package sync
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -64,16 +66,17 @@ type Options struct {
 
 type Service struct {
 	// 单用户场景：一个互斥锁串行化所有写操作，彻底避免 revision 检查的竞态。
-	mu    gosync.Mutex
-	db    *sql.DB
-	store *storage.Storage
-	blobs *storage.BlobStore
-	opts  Options
-	log   *slog.Logger
+	mu     gosync.Mutex
+	db     *sql.DB
+	store  *storage.Storage
+	blobs  *storage.BlobStore
+	shares *storage.ShareStore
+	opts   Options
+	log    *slog.Logger
 }
 
-func New(database *sql.DB, store *storage.Storage, blobs *storage.BlobStore, opts Options, logger *slog.Logger) *Service {
-	return &Service{db: database, store: store, blobs: blobs, opts: opts, log: logger}
+func New(database *sql.DB, store *storage.Storage, blobs *storage.BlobStore, shares *storage.ShareStore, opts Options, logger *slog.Logger) *Service {
+	return &Service{db: database, store: store, blobs: blobs, shares: shares, opts: opts, log: logger}
 }
 
 // validAction 校验客户端声明的上传动作类型。
@@ -355,6 +358,93 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 
 func (s *Service) LatestSequence() (int64, error) {
 	return db.LatestSequence(s.db)
+}
+
+// Snapshot 返回当前所有未删除文件的元数据与最新 sequence（Web 端与初次同步用）。
+func (s *Service) Snapshot() (int64, []db.File, error) {
+	files, err := db.ListFiles(s.db)
+	if err != nil {
+		return 0, nil, err
+	}
+	latest, err := db.LatestSequence(s.db)
+	if err != nil {
+		return 0, nil, err
+	}
+	return latest, files, nil
+}
+
+// CreateShare 保存分享密文并登记元数据（Phase 17）。
+// 服务器不持有 Share Key：内容是客户端用独立分享密钥加密后的 opaque bytes。
+func (s *Service) CreateShare(name string, expiresAt int64, body io.Reader) (*db.Share, error) {
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return nil, err
+	}
+	id := hex.EncodeToString(idBytes)
+
+	size, err := s.shares.Put(id, body)
+	if err != nil {
+		return nil, err
+	}
+	share := &db.Share{
+		ID:        id,
+		Name:      name,
+		Size:      size,
+		ExpiresAt: expiresAt,
+		CreatedAt: time.Now().Unix(),
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := db.InsertShare(s.db, share); err != nil {
+		s.shares.Remove(id) //nolint:errcheck
+		return nil, err
+	}
+	return share, nil
+}
+
+func (s *Service) ListShares() ([]db.Share, error) {
+	return db.ListShares(s.db)
+}
+
+// RevokeShare 撤销分享：标记 revoked 并删除密文文件（不影响原始 Vault）。
+func (s *Service) RevokeShare(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	share, err := db.GetShare(s.db, id)
+	if err != nil {
+		return err
+	}
+	if share == nil {
+		return ErrNotFound
+	}
+	if err := db.MarkShareRevoked(s.db, id); err != nil {
+		return err
+	}
+	if err := s.shares.Remove(id); err != nil {
+		s.log.Warn("failed to remove share content", "id", id, "error", err)
+	}
+	return nil
+}
+
+// OpenShare 公开读取分享内容；不存在 / 已撤销 / 已过期一律 ErrNotFound。
+func (s *Service) OpenShare(id string) (*db.Share, io.ReadCloser, error) {
+	share, err := db.GetShare(s.db, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if share == nil || share.Revoked {
+		return nil, nil, ErrNotFound
+	}
+	if share.ExpiresAt > 0 && time.Now().Unix() > share.ExpiresAt {
+		// 过期即失效；顺手清理密文文件
+		s.shares.Remove(id) //nolint:errcheck
+		return nil, nil, ErrNotFound
+	}
+	f, err := s.shares.Open(id)
+	if err != nil {
+		return nil, nil, ErrNotFound
+	}
+	return share, f, nil
 }
 
 // GetVaultKey 返回客户端存放的加密 vault key 文档（服务器视为 opaque JSON）。

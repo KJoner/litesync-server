@@ -3,11 +3,13 @@ package api
 
 import (
 	"encoding/json"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"time"
 
 	syncsvc "obsync/internal/sync"
+	"obsync/internal/web"
 )
 
 type Options struct {
@@ -38,6 +40,16 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/version", h.version)
 	mux.HandleFunc("GET /api/v1/vault-key", h.getVaultKey)
 	mux.HandleFunc("PUT /api/v1/vault-key", h.putVaultKey)
+	mux.HandleFunc("GET /api/v1/snapshot", h.snapshot)
+	mux.HandleFunc("POST /api/v1/share", h.createShare)
+	mux.HandleFunc("GET /api/v1/shares", h.listShares)
+	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
+
+	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
+	mux.HandleFunc("GET /share/{id}", h.getShare)
+	if dist, err := fs.Sub(web.Dist, "dist"); err == nil {
+		mux.Handle("GET /", http.FileServerFS(dist))
+	}
 
 	return requestLog(opts.Logger, authGate(opts.Token, mux))
 }

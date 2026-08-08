@@ -20,7 +20,7 @@ import (
 	syncsvc "obsync/internal/sync"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -59,8 +59,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init blob store: %w", err)
 	}
+	shares, err := storage.NewShareStore(filepath.Join(cfg.DataDir, "shares"))
+	if err != nil {
+		return fmt.Errorf("init share store: %w", err)
+	}
 
-	svc := syncsvc.New(database, store, blobs, syncsvc.Options{
+	svc := syncsvc.New(database, store, blobs, shares, syncsvc.Options{
 		HistoryEnabled:    cfg.HistoryEnabled,
 		HistoryDays:       cfg.HistoryDays,
 		HistoryMaxPerFile: cfg.HistoryMaxPerFile,

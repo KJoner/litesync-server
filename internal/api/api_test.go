@@ -59,8 +59,12 @@ func newTestEnvOpts(t *testing.T, maxFileSize int64, opts syncsvc.Options) *test
 	if err != nil {
 		t.Fatalf("init blob store: %v", err)
 	}
+	shares, err := storage.NewShareStore(filepath.Join(dir, "shares"))
+	if err != nil {
+		t.Fatalf("init share store: %v", err)
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := syncsvc.New(database, store, blobs, opts, logger)
+	svc := syncsvc.New(database, store, blobs, shares, opts, logger)
 	handler := api.New(api.Options{
 		Token:       testToken,
 		MaxFileSize: maxFileSize,

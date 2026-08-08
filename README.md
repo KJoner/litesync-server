@@ -94,6 +94,21 @@ sync.example.com {
 | GET | `/api/v1/version?path=...&revision=N` | 下载某历史版本的原始字节 |
 | GET | `/api/v1/vault-key` | 读取客户端存放的加密 vault key（opaque JSON） |
 | PUT | `/api/v1/vault-key?replace=true` | 保存 vault key；已存在且未 replace → 409 |
+| GET | `/api/v1/snapshot` | 当前全部未删除文件的元数据（Web 端 / 初次同步） |
+| POST | `/api/v1/share` | 创建分享（body 为独立 Share Key 加密的密文） |
+| GET | `/api/v1/shares` | 分享列表 |
+| DELETE | `/api/v1/share?id=...` | 撤销分享 |
+| GET | `/share/{id}` | **公开**读取分享密文（无认证；密钥在链接 fragment 中） |
+| GET | `/` | **公开** Web 只读端（embed 静态资源） |
+
+### Web 只读端（v0.4）
+
+服务器内嵌一个 Obsidian 风格的只读 Web 客户端（文件树 / Markdown 阅读 /
+Outline / 文件名搜索 / 版本历史 / Diff / E2EE 浏览器本地解密）。
+直接访问服务器根路径即可，输入 API Token 登录；E2EE Vault 需再输入
+E2EE 密码在浏览器本地解锁（**需要 HTTPS 或 localhost**，WebCrypto 限制）。
+前端源码在仓库 `web/`，构建产物已提交（`server/internal/web/dist`），
+服务器部署无需 Node；修改前端后执行 `cd web && npm run build` 再重新编译。
 
 ### 版本历史（v0.2）
 
