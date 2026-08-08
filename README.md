@@ -90,7 +90,10 @@ sync.example.com {
 | PUT | `/api/v1/file` | 上传原始字节，参数在请求 Header |
 | DELETE | `/api/v1/file` | 逻辑删除，Body: `{"path","baseRevision"}` |
 | GET | `/api/v1/history?path=...` | 历史版本列表（revision 降序） |
+| DELETE | `/api/v1/history?path=...&beforeRevision=N` | 清理该 revision 之前的历史（E2EE 迁移用） |
 | GET | `/api/v1/version?path=...&revision=N` | 下载某历史版本的原始字节 |
+| GET | `/api/v1/vault-key` | 读取客户端存放的加密 vault key（opaque JSON） |
+| PUT | `/api/v1/vault-key?replace=true` | 保存 vault key；已存在且未 replace → 409 |
 
 ### 版本历史（v0.2）
 
@@ -102,6 +105,14 @@ sync.example.com {
 - retention：保留最近 N 个 + 最近 N 天，最新版本永远保留；
   裁剪顺序为「先删元数据 → 确认 blob 无引用 → 再删 blob」
 - v0.1 升级：启动时自动为存量文件补记当前版本（幂等 backfill）
+
+### 端到端加密（v0.3）
+
+服务器对 E2EE **零感知**：加解密全部发生在客户端，服务器只是多存了
+一份客户端上传的加密 vault key 文档（`PUT /api/v1/vault-key`，本身也是
+密文）。启用 E2EE 后所有文件内容均为 `LSE1` 格式密文，`X-Content-Hash`
+即密文 hash；服务器永远无法获得解密密钥或任何明文。
+vault key 有覆盖保护（防止误覆盖导致密文数据永久不可读）。
 
 PUT 的 Header（路径必须 percent-encode，以支持中文等非 ASCII 文件名）：
 

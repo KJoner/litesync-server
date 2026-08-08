@@ -39,4 +39,10 @@ CREATE TABLE IF NOT EXISTS file_versions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_blob ON file_versions(blob_id);
+
+CREATE TABLE IF NOT EXISTS vault_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 `

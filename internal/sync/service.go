@@ -15,7 +15,12 @@ import (
 	"obsync/internal/storage"
 )
 
-var ErrNotFound = errors.New("file not found")
+var (
+	ErrNotFound       = errors.New("file not found")
+	ErrVaultKeyExists = errors.New("vault key already exists")
+)
+
+const vaultKeyMetaKey = "vault-key"
 
 // ConflictError 表示 baseRevision 与服务器当前 revision 不一致。
 // 携带服务器当前状态，客户端据此决定如何解决冲突。
@@ -350,6 +355,71 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 
 func (s *Service) LatestSequence() (int64, error) {
 	return db.LatestSequence(s.db)
+}
+
+// GetVaultKey 返回客户端存放的加密 vault key 文档（服务器视为 opaque JSON）。
+// 不存在时返回 ("", nil)。
+func (s *Service) GetVaultKey() (string, error) {
+	doc, ok, err := db.GetMeta(s.db, vaultKeyMetaKey)
+	if err != nil || !ok {
+		return "", err
+	}
+	return doc, nil
+}
+
+// SetVaultKey 保存加密 vault key 文档。
+// 已存在且未显式 replace 时拒绝——防止误覆盖导致已加密数据永久不可读。
+func (s *Service) SetVaultKey(doc string, replace bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists, err := db.GetMeta(s.db, vaultKeyMetaKey)
+	if err != nil {
+		return err
+	}
+	if exists && !replace {
+		return ErrVaultKeyExists
+	}
+	return db.SetMeta(s.db, vaultKeyMetaKey, doc, time.Now().Unix())
+}
+
+// PruneHistoryBefore 删除某路径 revision < before 的历史版本（E2EE 迁移：
+// 密文验证完成后清理明文历史）。最新版本永远保留；HEAD 与 changes 不受影响。
+func (s *Service) PruneHistoryBefore(path string, before int64) (int, error) {
+	if err := storage.ValidatePath(path); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	versions, err := db.ListVersions(s.db, path) // revision 降序
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var pruneBlobs []string
+	removed := 0
+	for i, v := range versions {
+		if i == 0 || v.Revision >= before {
+			continue // 最新版本永远保留
+		}
+		if _, err := tx.Exec(`DELETE FROM file_versions WHERE id = ?`, v.ID); err != nil {
+			return 0, err
+		}
+		removed++
+		if v.BlobID != "" {
+			pruneBlobs = append(pruneBlobs, v.BlobID)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.gcBlobs(pruneBlobs)
+	return removed, nil
 }
 
 // BackfillVersions 为升级前已存在、但还没有任何历史记录的文件补一条当前版本。

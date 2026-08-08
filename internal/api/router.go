@@ -34,7 +34,10 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
 	mux.HandleFunc("GET /api/v1/history", h.history)
+	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
 	mux.HandleFunc("GET /api/v1/version", h.version)
+	mux.HandleFunc("GET /api/v1/vault-key", h.getVaultKey)
+	mux.HandleFunc("PUT /api/v1/vault-key", h.putVaultKey)
 
 	return requestLog(opts.Logger, authGate(opts.Token, mux))
 }
