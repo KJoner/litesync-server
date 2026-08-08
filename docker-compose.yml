@@ -1,0 +1,18 @@
+services:
+  obsync:
+    build: .
+    restart: unless-stopped
+
+    environment:
+      # 在 .env 文件中设置 OBSYNC_TOKEN（参见 .env.example）
+      OBSYNC_TOKEN: ${OBSYNC_TOKEN:?please set OBSYNC_TOKEN in .env}
+      OBSYNC_DATA_DIR: /data
+      OBSYNC_MAX_FILE_SIZE: ${OBSYNC_MAX_FILE_SIZE:-104857600}
+      OBSYNC_LOG_LEVEL: ${OBSYNC_LOG_LEVEL:-info}
+
+    volumes:
+      - ./data:/data
+
+    # 只监听 localhost，通过 Caddy / Nginx / Cloudflare Tunnel 暴露 HTTPS
+    ports:
+      - "127.0.0.1:8080:8080"
