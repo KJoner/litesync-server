@@ -37,9 +37,11 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	if v := r.Header.Get("X-File-Mtime"); v != "" {
 		mtime, _ = strconv.ParseInt(v, 10, 64)
 	}
+	action := r.Header.Get("X-Action") // ""/upsert/merge/restore
+	deviceID := r.Header.Get("X-Device-ID")
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
-	res, err := h.svc.Upload(path, baseRevision, hash, body, mtime)
+	res, err := h.svc.Upload(path, baseRevision, hash, body, mtime, deviceID, action)
 	if err != nil {
 		h.writeUploadError(w, err)
 		return
@@ -117,7 +119,7 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	res, err := h.svc.Delete(req.Path, req.BaseRevision)
+	res, err := h.svc.Delete(req.Path, req.BaseRevision, r.Header.Get("X-Device-ID"))
 	if err != nil {
 		var conflict *syncsvc.ConflictError
 		switch {

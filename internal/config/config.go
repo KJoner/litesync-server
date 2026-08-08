@@ -15,6 +15,10 @@ type Config struct {
 	Token       string // OBSYNC_TOKEN, 必填
 	MaxFileSize int64  // OBSYNC_MAX_FILE_SIZE, 默认 100MB
 	LogLevel    slog.Level
+
+	HistoryEnabled    bool // OBSYNC_HISTORY_ENABLED, 默认 true
+	HistoryDays       int  // OBSYNC_HISTORY_DAYS, 默认 90（0 = 不按天数裁剪）
+	HistoryMaxPerFile int  // OBSYNC_HISTORY_MAX_PER_FILE, 默认 100（0 = 不限数量）
 }
 
 func Load() (*Config, error) {
@@ -39,6 +43,34 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid OBSYNC_MAX_FILE_SIZE: %q", v)
 		}
 		cfg.MaxFileSize = n
+	}
+
+	cfg.HistoryEnabled = true
+	cfg.HistoryDays = 90
+	cfg.HistoryMaxPerFile = 100
+	if v := strings.ToLower(os.Getenv("OBSYNC_HISTORY_ENABLED")); v != "" {
+		switch v {
+		case "true", "1", "yes":
+			cfg.HistoryEnabled = true
+		case "false", "0", "no":
+			cfg.HistoryEnabled = false
+		default:
+			return nil, fmt.Errorf("invalid OBSYNC_HISTORY_ENABLED: %q", v)
+		}
+	}
+	if v := os.Getenv("OBSYNC_HISTORY_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid OBSYNC_HISTORY_DAYS: %q", v)
+		}
+		cfg.HistoryDays = n
+	}
+	if v := os.Getenv("OBSYNC_HISTORY_MAX_PER_FILE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid OBSYNC_HISTORY_MAX_PER_FILE: %q", v)
+		}
+		cfg.HistoryMaxPerFile = n
 	}
 
 	switch strings.ToLower(getenv("OBSYNC_LOG_LEVEL", "info")) {

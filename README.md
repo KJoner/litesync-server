@@ -60,9 +60,12 @@ $env:OBSYNC_TOKEN = 'your-random-token'; go run ./cmd/obsync
 |---|---|---|
 | `OBSYNC_TOKEN` | （必填） | API Token，建议 `openssl rand -hex 32` 生成 |
 | `OBSYNC_LISTEN` | `:8080` | 监听地址 |
-| `OBSYNC_DATA_DIR` | `./data` | 数据目录（SQLite + Vault 文件） |
+| `OBSYNC_DATA_DIR` | `./data` | 数据目录（SQLite + Vault 文件 + 历史 blob） |
 | `OBSYNC_MAX_FILE_SIZE` | `104857600` | 单文件大小上限（字节，默认 100MB） |
 | `OBSYNC_LOG_LEVEL` | `info` | debug / info / warn / error |
+| `OBSYNC_HISTORY_ENABLED` | `true` | 版本历史开关 |
+| `OBSYNC_HISTORY_DAYS` | `90` | 历史保留天数（0 = 不按天数裁剪） |
+| `OBSYNC_HISTORY_MAX_PER_FILE` | `100` | 每文件保留版本数（0 = 不限） |
 
 ## HTTPS（生产环境必须）
 
@@ -86,6 +89,19 @@ sync.example.com {
 | GET | `/api/v1/file?path=...` | 下载原始字节，元数据在响应 Header |
 | PUT | `/api/v1/file` | 上传原始字节，参数在请求 Header |
 | DELETE | `/api/v1/file` | 逻辑删除，Body: `{"path","baseRevision"}` |
+| GET | `/api/v1/history?path=...` | 历史版本列表（revision 降序） |
+| GET | `/api/v1/version?path=...&revision=N` | 下载某历史版本的原始字节 |
+
+### 版本历史（v0.2）
+
+- 每次上传/删除都会写入不可变版本记录；文件内容以 SHA-256 内容寻址存入
+  `data/blobs/`（相同内容跨版本/跨文件只存一份）
+- `PUT /api/v1/file` 可带 `X-Action: upsert|merge|restore` 标记版本类型；
+  恢复历史版本由客户端下载旧版本后重新 PUT（`action=restore`），
+  历史保持线性，服务器不执行明文恢复
+- retention：保留最近 N 个 + 最近 N 天，最新版本永远保留；
+  裁剪顺序为「先删元数据 → 确认 blob 无引用 → 再删 blob」
+- v0.1 升级：启动时自动为存量文件补记当前版本（幂等 backfill）
 
 PUT 的 Header（路径必须 percent-encode，以支持中文等非 ASCII 文件名）：
 

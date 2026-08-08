@@ -33,6 +33,8 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/file", h.getFile)
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
+	mux.HandleFunc("GET /api/v1/history", h.history)
+	mux.HandleFunc("GET /api/v1/version", h.version)
 
 	return requestLog(opts.Logger, authGate(opts.Token, mux))
 }

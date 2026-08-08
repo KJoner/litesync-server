@@ -1,4 +1,4 @@
-// Package sync 实现同步核心逻辑：revision 校验、原子写入与元数据事务。
+// Package sync 实现同步核心逻辑：revision 校验、原子写入、元数据事务与版本历史。
 package sync
 
 import (
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	gosync "sync"
 	"time"
 
@@ -49,16 +50,34 @@ type ChangesResult struct {
 	Changes        []db.Change
 }
 
+// Options 控制版本历史行为（Phase 11）。
+type Options struct {
+	HistoryEnabled    bool
+	HistoryDays       int // 0 = 不按天数裁剪
+	HistoryMaxPerFile int // 0 = 不限数量
+}
+
 type Service struct {
 	// 单用户场景：一个互斥锁串行化所有写操作，彻底避免 revision 检查的竞态。
 	mu    gosync.Mutex
 	db    *sql.DB
 	store *storage.Storage
+	blobs *storage.BlobStore
+	opts  Options
 	log   *slog.Logger
 }
 
-func New(database *sql.DB, store *storage.Storage, logger *slog.Logger) *Service {
-	return &Service{db: database, store: store, log: logger}
+func New(database *sql.DB, store *storage.Storage, blobs *storage.BlobStore, opts Options, logger *slog.Logger) *Service {
+	return &Service{db: database, store: store, blobs: blobs, opts: opts, log: logger}
+}
+
+// validAction 校验客户端声明的上传动作类型。
+func validAction(action string) bool {
+	switch action {
+	case "upsert", "merge", "restore":
+		return true
+	}
+	return false
 }
 
 // Upload 处理文件上传。
@@ -68,10 +87,16 @@ func New(database *sql.DB, store *storage.Storage, logger *slog.Logger) *Service
 //   - 文件已删除 → baseRevision 为 0 或等于当前（tombstone）revision 均可重新创建；
 //   - 其他情况 → baseRevision 必须等于当前 revision，否则 409。
 //
-// 写入顺序遵循计划书第 28 节：临时文件 → 验证 hash → 原子改名 → SQLite 事务。
-func (s *Service) Upload(path string, baseRevision int64, claimedHash string, body io.Reader, mtime int64) (*UploadResult, error) {
+// 写入顺序：临时文件 → 验证 hash → 存入 blob（历史）→ 原子改名（HEAD）→ SQLite 事务。
+func (s *Service) Upload(path string, baseRevision int64, claimedHash string, body io.Reader, mtime int64, deviceID, action string) (*UploadResult, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
+	}
+	if action == "" {
+		action = "upsert"
+	}
+	if !validAction(action) {
+		return nil, storage.ErrInvalidPath // 语义上是 bad request；复用 400 映射
 	}
 
 	s.mu.Lock()
@@ -117,6 +142,14 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		return nil, storage.ErrHashMismatch
 	}
 
+	// 历史 blob 必须在 Promote 之前写入（Promote 会把临时文件改名走）
+	if s.opts.HistoryEnabled {
+		if err := s.putBlobFromFile(actualHash, tmp); err != nil {
+			s.store.Discard(tmp)
+			return nil, fmt.Errorf("store history blob: %w", err)
+		}
+	}
+
 	if err := s.store.Promote(tmp, path); err != nil {
 		return nil, err
 	}
@@ -154,15 +187,31 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	if err != nil {
 		return nil, err
 	}
+
+	var prunedBlobs []string
+	if s.opts.HistoryEnabled {
+		if err := db.InsertVersion(tx, &db.FileVersion{
+			Path: path, Revision: newRevision, BlobID: actualHash, ContentHash: actualHash,
+			Size: size, Mtime: mtime, Action: action, DeviceID: deviceID, CreatedAt: now,
+		}); err != nil {
+			return nil, err
+		}
+		prunedBlobs, err = s.pruneVersions(tx, path, now)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.gcBlobs(prunedBlobs)
 
 	return &UploadResult{Path: path, Revision: newRevision, Hash: actualHash, Size: size, Sequence: seq}, nil
 }
 
 // Delete 逻辑删除文件（tombstone），磁盘文件在事务提交后移除。
-func (s *Service) Delete(path string, baseRevision int64) (*DeleteResult, error) {
+// 删除同样产生一条历史版本记录（action=delete，不可抹掉历史）。
+func (s *Service) Delete(path string, baseRevision int64, deviceID string) (*DeleteResult, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
 	}
@@ -209,6 +258,14 @@ func (s *Service) Delete(path string, baseRevision int64) (*DeleteResult, error)
 	if err != nil {
 		return nil, err
 	}
+	if s.opts.HistoryEnabled {
+		if err := db.InsertVersion(tx, &db.FileVersion{
+			Path: path, Revision: newRevision, BlobID: "", ContentHash: "",
+			Size: 0, Mtime: cur.Mtime, Action: "delete", DeviceID: deviceID, CreatedAt: now,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -249,6 +306,34 @@ func (s *Service) OpenFile(path string) (*db.File, io.ReadCloser, error) {
 	return cur, f, nil
 }
 
+// History 返回某路径的历史版本列表（revision 降序）。
+func (s *Service) History(path string) ([]db.FileVersion, error) {
+	if err := storage.ValidatePath(path); err != nil {
+		return nil, err
+	}
+	return db.ListVersions(s.db, path)
+}
+
+// OpenVersion 返回历史版本的元数据和内容读取器。
+// 版本不存在、是 delete 版本或 blob 已被 GC 时返回 ErrNotFound。
+func (s *Service) OpenVersion(path string, revision int64) (*db.FileVersion, io.ReadCloser, error) {
+	if err := storage.ValidatePath(path); err != nil {
+		return nil, nil, err
+	}
+	v, err := db.GetVersion(s.db, path, revision)
+	if err != nil {
+		return nil, nil, err
+	}
+	if v == nil || v.BlobID == "" {
+		return nil, nil, ErrNotFound
+	}
+	f, err := s.blobs.Open(v.BlobID)
+	if err != nil {
+		return nil, nil, ErrNotFound
+	}
+	return v, f, nil
+}
+
 // Changes 返回 since 之后的变更列表。
 func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 	changes, err := db.ListChanges(s.db, since, limit)
@@ -265,4 +350,128 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 
 func (s *Service) LatestSequence() (int64, error) {
 	return db.LatestSequence(s.db)
+}
+
+// BackfillVersions 为升级前已存在、但还没有任何历史记录的文件补一条当前版本。
+// 幂等；启动时调用。
+func (s *Service) BackfillVersions() error {
+	if !s.opts.HistoryEnabled {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(
+		`SELECT f.path, f.content_hash, f.size, f.mtime, f.revision, f.updated_at
+		 FROM files f
+		 WHERE f.deleted = 0
+		   AND NOT EXISTS (SELECT 1 FROM file_versions v WHERE v.path = f.path)`)
+	if err != nil {
+		return err
+	}
+	type pending struct{ path, hash string; size, mtime, revision, updatedAt int64 }
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.path, &p.hash, &p.size, &p.mtime, &p.revision, &p.updatedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		todo = append(todo, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, p := range todo {
+		f, err := s.store.Open(p.path)
+		if err != nil {
+			s.log.Warn("backfill: cannot open vault file, skipping", "path", p.path, "error", err)
+			continue
+		}
+		err = s.blobs.PutReader(p.hash, f)
+		f.Close()
+		if err != nil {
+			s.log.Warn("backfill: blob write failed, skipping", "path", p.path, "error", err)
+			continue
+		}
+		if err := db.InsertVersion(s.db, &db.FileVersion{
+			Path: p.path, Revision: p.revision, BlobID: p.hash, ContentHash: p.hash,
+			Size: p.size, Mtime: p.mtime, Action: "upsert", DeviceID: "", CreatedAt: p.updatedAt,
+		}); err != nil {
+			return err
+		}
+		s.log.Info("backfill: version recorded", "path", p.path, "revision", p.revision)
+	}
+	return nil
+}
+
+// pruneVersions 按 retention 规则裁剪某路径的历史（在上传事务内执行）。
+// 规则：保留最近 HistoryMaxPerFile 个版本，且不早于 HistoryDays 天；
+// 最新的一条（HEAD 对应的版本）永远保留。
+// 返回被删元数据引用的 blob 列表，由调用方在事务提交后做引用计数 GC。
+func (s *Service) pruneVersions(tx *sql.Tx, path string, now int64) ([]string, error) {
+	if s.opts.HistoryMaxPerFile <= 0 && s.opts.HistoryDays <= 0 {
+		return nil, nil
+	}
+	versions, err := db.ListVersions(tx, path) // revision 降序
+	if err != nil {
+		return nil, err
+	}
+	cutoff := int64(0)
+	if s.opts.HistoryDays > 0 {
+		cutoff = now - int64(s.opts.HistoryDays)*86400
+	}
+	var pruneIDs []int64
+	var pruneBlobs []string
+	for i, v := range versions {
+		if i == 0 {
+			continue // 最新版本永远保留
+		}
+		tooMany := s.opts.HistoryMaxPerFile > 0 && i >= s.opts.HistoryMaxPerFile
+		tooOld := cutoff > 0 && v.CreatedAt < cutoff
+		if tooMany || tooOld {
+			pruneIDs = append(pruneIDs, v.ID)
+			if v.BlobID != "" {
+				pruneBlobs = append(pruneBlobs, v.BlobID)
+			}
+		}
+	}
+	for _, id := range pruneIDs {
+		if _, err := tx.Exec(`DELETE FROM file_versions WHERE id = ?`, id); err != nil {
+			return nil, err
+		}
+	}
+	return pruneBlobs, nil
+}
+
+// gcBlobs 删除不再被任何版本引用的 blob（GC 顺序：先删元数据，确认无引用，再删 blob）。
+func (s *Service) gcBlobs(blobIDs []string) {
+	seen := map[string]bool{}
+	for _, id := range blobIDs {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		n, err := db.CountBlobRefs(s.db, id)
+		if err != nil {
+			s.log.Warn("blob gc: refcount query failed", "blob", id, "error", err)
+			continue
+		}
+		if n == 0 {
+			if err := s.blobs.Remove(id); err != nil {
+				s.log.Warn("blob gc: remove failed", "blob", id, "error", err)
+			}
+		}
+	}
+}
+
+func (s *Service) putBlobFromFile(hash, filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return s.blobs.PutReader(hash, f)
 }

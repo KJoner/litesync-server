@@ -23,4 +23,20 @@ CREATE TABLE IF NOT EXISTS changes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_changes_path ON changes(path);
+
+CREATE TABLE IF NOT EXISTS file_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    blob_id TEXT,
+    content_hash TEXT,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('upsert','delete','restore','merge')),
+    device_id TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE(path, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_versions_blob ON file_versions(blob_id);
 `

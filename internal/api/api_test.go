@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,9 +27,20 @@ const testToken = "test-token-0123456789abcdef0123456789abcdef"
 type testEnv struct {
 	ts       *httptest.Server
 	vaultDir string
+	blobDir  string
+	svc      *syncsvc.Service
+	db       *sql.DB
 }
 
 func newTestEnv(t *testing.T, maxFileSize int64) *testEnv {
+	return newTestEnvOpts(t, maxFileSize, syncsvc.Options{
+		HistoryEnabled:    true,
+		HistoryDays:       90,
+		HistoryMaxPerFile: 100,
+	})
+}
+
+func newTestEnvOpts(t *testing.T, maxFileSize int64, opts syncsvc.Options) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
 	database, err := db.Open(filepath.Join(dir, "sync.db"))
@@ -42,8 +54,13 @@ func newTestEnv(t *testing.T, maxFileSize int64) *testEnv {
 	if err != nil {
 		t.Fatalf("init storage: %v", err)
 	}
+	blobDir := filepath.Join(dir, "blobs")
+	blobs, err := storage.NewBlobStore(blobDir)
+	if err != nil {
+		t.Fatalf("init blob store: %v", err)
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := syncsvc.New(database, store, logger)
+	svc := syncsvc.New(database, store, blobs, opts, logger)
 	handler := api.New(api.Options{
 		Token:       testToken,
 		MaxFileSize: maxFileSize,
@@ -52,7 +69,7 @@ func newTestEnv(t *testing.T, maxFileSize int64) *testEnv {
 	}, svc)
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
-	return &testEnv{ts: ts, vaultDir: vaultDir}
+	return &testEnv{ts: ts, vaultDir: vaultDir, blobDir: blobDir, svc: svc, db: database}
 }
 
 func sha256Hex(b []byte) string {

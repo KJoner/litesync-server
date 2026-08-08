@@ -20,7 +20,7 @@ import (
 	syncsvc "obsync/internal/sync"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -55,8 +55,20 @@ func run() error {
 	if err := store.CleanTempFiles(); err != nil {
 		logger.Warn("clean temp files", "error", err)
 	}
+	blobs, err := storage.NewBlobStore(filepath.Join(cfg.DataDir, "blobs"))
+	if err != nil {
+		return fmt.Errorf("init blob store: %w", err)
+	}
 
-	svc := syncsvc.New(database, store, logger)
+	svc := syncsvc.New(database, store, blobs, syncsvc.Options{
+		HistoryEnabled:    cfg.HistoryEnabled,
+		HistoryDays:       cfg.HistoryDays,
+		HistoryMaxPerFile: cfg.HistoryMaxPerFile,
+	}, logger)
+	// 为 v1 升级上来的旧文件补记当前版本（幂等）
+	if err := svc.BackfillVersions(); err != nil {
+		logger.Warn("backfill versions", "error", err)
+	}
 	handler := api.New(api.Options{
 		Token:       cfg.Token,
 		MaxFileSize: cfg.MaxFileSize,
