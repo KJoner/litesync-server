@@ -1,8 +1,11 @@
-/** LiteSync Web 只读端主应用：文件树 + Markdown 阅读 + Outline + 历史 + Diff。 */
-import { Api, AuthError, FileEntry, VersionEntry } from "./api";
+/** LiteSync Web 只读端主应用：文件树 + Markdown 阅读 + Outline + 历史 + Diff。
+ *
+ * v4 安全模型：
+ * - 凭据：HttpOnly 只读会话 Cookie（JS 不可见），根 Token 不落浏览器存储
+ * - VMK：解锁后只存在于内存 CryptoKey；刷新/关闭页面即需重新输入密码
+ */
+import { Api, AuthError, FileEntry, login, logout, VersionEntry } from "./api";
 import {
-	b64decode,
-	b64encode,
 	decryptFile,
 	importVmk,
 	isEncryptedFile,
@@ -13,9 +16,7 @@ import {
 import { DiffLine, diffLines } from "./diff";
 import { buildOutline, md, preprocessWiki } from "./markdown";
 
-const TOKEN_KEY = "litesync-token";
 const THEME_KEY = "litesync-theme";
-const VMK_KEY = "litesync-vmk"; // sessionStorage：仅本浏览器会话
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
@@ -29,7 +30,13 @@ interface State {
 
 let S: State | null = null;
 const app = document.getElementById("app")!;
-const blobUrls: string[] = [];
+let blobUrls: string[] = [];
+
+/** 切换视图时立即回收上一个笔记的所有附件 Blob URL，避免大图累积占内存。 */
+function revokeAllBlobs(): void {
+	for (const url of blobUrls) URL.revokeObjectURL(url);
+	blobUrls = [];
+}
 
 // ---------- 主题 ----------
 function applyTheme(): void {
@@ -91,14 +98,9 @@ function resolveTarget(target: string): string | null {
 // ---------- 入口 ----------
 async function boot(): Promise<void> {
 	applyTheme();
-	const token = localStorage.getItem(TOKEN_KEY);
-	if (!token) {
-		renderLogin();
-		return;
-	}
-	const api = new Api(token);
+	const api = new Api();
 	try {
-		await api.info();
+		await api.info(); // 会话 Cookie 无效 → AuthError → 登录页
 		const vaultDoc = await api.vaultKey();
 		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null };
 		if (vaultDoc?.enabled) {
@@ -106,19 +108,14 @@ async function boot(): Promise<void> {
 				renderMessage("此 Vault 已启用端到端加密，浏览器解密需要 HTTPS（或 localhost）访问。");
 				return;
 			}
-			const cached = sessionStorage.getItem(VMK_KEY);
-			if (cached) {
-				S.vmk = await importVmk(b64decode(cached));
-			} else {
-				renderUnlock();
-				return;
-			}
+			// VMK 只存在内存：每次进入页面都需要解锁
+			renderUnlock();
+			return;
 		}
 		await enterMain();
 	} catch (e) {
 		if (e instanceof AuthError) {
-			localStorage.removeItem(TOKEN_KEY);
-			renderLogin("Token 无效或已更换，请重新输入");
+			renderLogin();
 			return;
 		}
 		renderMessage(`无法连接服务器：${e instanceof Error ? e.message : String(e)}`);
@@ -155,13 +152,14 @@ function renderLogin(err?: string): void {
 	input.placeholder = "API Token";
 	const btn = el("button", "primary", "连接");
 	const errEl = el("p", "error", err ?? "");
+	const hint = el("p", "muted small", "Token 只用于换取只读会话，不会保存在浏览器中");
 	const submit = async () => {
 		btn.textContent = "连接中…";
 		btn.disabled = true;
 		try {
-			const api = new Api(input.value.trim());
-			await api.info();
-			localStorage.setItem(TOKEN_KEY, input.value.trim());
+			if (!(await login(input.value.trim()))) {
+				throw new Error("unauthorized");
+			}
 			await boot();
 		} catch {
 			errEl.textContent = "连接失败：Token 错误或服务器不可达";
@@ -173,7 +171,7 @@ function renderLogin(err?: string): void {
 	input.onkeydown = (e) => {
 		if (e.key === "Enter") void submit();
 	};
-	renderCentered([sub, input, btn, errEl]);
+	renderCentered([sub, input, btn, errEl, hint]);
 	input.focus();
 }
 
@@ -195,8 +193,8 @@ function renderUnlock(err?: string): void {
 			btn.disabled = false;
 			return;
 		}
+		// VMK 只保留在内存 CryptoKey：不写任何浏览器存储，刷新即需重新解锁
 		S!.vmk = await importVmk(raw);
-		sessionStorage.setItem(VMK_KEY, b64encode(raw));
 		raw.fill(0);
 		await enterMain();
 	};
@@ -240,17 +238,22 @@ function renderMain(): void {
 	themeBtn.title = "切换主题";
 	themeBtn.onclick = toggleTheme;
 	const lockBtn = el("button", "icon-btn", "🔒");
-	lockBtn.title = S!.vaultDoc?.enabled ? "锁定（清除本会话密钥）" : "退出登录";
+	lockBtn.title = "锁定（丢弃内存中的密钥）";
+	lockBtn.hidden = !S!.vaultDoc?.enabled;
 	lockBtn.onclick = () => {
-		if (S!.vaultDoc?.enabled) {
-			sessionStorage.removeItem(VMK_KEY);
-		} else {
-			localStorage.removeItem(TOKEN_KEY);
-		}
+		S!.vmk = null;
 		location.hash = "";
-		location.reload();
+		location.reload(); // 内存密钥随页面刷新彻底消失
 	};
-	header.append(menuBtn, brand, searchWrap, spacer, themeBtn, lockBtn);
+	const outBtn = el("button", "icon-btn", "⏻");
+	outBtn.title = "退出登录";
+	outBtn.onclick = () => {
+		void logout().then(() => {
+			location.hash = "";
+			location.reload();
+		});
+	};
+	header.append(menuBtn, brand, searchWrap, spacer, themeBtn, lockBtn, outBtn);
 
 	// 三栏
 	treeEl = el("aside", "tree");
@@ -376,6 +379,7 @@ function onRoute(): void {
 
 // ---------- 首页：最近笔记 ----------
 function showHome(): void {
+	revokeAllBlobs();
 	markActive(null);
 	outlineEl.innerHTML = "";
 	contentEl.innerHTML = "";
@@ -407,6 +411,7 @@ function showHome(): void {
 
 // ---------- 笔记视图 ----------
 async function showNote(path: string): Promise<void> {
+	revokeAllBlobs();
 	markActive(path);
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
@@ -468,7 +473,6 @@ async function showNote(path: string): Promise<void> {
 function trackBlob(blob: Blob): string {
 	const url = URL.createObjectURL(blob);
 	blobUrls.push(url);
-	if (blobUrls.length > 64) URL.revokeObjectURL(blobUrls.shift()!);
 	return url;
 }
 
@@ -506,8 +510,8 @@ function renderOutline(items: { level: number; text: string; id: string }[]): vo
 	if (items.length === 0) return;
 	outlineEl.append(el("div", "outline-title", "On this page"));
 	for (const item of items) {
-		const a = el("a", `outline-item lv${item.level}`, item.text) as HTMLAnchorElement;
-		a.href = "javascript:void 0";
+		// 不用 href="javascript:"（严格 CSP 下被禁止），纯 onclick
+		const a = el("a", `outline-item lv${item.level}`, item.text);
 		a.onclick = () => document.getElementById(item.id)?.scrollIntoView({ behavior: "smooth" });
 		outlineEl.append(a);
 	}
@@ -534,8 +538,7 @@ async function openHistory(path: string): Promise<void> {
 		}
 		const cur = S!.byPath.get(path);
 		for (const v of versions) {
-			const row = el("a", "drawer-item") as HTMLAnchorElement;
-			row.href = "javascript:void 0";
+			const row = el("a", "drawer-item");
 			const label =
 				v.revision === cur?.revision ? `● Current (rev ${v.revision})` : `● Revision ${v.revision}`;
 			row.append(el("div", "", `${label} · ${v.action}`));
@@ -558,6 +561,7 @@ function closeDrawer(): void {
 
 async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	closeDrawer();
+	revokeAllBlobs();
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
 	const wrap = el("div", "note-wrap");
@@ -594,6 +598,7 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 }
 
 async function showDiff(path: string, v: VersionEntry, oldText: string): Promise<void> {
+	revokeAllBlobs();
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
 	const wrap = el("div", "note-wrap");

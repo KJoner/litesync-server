@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var ErrInvalidBlobID = errors.New("invalid blob id")
@@ -92,6 +93,83 @@ func (b *BlobStore) PutReader(hash string, r io.Reader) error {
 		return err
 	}
 	return nil
+}
+
+// IngestVerify 把内容流写入临时文件并计算 SHA-256（不持有任何业务锁，供上传路径使用）。
+// 调用方随后在锁内 Commit（原子入库）或 Discard。
+func (b *BlobStore) IngestVerify(r io.Reader) (tmpPath, hashHex string, size int64, err error) {
+	f, err := os.CreateTemp(b.root, tmpPrefix+"*")
+	if err != nil {
+		return "", "", 0, err
+	}
+	tmpPath = f.Name()
+	h := sha256.New()
+	size, err = io.Copy(io.MultiWriter(f, h), r)
+	if err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return "", "", 0, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return "", "", 0, err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return "", "", 0, err
+	}
+	return tmpPath, hex.EncodeToString(h.Sum(nil)), size, nil
+}
+
+// Commit 把 IngestVerify 的临时文件原子改名为 blob；blob 已存在则丢弃临时文件（去重）。
+func (b *BlobStore) Commit(tmpPath, hash string) error {
+	p, err := b.path(hash)
+	if err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if _, err := os.Stat(p); err == nil {
+		os.Remove(tmpPath)
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, p); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// Discard 丢弃临时文件。
+func (b *BlobStore) Discard(tmpPath string) {
+	if tmpPath != "" {
+		os.Remove(tmpPath)
+	}
+}
+
+// Walk 遍历所有 blob（孤儿 GC 用），回调收到 hash 与文件信息。
+func (b *BlobStore) Walk(fn func(hash string, info os.FileInfo) error) error {
+	return filepath.WalkDir(b.root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // 尽力而为
+		}
+		name := d.Name()
+		if len(name) != 64 || strings.HasPrefix(name, tmpPrefix) {
+			return nil
+		}
+		if _, perr := b.path(name); perr != nil {
+			return nil // 非法命名，跳过
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil //nolint:nilerr
+		}
+		return fn(name, info)
+	})
 }
 
 func (b *BlobStore) Open(hash string) (*os.File, error) {

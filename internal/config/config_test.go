@@ -15,8 +15,12 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Listen != ":8080" || cfg.DataDir != "./data" || cfg.MaxFileSize != 100<<20 {
+	if cfg.Listen != "127.0.0.1:8080" || cfg.DataDir != "./data" || cfg.MaxFileSize != 100<<20 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+	if cfg.ChangesDays != 90 || cfg.ChangesMax != 100000 || cfg.MaintenanceHours != 24 ||
+		cfg.HistoryAttachmentDays != 30 || cfg.HistoryAttachmentMax != 10 || cfg.HistoryMaxBytes != 0 {
+		t.Fatalf("unexpected v4 defaults: %+v", cfg)
 	}
 }
 

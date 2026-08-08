@@ -214,9 +214,12 @@ func TestUploadDownloadFlow(t *testing.T) {
 		t.Fatalf("X-File-Mtime = %q", dresp.Header.Get("X-File-Mtime"))
 	}
 
-	// 磁盘上确实存在
-	if _, err := os.Stat(filepath.Join(e.vaultDir, "Notes", "hello.md")); err != nil {
-		t.Fatalf("file not on disk: %v", err)
+	// v4 单份存储：内容落在 blob store（vault 目录不再保存 HEAD 物理文件）
+	if _, err := os.Stat(filepath.Join(e.blobDir, sha256Hex(content)[:2], sha256Hex(content))); err != nil {
+		t.Fatalf("blob not on disk: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.vaultDir, "Notes", "hello.md")); !os.IsNotExist(err) {
+		t.Fatal("HEAD must not be duplicated in vault dir")
 	}
 
 	// 修改（baseRevision=1）

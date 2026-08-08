@@ -40,6 +40,17 @@ func (h *handlers) changes(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, "changes", err)
 		return
 	}
+	if res.ResyncRequired {
+		// 客户端游标早于已裁剪的水位线：必须走 snapshot 全量对账重建游标
+		writeJSON(w, http.StatusOK, map[string]any{
+			"latestSequence": res.LatestSequence,
+			"resyncRequired": true,
+			"minSequence":    res.MinSequence,
+			"hasMore":        false,
+			"changes":        []apiChange{},
+		})
+		return
+	}
 	out := make([]apiChange, 0, len(res.Changes))
 	for _, c := range res.Changes {
 		out = append(out, apiChange{

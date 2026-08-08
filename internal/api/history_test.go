@@ -188,7 +188,8 @@ func TestHistoryRetention(t *testing.T) {
 	}
 }
 
-// 关闭历史后：不写版本、不建 blob，history 返回空列表。
+// 关闭历史后：不写版本记录，history 返回空列表。
+// （v4 起 HEAD 本身就存在 blob store，因此 blob 仍会存在——单份存储。）
 func TestHistoryDisabled(t *testing.T) {
 	e := newTestEnvOpts(t, 1<<20, syncsvc.Options{HistoryEnabled: false})
 	content := []byte("no history")
@@ -201,8 +202,13 @@ func TestHistoryDisabled(t *testing.T) {
 	if resp, _ := e.version(t, "n.md", 1); resp.StatusCode != http.StatusNotFound {
 		t.Fatal("version must 404 when disabled")
 	}
-	if _, err := os.Stat(blobPath(e.blobDir, sha256Hex(content))); !os.IsNotExist(err) {
-		t.Fatal("no blob should be written when disabled")
+	// HEAD blob 存在（唯一内容存储），且下载正常
+	if _, err := os.Stat(blobPath(e.blobDir, sha256Hex(content))); err != nil {
+		t.Fatal("HEAD blob must exist (single storage)")
+	}
+	dresp, data := e.download(t, "n.md")
+	if dresp.StatusCode != http.StatusOK || !bytes.Equal(data, content) {
+		t.Fatal("download must serve from blob store")
 	}
 }
 

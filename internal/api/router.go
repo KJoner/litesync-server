@@ -22,13 +22,17 @@ type Options struct {
 type handlers struct {
 	svc  *syncsvc.Service
 	opts Options
+	web  *sessionStore
 }
 
-// New 构建完整的 HTTP handler。除 /health 外，/api/* 全部要求 Bearer Token。
+// New 构建完整的 HTTP handler。
+// /api/* 要求 Bearer Token（完整权限）或 Web 只读会话（白名单 GET）。
 func New(opts Options, svc *syncsvc.Service) http.Handler {
-	h := &handlers{svc: svc, opts: opts}
+	h := &handlers{svc: svc, opts: opts, web: newSessionStore()}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /web/session", h.createSession)
+	mux.HandleFunc("DELETE /web/session", h.destroySession)
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("GET /api/v1/info", h.info)
 	mux.HandleFunc("GET /api/v1/changes", h.changes)
@@ -51,7 +55,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 		mux.Handle("GET /", http.FileServerFS(dist))
 	}
 
-	return requestLog(opts.Logger, authGate(opts.Token, mux))
+	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, mux)))
 }
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {

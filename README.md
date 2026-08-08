@@ -64,8 +64,30 @@ $env:OBSYNC_TOKEN = 'your-random-token'; go run ./cmd/obsync
 | `OBSYNC_MAX_FILE_SIZE` | `104857600` | 单文件大小上限（字节，默认 100MB） |
 | `OBSYNC_LOG_LEVEL` | `info` | debug / info / warn / error |
 | `OBSYNC_HISTORY_ENABLED` | `true` | 版本历史开关 |
-| `OBSYNC_HISTORY_DAYS` | `90` | 历史保留天数（0 = 不按天数裁剪） |
-| `OBSYNC_HISTORY_MAX_PER_FILE` | `100` | 每文件保留版本数（0 = 不限） |
+| `OBSYNC_HISTORY_DAYS` | `90` | Markdown 历史保留天数（0 = 不限） |
+| `OBSYNC_HISTORY_MAX_PER_FILE` | `100` | Markdown 每文件版本数（0 = 不限） |
+| `OBSYNC_HISTORY_ATTACHMENT_DAYS` | `30` | 附件历史保留天数 |
+| `OBSYNC_HISTORY_ATTACHMENT_MAX_PER_FILE` | `10` | 附件每文件版本数 |
+| `OBSYNC_HISTORY_MAX_BYTES` | `0` | 非 HEAD 历史总字节硬上限（0 = 不限） |
+| `OBSYNC_CHANGES_DAYS` | `90` | changes 保留天数（旧游标自动 snapshot 对账） |
+| `OBSYNC_CHANGES_MAX` | `100000` | changes 最大行数 |
+| `OBSYNC_MAINTENANCE_HOURS` | `24` | 资源治理任务间隔（0 = 关闭定时） |
+
+### v0.5：安全与资源治理
+
+- **单份存储**：Blob Store 是唯一内容存储，HEAD 不再另存物理文件
+  （旧部署启动时自动迁移，读取带回退兼容），磁盘占用约省一半
+- **锁优化**：上传收流与 SHA-256 在锁外完成，慢速大文件上传不再阻塞其他请求
+- **资源治理**（启动 + 每 24h）：历史全量保留扫描（含从不修改的文件）、
+  历史字节预算、孤儿 blob 回收、过期分享清理、changes 裁剪（水位线 +
+  `resyncRequired` 协议，旧设备自动走 snapshot 全量对账）、SQLite
+  checkpoint/按需 VACUUM，并输出资源统计日志
+- **Web 只读会话**：浏览器登录换取 HttpOnly + SameSite=Strict 的短期会话
+  Cookie（JS 不可见），且只能访问白名单 GET 接口；根 Token 不再进浏览器存储
+- **CSP 等安全响应头**：`default-src 'none'` 严格策略；笔记内外链图片默认
+  被阻断（隐私保护）
+- 默认监听 `127.0.0.1:8080`（Docker 内仍为 `:8080`）；数据目录 0700、
+  数据库 0600；compose 配置日志轮转
 
 ## HTTPS（生产环境必须）
 

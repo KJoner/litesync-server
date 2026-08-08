@@ -74,3 +74,66 @@ func CountBlobRefs(q dbtx, blobID string) (int64, error) {
 	err := q.QueryRow(`SELECT COUNT(*) FROM file_versions WHERE blob_id = ?`, blobID).Scan(&n)
 	return n, err
 }
+
+// BlobReferenced 判断 blob 是否仍被引用：任何历史版本，或未删除文件的当前 HEAD。
+func BlobReferenced(q dbtx, blobID string) (bool, error) {
+	var n int64
+	err := q.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM file_versions WHERE blob_id = ?)
+		     OR EXISTS(SELECT 1 FROM files WHERE deleted = 0 AND content_hash = ?)`,
+		blobID, blobID,
+	).Scan(&n)
+	return n != 0, err
+}
+
+// DistinctVersionPaths 返回拥有历史版本的全部路径（维护任务用）。
+func DistinctVersionPaths(q dbtx) ([]string, error) {
+	rows, err := q.Query(`SELECT DISTINCT path FROM file_versions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// NonHeadHistoryBytes 返回非最新版本（每路径除最大 revision 外）的历史总字节。
+func NonHeadHistoryBytes(q dbtx) (int64, error) {
+	var n int64
+	err := q.QueryRow(
+		`SELECT COALESCE(SUM(size), 0) FROM file_versions v
+		 WHERE v.revision < (SELECT MAX(revision) FROM file_versions WHERE path = v.path)`,
+	).Scan(&n)
+	return n, err
+}
+
+// OldestNonHeadVersions 返回最旧的一批非 HEAD 历史版本（字节预算裁剪用）。
+func OldestNonHeadVersions(q dbtx, limit int) ([]FileVersion, error) {
+	rows, err := q.Query(
+		`SELECT id, path, revision, COALESCE(blob_id,''), COALESCE(content_hash,''), size, mtime, action, COALESCE(device_id,''), created_at
+		 FROM file_versions v
+		 WHERE v.revision < (SELECT MAX(revision) FROM file_versions WHERE path = v.path)
+		 ORDER BY created_at ASC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	versions := make([]FileVersion, 0, limit)
+	for rows.Next() {
+		var v FileVersion
+		if err := rows.Scan(&v.ID, &v.Path, &v.Revision, &v.BlobID, &v.ContentHash,
+			&v.Size, &v.Mtime, &v.Action, &v.DeviceID, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		versions = append(versions, v)
+	}
+	return versions, rows.Err()
+}

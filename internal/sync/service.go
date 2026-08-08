@@ -1,4 +1,8 @@
-// Package sync 实现同步核心逻辑：revision 校验、原子写入、元数据事务与版本历史。
+// Package sync 实现同步核心逻辑：revision 校验、内容寻址存储、元数据事务与版本历史。
+//
+// v4 存储模型：Blob Store 是唯一内容存储（内容寻址、不可变、去重）。
+// files 表的 content_hash 指向当前 HEAD blob，file_versions 指向历史 blob，
+// HEAD 不再单独保存一份物理文件（旧部署由启动迁移自动收编，读取带回退兼容）。
 package sync
 
 import (
@@ -9,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
+	"strings"
 	gosync "sync"
 	"time"
 
@@ -22,10 +26,12 @@ var (
 	ErrVaultKeyExists = errors.New("vault key already exists")
 )
 
-const vaultKeyMetaKey = "vault-key"
+const (
+	vaultKeyMetaKey  = "vault-key"
+	watermarkMetaKey = "changes-watermark" // 已裁剪到的 sequence（含）
+)
 
 // ConflictError 表示 baseRevision 与服务器当前 revision 不一致。
-// 携带服务器当前状态，客户端据此决定如何解决冲突。
 type ConflictError struct {
 	Path     string
 	Revision int64
@@ -55,20 +61,31 @@ type ChangesResult struct {
 	LatestSequence int64
 	HasMore        bool
 	Changes        []db.Change
+	// ResyncRequired：客户端游标早于已裁剪的水位线，必须走 snapshot 全量对账
+	ResyncRequired bool
+	MinSequence    int64
 }
 
-// Options 控制版本历史行为（Phase 11）。
+// Options 控制历史保留与资源治理（v4）。
 type Options struct {
 	HistoryEnabled    bool
-	HistoryDays       int // 0 = 不按天数裁剪
-	HistoryMaxPerFile int // 0 = 不限数量
+	HistoryDays       int // Markdown 历史保留天数（0 = 不限）
+	HistoryMaxPerFile int // Markdown 每文件版本数（0 = 不限）
+
+	HistoryAttachmentDays int   // 附件历史保留天数
+	HistoryAttachmentMax  int   // 附件每文件版本数
+	HistoryMaxBytes       int64 // 非 HEAD 历史总字节硬上限（0 = 不限）
+
+	ChangesDays int // changes 保留天数（0 = 不裁剪）
+	ChangesMax  int // changes 最大行数（0 = 不限）
 }
 
 type Service struct {
-	// 单用户场景：一个互斥锁串行化所有写操作，彻底避免 revision 检查的竞态。
+	// 单用户场景：互斥锁串行化元数据写；v4 起收流与哈希在锁外完成，
+	// 大文件慢速上传不再阻塞其他请求。
 	mu     gosync.Mutex
 	db     *sql.DB
-	store  *storage.Storage
+	store  *storage.Storage // 旧版 vault 文件目录（仅迁移与读取回退用）
 	blobs  *storage.BlobStore
 	shares *storage.ShareStore
 	opts   Options
@@ -79,7 +96,6 @@ func New(database *sql.DB, store *storage.Storage, blobs *storage.BlobStore, sha
 	return &Service{db: database, store: store, blobs: blobs, shares: shares, opts: opts, log: logger}
 }
 
-// validAction 校验客户端声明的上传动作类型。
 func validAction(action string) bool {
 	switch action {
 	case "upsert", "merge", "restore":
@@ -88,14 +104,22 @@ func validAction(action string) bool {
 	return false
 }
 
+// isMarkdownPath 决定历史保留策略分类（Markdown 历史同时是三方合并的 merge-base）。
+func isMarkdownPath(path string) bool {
+	p := strings.ToLower(path)
+	return strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt")
+}
+
+// retentionFor 返回该路径适用的（保留天数, 版本数上限）。
+func (s *Service) retentionFor(path string) (days, maxPerFile int) {
+	if isMarkdownPath(path) {
+		return s.opts.HistoryDays, s.opts.HistoryMaxPerFile
+	}
+	return s.opts.HistoryAttachmentDays, s.opts.HistoryAttachmentMax
+}
+
 // Upload 处理文件上传。
-// 规则：
-//   - 服务器已有相同内容（hash 相同且未删除）→ 幂等成功，不产生新 revision；
-//   - 文件不存在 → baseRevision 必须为 0；
-//   - 文件已删除 → baseRevision 为 0 或等于当前（tombstone）revision 均可重新创建；
-//   - 其他情况 → baseRevision 必须等于当前 revision，否则 409。
-//
-// 写入顺序：临时文件 → 验证 hash → 存入 blob（历史）→ 原子改名（HEAD）→ SQLite 事务。
+// v4 流程：收流 + SHA-256（锁外）→ 加锁 → revision 校验 → blob 原子提交 → SQLite 事务。
 func (s *Service) Upload(path string, baseRevision int64, claimedHash string, body io.Reader, mtime int64, deviceID, action string) (*UploadResult, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
@@ -107,6 +131,21 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		return nil, storage.ErrInvalidPath // 语义上是 bad request；复用 400 映射
 	}
 
+	// 锁外：接收 body、落临时文件、计算 hash（慢速网络不影响其他请求）
+	tmp, actualHash, size, err := s.blobs.IngestVerify(body)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			s.blobs.Discard(tmp)
+		}
+	}()
+	if actualHash != claimedHash {
+		return nil, storage.ErrHashMismatch
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -115,9 +154,8 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		return nil, err
 	}
 
-	// 幂等：内容与服务器现状一致时直接成功（覆盖“重复提交同一个 change”场景）。
+	// 幂等：内容与服务器现状一致时直接成功（覆盖“重复提交同一个 change”场景）
 	if cur != nil && !cur.Deleted && cur.ContentHash == claimedHash {
-		io.Copy(io.Discard, body) //nolint:errcheck // 服务器状态已正确，body 内容无关紧要
 		seq, err := db.LastSequenceForPath(s.db, path)
 		if err != nil {
 			return nil, err
@@ -125,7 +163,7 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: seq}, nil
 	}
 
-	// revision 校验（数据安全红线：上传必须有 revision 校验）
+	// revision 校验（数据安全红线）
 	switch {
 	case cur == nil:
 		if baseRevision != 0 {
@@ -141,26 +179,11 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		}
 	}
 
-	tmp, actualHash, size, err := s.store.WriteTemp(path, body)
-	if err != nil {
+	// blob 原子入库（同时充当 HEAD 与历史内容，单份存储）
+	if err := s.blobs.Commit(tmp, actualHash); err != nil {
 		return nil, err
 	}
-	if actualHash != claimedHash {
-		s.store.Discard(tmp)
-		return nil, storage.ErrHashMismatch
-	}
-
-	// 历史 blob 必须在 Promote 之前写入（Promote 会把临时文件改名走）
-	if s.opts.HistoryEnabled {
-		if err := s.putBlobFromFile(actualHash, tmp); err != nil {
-			s.store.Discard(tmp)
-			return nil, fmt.Errorf("store history blob: %w", err)
-		}
-	}
-
-	if err := s.store.Promote(tmp, path); err != nil {
-		return nil, err
-	}
+	committed = true
 
 	now := time.Now().Unix()
 	newRevision := int64(1)
@@ -204,7 +227,8 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		}); err != nil {
 			return nil, err
 		}
-		prunedBlobs, err = s.pruneVersions(tx, path, now)
+		days, maxPerFile := s.retentionFor(path)
+		prunedBlobs, err = s.pruneVersionsTx(tx, path, now, days, maxPerFile)
 		if err != nil {
 			return nil, err
 		}
@@ -217,8 +241,7 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	return &UploadResult{Path: path, Revision: newRevision, Hash: actualHash, Size: size, Sequence: seq}, nil
 }
 
-// Delete 逻辑删除文件（tombstone），磁盘文件在事务提交后移除。
-// 删除同样产生一条历史版本记录（action=delete，不可抹掉历史）。
+// Delete 逻辑删除文件（tombstone）。内容 blob 由历史保留与孤儿 GC 治理，这里不动磁盘。
 func (s *Service) Delete(path string, baseRevision int64, deviceID string) (*DeleteResult, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
@@ -234,7 +257,6 @@ func (s *Service) Delete(path string, baseRevision int64, deviceID string) (*Del
 	if cur == nil {
 		return nil, ErrNotFound
 	}
-	// 重复删除：幂等成功
 	if cur.Deleted {
 		seq, err := db.LastSequenceForPath(s.db, path)
 		if err != nil {
@@ -242,7 +264,6 @@ func (s *Service) Delete(path string, baseRevision int64, deviceID string) (*Del
 		}
 		return &DeleteResult{Path: path, Revision: cur.Revision, Sequence: seq}, nil
 	}
-	// 数据安全红线：删除必须有 revision 校验
 	if baseRevision != cur.Revision {
 		return nil, &ConflictError{Path: path, Revision: cur.Revision, Hash: cur.ContentHash}
 	}
@@ -278,16 +299,15 @@ func (s *Service) Delete(path string, baseRevision int64, deviceID string) (*Del
 		return nil, err
 	}
 
-	// 先提交元数据再删磁盘文件：即使删除失败也只会留下孤立文件，不会丢数据。
+	// 迁移前的旧 vault 物理文件（如仍存在）顺手清理
 	if err := s.store.Remove(path); err != nil {
-		s.log.Warn("failed to remove file from disk after delete", "path", path, "error", err)
+		s.log.Debug("legacy vault file cleanup", "path", path, "error", err)
 	}
 
 	return &DeleteResult{Path: path, Revision: newRevision, Sequence: seq}, nil
 }
 
-// OpenFile 返回文件元数据和内容读取器。
-// 记录存在但已删除时，返回 (元数据, nil, ErrNotFound)，供 API 层提示客户端。
+// OpenFile 返回文件元数据和内容读取器（blob 优先，旧部署回退 vault 文件）。
 func (s *Service) OpenFile(path string) (*db.File, io.ReadCloser, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, nil, err
@@ -306,15 +326,61 @@ func (s *Service) OpenFile(path string) (*db.File, io.ReadCloser, error) {
 	if cur.Deleted {
 		return cur, nil, ErrNotFound
 	}
+	if f, err := s.blobs.Open(cur.ContentHash); err == nil {
+		return cur, f, nil
+	}
+	// 迁移前的旧部署：内容还在 vault 目录
 	f, err := s.store.Open(path)
 	if err != nil {
-		s.log.Error("metadata exists but file missing on disk", "path", path, "error", err)
+		s.log.Error("content missing in both blob store and vault dir", "path", path)
 		return nil, nil, ErrNotFound
 	}
 	return cur, f, nil
 }
 
-// History 返回某路径的历史版本列表（revision 降序）。
+// MigrateHeadToBlobs 把旧版 vault 目录中的 HEAD 文件收编进 blob store（幂等，启动时调用）。
+// 验证通过后删除 vault 物理文件，消除双份存储。
+func (s *Service) MigrateHeadToBlobs() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	files, err := db.ListFiles(s.db)
+	if err != nil {
+		return err
+	}
+	migrated := 0
+	for i := range files {
+		f := &files[i]
+		if s.blobs.Has(f.ContentHash) {
+			// blob 已有（如历史 backfill 已复制）→ 直接清理旧物理文件
+			if err := s.store.Remove(f.Path); err == nil {
+				migrated++
+			}
+			continue
+		}
+		src, err := s.store.Open(f.Path)
+		if err != nil {
+			continue // 旧文件不存在（全新部署）
+		}
+		err = s.blobs.PutReader(f.ContentHash, src)
+		src.Close()
+		if err != nil {
+			s.log.Warn("head migration: blob write failed, keeping vault file", "path", f.Path, "error", err)
+			continue
+		}
+		if err := s.store.Remove(f.Path); err != nil {
+			s.log.Warn("head migration: vault file cleanup failed", "path", f.Path, "error", err)
+		}
+		migrated++
+	}
+	if migrated > 0 {
+		s.log.Info("head migration: vault files absorbed into blob store", "count", migrated)
+	}
+	return nil
+}
+
+// History / OpenVersion --------------------------------------------------
+
 func (s *Service) History(path string) ([]db.FileVersion, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
@@ -322,8 +388,6 @@ func (s *Service) History(path string) ([]db.FileVersion, error) {
 	return db.ListVersions(s.db, path)
 }
 
-// OpenVersion 返回历史版本的元数据和内容读取器。
-// 版本不存在、是 delete 版本或 blob 已被 GC 时返回 ErrNotFound。
 func (s *Service) OpenVersion(path string, revision int64) (*db.FileVersion, io.ReadCloser, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, nil, err
@@ -342,9 +406,11 @@ func (s *Service) OpenVersion(path string, revision int64) (*db.FileVersion, io.
 	return v, f, nil
 }
 
-// Changes 返回 since 之后的变更列表。
+// Changes -----------------------------------------------------------------
+
+// Changes 返回 since 之后的变更；since 早于裁剪水位线时要求客户端走 snapshot 对账。
 func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
-	changes, err := db.ListChanges(s.db, since, limit)
+	watermark, err := s.changesWatermark()
 	if err != nil {
 		return nil, err
 	}
@@ -352,15 +418,34 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if since < watermark {
+		return &ChangesResult{LatestSequence: latest, ResyncRequired: true, MinSequence: watermark}, nil
+	}
+	changes, err := db.ListChanges(s.db, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	// latest 需要重取一次以覆盖 List 期间的新写入导致的 hasMore 误判？
+	// 这里保持先取 latest：若期间有新写入，客户端下轮拉取自然补齐。
 	hasMore := len(changes) > 0 && changes[len(changes)-1].Sequence < latest
 	return &ChangesResult{LatestSequence: latest, HasMore: hasMore, Changes: changes}, nil
+}
+
+func (s *Service) changesWatermark() (int64, error) {
+	v, ok, err := db.GetMeta(s.db, watermarkMetaKey)
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int64
+	fmt.Sscanf(v, "%d", &n) //nolint:errcheck
+	return n, nil
 }
 
 func (s *Service) LatestSequence() (int64, error) {
 	return db.LatestSequence(s.db)
 }
 
-// Snapshot 返回当前所有未删除文件的元数据与最新 sequence（Web 端与初次同步用）。
+// Snapshot 返回当前所有未删除文件的元数据与最新 sequence。
 func (s *Service) Snapshot() (int64, []db.File, error) {
 	files, err := db.ListFiles(s.db)
 	if err != nil {
@@ -373,8 +458,8 @@ func (s *Service) Snapshot() (int64, []db.File, error) {
 	return latest, files, nil
 }
 
-// CreateShare 保存分享密文并登记元数据（Phase 17）。
-// 服务器不持有 Share Key：内容是客户端用独立分享密钥加密后的 opaque bytes。
+// Shares ------------------------------------------------------------------
+
 func (s *Service) CreateShare(name string, expiresAt int64, body io.Reader) (*db.Share, error) {
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
@@ -406,7 +491,6 @@ func (s *Service) ListShares() ([]db.Share, error) {
 	return db.ListShares(s.db)
 }
 
-// RevokeShare 撤销分享：标记 revoked 并删除密文文件（不影响原始 Vault）。
 func (s *Service) RevokeShare(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -426,7 +510,6 @@ func (s *Service) RevokeShare(id string) error {
 	return nil
 }
 
-// OpenShare 公开读取分享内容；不存在 / 已撤销 / 已过期一律 ErrNotFound。
 func (s *Service) OpenShare(id string) (*db.Share, io.ReadCloser, error) {
 	share, err := db.GetShare(s.db, id)
 	if err != nil {
@@ -436,7 +519,6 @@ func (s *Service) OpenShare(id string) (*db.Share, io.ReadCloser, error) {
 		return nil, nil, ErrNotFound
 	}
 	if share.ExpiresAt > 0 && time.Now().Unix() > share.ExpiresAt {
-		// 过期即失效；顺手清理密文文件
 		s.shares.Remove(id) //nolint:errcheck
 		return nil, nil, ErrNotFound
 	}
@@ -447,8 +529,8 @@ func (s *Service) OpenShare(id string) (*db.Share, io.ReadCloser, error) {
 	return share, f, nil
 }
 
-// GetVaultKey 返回客户端存放的加密 vault key 文档（服务器视为 opaque JSON）。
-// 不存在时返回 ("", nil)。
+// Vault key ---------------------------------------------------------------
+
 func (s *Service) GetVaultKey() (string, error) {
 	doc, ok, err := db.GetMeta(s.db, vaultKeyMetaKey)
 	if err != nil || !ok {
@@ -457,8 +539,6 @@ func (s *Service) GetVaultKey() (string, error) {
 	return doc, nil
 }
 
-// SetVaultKey 保存加密 vault key 文档。
-// 已存在且未显式 replace 时拒绝——防止误覆盖导致已加密数据永久不可读。
 func (s *Service) SetVaultKey(doc string, replace bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -472,8 +552,7 @@ func (s *Service) SetVaultKey(doc string, replace bool) error {
 	return db.SetMeta(s.db, vaultKeyMetaKey, doc, time.Now().Unix())
 }
 
-// PruneHistoryBefore 删除某路径 revision < before 的历史版本（E2EE 迁移：
-// 密文验证完成后清理明文历史）。最新版本永远保留；HEAD 与 changes 不受影响。
+// PruneHistoryBefore（E2EE 迁移用）：删除某路径 revision < before 的历史版本。
 func (s *Service) PruneHistoryBefore(path string, before int64) (int, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return 0, err
@@ -481,7 +560,7 @@ func (s *Service) PruneHistoryBefore(path string, before int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	versions, err := db.ListVersions(s.db, path) // revision 降序
+	versions, err := db.ListVersions(s.db, path)
 	if err != nil {
 		return 0, err
 	}
@@ -495,7 +574,7 @@ func (s *Service) PruneHistoryBefore(path string, before int64) (int, error) {
 	removed := 0
 	for i, v := range versions {
 		if i == 0 || v.Revision >= before {
-			continue // 最新版本永远保留
+			continue
 		}
 		if _, err := tx.Exec(`DELETE FROM file_versions WHERE id = ?`, v.ID); err != nil {
 			return 0, err
@@ -513,7 +592,6 @@ func (s *Service) PruneHistoryBefore(path string, before int64) (int, error) {
 }
 
 // BackfillVersions 为升级前已存在、但还没有任何历史记录的文件补一条当前版本。
-// 幂等；启动时调用。
 func (s *Service) BackfillVersions() error {
 	if !s.opts.HistoryEnabled {
 		return nil
@@ -529,11 +607,14 @@ func (s *Service) BackfillVersions() error {
 	if err != nil {
 		return err
 	}
-	type pending struct{ path, hash string; size, mtime, revision, updatedAt int64 }
+	type pending struct {
+		path, hash                      string
+		size, mtime, revision, updated int64
+	}
 	var todo []pending
 	for rows.Next() {
 		var p pending
-		if err := rows.Scan(&p.path, &p.hash, &p.size, &p.mtime, &p.revision, &p.updatedAt); err != nil {
+		if err := rows.Scan(&p.path, &p.hash, &p.size, &p.mtime, &p.revision, &p.updated); err != nil {
 			rows.Close()
 			return err
 		}
@@ -545,34 +626,35 @@ func (s *Service) BackfillVersions() error {
 	}
 
 	for _, p := range todo {
-		f, err := s.store.Open(p.path)
-		if err != nil {
-			s.log.Warn("backfill: cannot open vault file, skipping", "path", p.path, "error", err)
-			continue
-		}
-		err = s.blobs.PutReader(p.hash, f)
-		f.Close()
-		if err != nil {
-			s.log.Warn("backfill: blob write failed, skipping", "path", p.path, "error", err)
-			continue
+		if !s.blobs.Has(p.hash) {
+			f, err := s.store.Open(p.path)
+			if err != nil {
+				s.log.Warn("backfill: cannot open vault file, skipping", "path", p.path, "error", err)
+				continue
+			}
+			err = s.blobs.PutReader(p.hash, f)
+			f.Close()
+			if err != nil {
+				s.log.Warn("backfill: blob write failed, skipping", "path", p.path, "error", err)
+				continue
+			}
 		}
 		if err := db.InsertVersion(s.db, &db.FileVersion{
 			Path: p.path, Revision: p.revision, BlobID: p.hash, ContentHash: p.hash,
-			Size: p.size, Mtime: p.mtime, Action: "upsert", DeviceID: "", CreatedAt: p.updatedAt,
+			Size: p.size, Mtime: p.mtime, Action: "upsert", DeviceID: "", CreatedAt: p.updated,
 		}); err != nil {
 			return err
 		}
-		s.log.Info("backfill: version recorded", "path", p.path, "revision", p.revision)
 	}
 	return nil
 }
 
-// pruneVersions 按 retention 规则裁剪某路径的历史（在上传事务内执行）。
-// 规则：保留最近 HistoryMaxPerFile 个版本，且不早于 HistoryDays 天；
-// 最新的一条（HEAD 对应的版本）永远保留。
-// 返回被删元数据引用的 blob 列表，由调用方在事务提交后做引用计数 GC。
-func (s *Service) pruneVersions(tx *sql.Tx, path string, now int64) ([]string, error) {
-	if s.opts.HistoryMaxPerFile <= 0 && s.opts.HistoryDays <= 0 {
+// 内部工具 -----------------------------------------------------------------
+
+// pruneVersionsTx 按 retention 规则裁剪某路径历史（事务内），返回待 GC 的 blob。
+// 最新版本永远保留。
+func (s *Service) pruneVersionsTx(tx *sql.Tx, path string, now int64, days, maxPerFile int) ([]string, error) {
+	if days <= 0 && maxPerFile <= 0 {
 		return nil, nil
 	}
 	versions, err := db.ListVersions(tx, path) // revision 降序
@@ -580,33 +662,29 @@ func (s *Service) pruneVersions(tx *sql.Tx, path string, now int64) ([]string, e
 		return nil, err
 	}
 	cutoff := int64(0)
-	if s.opts.HistoryDays > 0 {
-		cutoff = now - int64(s.opts.HistoryDays)*86400
+	if days > 0 {
+		cutoff = now - int64(days)*86400
 	}
-	var pruneIDs []int64
 	var pruneBlobs []string
 	for i, v := range versions {
 		if i == 0 {
-			continue // 最新版本永远保留
+			continue
 		}
-		tooMany := s.opts.HistoryMaxPerFile > 0 && i >= s.opts.HistoryMaxPerFile
+		tooMany := maxPerFile > 0 && i >= maxPerFile
 		tooOld := cutoff > 0 && v.CreatedAt < cutoff
 		if tooMany || tooOld {
-			pruneIDs = append(pruneIDs, v.ID)
+			if _, err := tx.Exec(`DELETE FROM file_versions WHERE id = ?`, v.ID); err != nil {
+				return nil, err
+			}
 			if v.BlobID != "" {
 				pruneBlobs = append(pruneBlobs, v.BlobID)
 			}
 		}
 	}
-	for _, id := range pruneIDs {
-		if _, err := tx.Exec(`DELETE FROM file_versions WHERE id = ?`, id); err != nil {
-			return nil, err
-		}
-	}
 	return pruneBlobs, nil
 }
 
-// gcBlobs 删除不再被任何版本引用的 blob（GC 顺序：先删元数据，确认无引用，再删 blob）。
+// gcBlobs 删除不再被引用的 blob（引用 = 任何历史版本 或 未删除文件的 HEAD）。
 func (s *Service) gcBlobs(blobIDs []string) {
 	seen := map[string]bool{}
 	for _, id := range blobIDs {
@@ -614,24 +692,15 @@ func (s *Service) gcBlobs(blobIDs []string) {
 			continue
 		}
 		seen[id] = true
-		n, err := db.CountBlobRefs(s.db, id)
+		ref, err := db.BlobReferenced(s.db, id)
 		if err != nil {
-			s.log.Warn("blob gc: refcount query failed", "blob", id, "error", err)
+			s.log.Warn("blob gc: reference query failed", "blob", id, "error", err)
 			continue
 		}
-		if n == 0 {
+		if !ref {
 			if err := s.blobs.Remove(id); err != nil {
 				s.log.Warn("blob gc: remove failed", "blob", id, "error", err)
 			}
 		}
 	}
-}
-
-func (s *Service) putBlobFromFile(hash, filePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return s.blobs.PutReader(hash, f)
 }

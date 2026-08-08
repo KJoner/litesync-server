@@ -10,20 +10,30 @@ import (
 )
 
 type Config struct {
-	Listen      string // OBSYNC_LISTEN, 默认 :8080
+	Listen      string // OBSYNC_LISTEN, 默认 127.0.0.1:8080（防止误暴露公网；Docker 里显式设 :8080）
 	DataDir     string // OBSYNC_DATA_DIR, 默认 ./data
 	Token       string // OBSYNC_TOKEN, 必填
 	MaxFileSize int64  // OBSYNC_MAX_FILE_SIZE, 默认 100MB
 	LogLevel    slog.Level
 
+	// Markdown 历史保留（同时是三方合并的 merge-base 数据库，保守保留）
 	HistoryEnabled    bool // OBSYNC_HISTORY_ENABLED, 默认 true
 	HistoryDays       int  // OBSYNC_HISTORY_DAYS, 默认 90（0 = 不按天数裁剪）
 	HistoryMaxPerFile int  // OBSYNC_HISTORY_MAX_PER_FILE, 默认 100（0 = 不限数量）
+	// 附件（二进制）历史保留：体积大、无合并价值，激进裁剪
+	HistoryAttachmentDays int   // OBSYNC_HISTORY_ATTACHMENT_DAYS, 默认 30
+	HistoryAttachmentMax  int   // OBSYNC_HISTORY_ATTACHMENT_MAX_PER_FILE, 默认 10
+	HistoryMaxBytes       int64 // OBSYNC_HISTORY_MAX_BYTES, 默认 0（不限）：非 HEAD 历史总字节硬上限
+
+	ChangesDays int // OBSYNC_CHANGES_DAYS, 默认 90（0 = 不裁剪）
+	ChangesMax  int // OBSYNC_CHANGES_MAX, 默认 100000（0 = 不限）
+
+	MaintenanceHours int // OBSYNC_MAINTENANCE_HOURS, 默认 24（0 = 关闭定时维护）
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Listen:      getenv("OBSYNC_LISTEN", ":8080"),
+		Listen:      getenv("OBSYNC_LISTEN", "127.0.0.1:8080"),
 		DataDir:     getenv("OBSYNC_DATA_DIR", "./data"),
 		Token:       os.Getenv("OBSYNC_TOKEN"),
 		MaxFileSize: 100 << 20,
@@ -71,6 +81,38 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid OBSYNC_HISTORY_MAX_PER_FILE: %q", v)
 		}
 		cfg.HistoryMaxPerFile = n
+	}
+
+	cfg.HistoryAttachmentDays = 30
+	cfg.HistoryAttachmentMax = 10
+	cfg.ChangesDays = 90
+	cfg.ChangesMax = 100000
+	cfg.MaintenanceHours = 24
+	intEnvs := []struct {
+		name string
+		dst  *int
+	}{
+		{"OBSYNC_HISTORY_ATTACHMENT_DAYS", &cfg.HistoryAttachmentDays},
+		{"OBSYNC_HISTORY_ATTACHMENT_MAX_PER_FILE", &cfg.HistoryAttachmentMax},
+		{"OBSYNC_CHANGES_DAYS", &cfg.ChangesDays},
+		{"OBSYNC_CHANGES_MAX", &cfg.ChangesMax},
+		{"OBSYNC_MAINTENANCE_HOURS", &cfg.MaintenanceHours},
+	}
+	for _, e := range intEnvs {
+		if v := os.Getenv(e.name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("invalid %s: %q", e.name, v)
+			}
+			*e.dst = n
+		}
+	}
+	if v := os.Getenv("OBSYNC_HISTORY_MAX_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid OBSYNC_HISTORY_MAX_BYTES: %q", v)
+		}
+		cfg.HistoryMaxBytes = n
 	}
 
 	switch strings.ToLower(getenv("OBSYNC_LOG_LEVEL", "info")) {

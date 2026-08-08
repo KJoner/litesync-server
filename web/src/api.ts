@@ -25,15 +25,28 @@ export class AuthError extends Error {
 	}
 }
 
-export class Api {
-	constructor(private token: string) {}
+/**
+ * v4：浏览器不再持有根 API Token。
+ * 登录用 Token 换取 HttpOnly + SameSite=Strict 的只读会话 Cookie，
+ * JavaScript 完全接触不到凭据；之后所有请求靠 Cookie 自动携带。
+ */
+export async function login(token: string): Promise<boolean> {
+	const res = await fetch("/web/session", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ token }),
+	});
+	return res.ok;
+}
 
+export async function logout(): Promise<void> {
+	await fetch("/web/session", { method: "DELETE" }).catch(() => undefined);
+}
+
+export class Api {
 	private async req(path: string, init?: RequestInit): Promise<Response> {
-		const res = await fetch(path, {
-			...init,
-			headers: { Authorization: `Bearer ${this.token}`, ...(init?.headers ?? {}) },
-		});
-		if (res.status === 401) throw new AuthError();
+		const res = await fetch(path, init);
+		if (res.status === 401 || res.status === 403) throw new AuthError();
 		return res;
 	}
 

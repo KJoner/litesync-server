@@ -19,3 +19,10 @@ services:
     # 绑定地址与宿主机端口可在 .env 中用 OBSYNC_BIND / OBSYNC_PORT 覆盖
     ports:
       - "${OBSYNC_BIND:-127.0.0.1}:${OBSYNC_PORT:-8080}:8080"
+
+    # 日志轮转：防止 json-file 日志无限增长吃满磁盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
