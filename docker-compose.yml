@@ -1,3 +1,5 @@
+name: litesync
+
 services:
   obsync:
     build: .
@@ -13,6 +15,7 @@ services:
     volumes:
       - ./data:/data
 
-    # 只监听 localhost，通过 Caddy / Nginx / Cloudflare Tunnel 暴露 HTTPS
+    # 默认只监听 localhost，通过 Caddy / Nginx / Cloudflare Tunnel 暴露 HTTPS；
+    # 绑定地址与宿主机端口可在 .env 中用 OBSYNC_BIND / OBSYNC_PORT 覆盖
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${OBSYNC_BIND:-127.0.0.1}:${OBSYNC_PORT:-8080}:8080"

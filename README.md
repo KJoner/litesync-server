@@ -18,6 +18,16 @@
 - 所有变更写入 changes 表（递增 sequence），客户端按 `since` 增量拉取
 - 上传采用「临时文件 → 校验 SHA-256 → 原子改名 → SQLite 事务」，断电不产生半文件
 
+## 一键部署 / 更新
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync/master/scripts/litesync-install.sh)
+```
+
+首次执行：克隆代码、生成 `.env`（随机 Token，端口被占用时自动改用 8081–8099
+中的空闲端口）、构建镜像、启动并输出配置信息。
+再次执行：拉取最新代码重新构建部署，`.env` 和 `data/` 保持不变。
+
 ## 快速开始（Docker）
 
 ```bash
