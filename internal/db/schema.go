@@ -54,4 +54,13 @@ CREATE TABLE IF NOT EXISTS shares (
     created_at INTEGER NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0
 );
+
+-- 一次性加密配对包（v8 新设备接入）：只存客户端加密后的密文，
+-- 解密密钥只在配对链接的 #fragment 中，服务器永远看不到配置明文
+CREATE TABLE IF NOT EXISTS pairings (
+    id TEXT PRIMARY KEY,
+    ciphertext TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
 `

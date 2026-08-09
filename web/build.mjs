@@ -9,7 +9,7 @@ const outdir = join(root, "..", "internal", "web", "dist");
 mkdirSync(outdir, { recursive: true });
 
 await esbuild.build({
-	entryPoints: [join(root, "src", "app.ts"), join(root, "src", "share.ts")],
+	entryPoints: [join(root, "src", "app.ts"), join(root, "src", "share.ts"), join(root, "src", "pair.ts")],
 	bundle: true,
 	minify: true,
 	format: "iife",
@@ -18,7 +18,7 @@ await esbuild.build({
 	logLevel: "info",
 });
 
-for (const f of ["index.html", "share.html", "styles.css"]) {
+for (const f of ["index.html", "share.html", "pair.html", "styles.css"]) {
 	copyFileSync(join(root, f), join(outdir, f));
 }
 console.log("web dist ->", outdir);

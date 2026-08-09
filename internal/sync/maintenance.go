@@ -51,6 +51,9 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 	} else {
 		stats.ChangesPruned = n
 	}
+	if _, err := s.maintainPairings(now); err != nil {
+		s.log.Warn("maintenance: pairings", "error", err)
+	}
 	if v, err := s.maintainSQLite(); err != nil {
 		s.log.Warn("maintenance: sqlite", "error", err)
 	} else {

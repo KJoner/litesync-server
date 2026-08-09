@@ -123,7 +123,7 @@ sync.example.com {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 `{"status":"ok"}`（无认证） |
-| GET | `/api/v1/info` | 版本、`protocolVersion` / `minProtocolVersion`（客户端兼容性判定）、latestSequence、服务器时间 |
+| GET | `/api/v1/info` | 版本、`protocolVersion` / `minProtocolVersion`（客户端兼容性判定）、`vaultId`（仓库稳定身份，0.8.0+）、latestSequence、服务器时间 |
 | GET | `/api/v1/changes?since=N&limit=500` | 增量变更；游标过旧时返回 `resyncRequired` + `minSequence` |
 | GET | `/api/v1/snapshot` | 当前全部未删除文件的元数据（Web 端 / 全量对账） |
 | GET | `/api/v1/file?path=...` | 下载原始字节，元数据在响应 Header |
@@ -144,6 +144,10 @@ sync.example.com {
 | POST | `/api/v1/admin/backup/run` | 立即备份（异步；任务互斥，运行中返回 409） |
 | POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
+| POST | `/api/v1/pairing` | 创建一次性加密配对包（0.8.0；只存密文，默认 5 分钟过期） |
+| DELETE | `/api/v1/pairing/{id}` | 撤销配对包（配对窗口关闭时调用） |
+| POST | `/pair/{id}/consume` | **公开**消费配对包（一次性；密文仍需链接 fragment 中的密钥解密） |
+| GET | `/p/{id}` | **公开**扫码落地页（脚本本地拼 obsidian:// 深链，secret 不经服务器） |
 | POST / DELETE | `/web/session` | Web 登录（Token 换只读会话；`admin:true` 加发 admin 会话）/ 登出 |
 | GET | `/share/{id}` | **公开**读取分享密文（密钥在链接 fragment 中，服务器拿不到） |
 | GET | `/` | **公开** Web 只读端静态资源（embed，CSP 严格策略） |

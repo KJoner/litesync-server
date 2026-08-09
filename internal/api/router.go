@@ -61,6 +61,12 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/backup/check", h.backupCheck)
 	mux.HandleFunc("GET /api/v1/admin/backup/snapshots", h.backupSnapshots)
 
+	// 配对（v8 新设备接入）：创建/撤销需 Token；消费与落地页公开（一次性 + 5 分钟过期）
+	mux.HandleFunc("POST /api/v1/pairing", h.createPairing)
+	mux.HandleFunc("DELETE /api/v1/pairing/{id}", h.deletePairing)
+	mux.HandleFunc("POST /pair/{id}/consume", h.consumePairing)
+	mux.HandleFunc("GET /p/{id}", h.pairLanding)
+
 	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
 	mux.HandleFunc("GET /share/{id}", h.getShare)
 	if dist, err := fs.Sub(web.Dist, "dist"); err == nil {
@@ -88,10 +94,18 @@ func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
 		h.internalError(w, "info", err)
 		return
 	}
+	// vaultId：本仓库的稳定身份（v8）。客户端 Bootstrap 后保存，
+	// 发现同一 URL 上 vaultId 变化（服务器重装/换库）即停止自动同步重新接入
+	vaultID, err := h.svc.VaultID()
+	if err != nil {
+		h.internalError(w, "info", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":            h.opts.Version,
 		"protocolVersion":    ProtocolVersion,
 		"minProtocolVersion": MinProtocolVersion,
+		"vaultId":            vaultID,
 		"latestSequence":     latest,
 		"serverTime":         time.Now().Unix(),
 	})
