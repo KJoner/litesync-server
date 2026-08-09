@@ -90,6 +90,25 @@ set -a; . ./.env; set +a
 BIND="${OBSYNC_BIND:-127.0.0.1}"
 PORT="${OBSYNC_PORT:-8080}"
 
+# ---------- 备份配置密钥（v6；仅首次生成，重新部署完整保留） ----------
+# backup-config.key 与 /data 分离：R2 凭据以 AES-256-GCM 密文存在数据库里，
+# 单独复制 /data 无法解出凭据。丢失该文件只需在 Web 重新填一次 R2 配置。
+ETC_DIR="${LITESYNC_ETC_DIR:-$PWD/etc-litesync}"
+KEY_FILE="$ETC_DIR/backup-config.key"
+if [ ! -f "$KEY_FILE" ]; then
+	mkdir -p "$ETC_DIR"
+	if command -v openssl >/dev/null 2>&1; then
+		openssl rand -hex 32 > "$KEY_FILE"
+	else
+		head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$KEY_FILE"
+	fi
+	chmod 600 "$KEY_FILE"
+	chmod 700 "$ETC_DIR"
+	info "已生成备份配置密钥 $KEY_FILE"
+else
+	info "检测到已有 backup-config.key，保留不变"
+fi
+
 # ---------- 构建并启动 ----------
 info "构建镜像并启动容器 ..."
 $COMPOSE up -d --build
@@ -136,6 +155,9 @@ echo "   API Token  : 同上"
 if [ "$BIND" = "127.0.0.1" ]; then
 	echo " 注意：当前仅监听 127.0.0.1，外网访问需要配置 HTTPS 反向代理。"
 fi
+echo "--------------------------------------------------------------"
+echo " 异地备份  : 浏览器打开 Web 端 → ⚙ → Backup 配置 Cloudflare R2"
+echo "             （backup-config.key 位于 $ETC_DIR，请勿删除）"
 echo "--------------------------------------------------------------"
 echo " 常用命令（在 $REPO_DIR/server 下执行）："
 echo "   查看日志 : $COMPOSE logs -f"

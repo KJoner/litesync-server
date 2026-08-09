@@ -235,7 +235,8 @@ func TestMaintenanceOrphanBlobsAndShares(t *testing.T) {
 		t.Fatal(resp.StatusCode)
 	}
 	shareID := body["id"].(string)
-	time.Sleep(1500 * time.Millisecond)
+	// 过期判断是秒级（now > expiresAt）：等待 >2s 才能保证跨过临界秒，避免 flaky
+	time.Sleep(2500 * time.Millisecond)
 
 	e.svc.RunMaintenance()
 

@@ -527,3 +527,105 @@ footer {
 		padding: 20px 16px 60px;
 	}
 }
+
+/* ---------- 备份设置页（v6） ---------- */
+.settings-box {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+.settings-card {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--bg-side);
+	padding: 16px 18px;
+}
+.settings-card h2 {
+	margin: 0 0 10px;
+	font-size: 15px;
+}
+.settings-grid {
+	display: grid;
+	grid-template-columns: 140px minmax(0, 1fr);
+	gap: 6px 12px;
+	align-items: baseline;
+}
+.settings-grid .ok {
+	color: var(--accent);
+}
+.settings-label {
+	display: block;
+	margin: 12px 0 4px;
+	color: var(--muted);
+	font-size: 12px;
+}
+.settings-input {
+	width: 100%;
+	max-width: 460px;
+}
+.settings-row {
+	display: flex;
+	gap: 8px;
+	align-items: center;
+}
+.settings-row .settings-input {
+	flex: 1;
+}
+.settings-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 16px;
+}
+.settings-check {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 14px;
+	cursor: pointer;
+}
+.settings-msg {
+	min-height: 18px;
+	margin: 10px 0 0;
+}
+.settings-msg.ok {
+	color: var(--accent);
+}
+.settings-pw-warn {
+	border: 1px solid var(--border);
+	border-left: 3px solid #d9a53f;
+	border-radius: var(--radius);
+	padding: 8px 12px;
+	margin-top: 8px;
+}
+.warn {
+	color: #d9a53f;
+}
+.usage-bar {
+	height: 8px;
+	border-radius: 4px;
+	background: var(--bg-hover);
+	overflow: hidden;
+	margin-top: 12px;
+}
+.usage-fill {
+	height: 100%;
+	background: var(--accent);
+	transition: width 0.2s ease;
+}
+.usage-fill.yellow {
+	background: #d9a53f;
+}
+.usage-fill.red {
+	background: #d05050;
+}
+.snapshot-row {
+	display: flex;
+	gap: 12px;
+	align-items: baseline;
+	padding: 5px 0;
+	border-bottom: 1px solid var(--border);
+}
+.snapshot-row:last-child {
+	border-bottom: none;
+}

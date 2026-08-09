@@ -7,7 +7,8 @@ import (
 )
 
 // authGate 校验 /api/* 请求：
-//   - Bearer Token（插件/CLI）→ 完整权限
+//   - Bearer Token（插件/CLI）→ 完整权限（含 admin）
+//   - Admin 会话 Cookie（短期）→ 仅 /api/v1/admin/*（备份管理）
 //   - Web 只读会话 Cookie → 仅白名单 GET 接口（webSessionAllowed）
 //
 // 其余路径（/health、/web/session、/share/{id}、静态资源）直接放行。
@@ -23,6 +24,19 @@ func authGate(token string, web *sessionStore, next http.Handler) http.Handler {
 		if strings.HasPrefix(auth, prefix) &&
 			subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), want) == 1 {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/") {
+			// ADMIN capability：只读会话不够，必须持根 Token 或短期 admin 会话
+			if c, err := r.Cookie(adminCookieName); err == nil && web.validAdmin(c.Value) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if c, err := r.Cookie(sessionCookieName); err == nil && web.valid(c.Value) {
+				writeErr(w, http.StatusForbidden, "admin session required")
+				return
+			}
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		if c, err := r.Cookie(sessionCookieName); err == nil && web.valid(c.Value) {

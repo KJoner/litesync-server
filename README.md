@@ -1,16 +1,16 @@
 # obsync — 单用户 Obsidian 私有同步服务器
 
 一个使用 Go + SQLite + 内容寻址 Blob 存储实现的单用户、低资源、增量式
-Obsidian 私有同步服务器，内嵌 Web 只读客户端。
+Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudflare R2 异地备份。
 
 > ⚠️ **Sync is not Backup（同步不等于备份）**
-> 本服务只负责在多台设备之间同步笔记，不能替代备份。
-> 请定期用 restic / rclone / rsync 等工具备份整个 `/data` 目录。
+> 同步只保护多设备一致性；灾难恢复请启用内置的 R2 异地备份（见下），
+> 或自行定期备份整个 `/data` 目录。
 
-## 架构（v0.5）
+## 架构（v0.6）
 
 ```text
-一个 Go Binary + 一个 SQLite 文件 + 一个内容寻址 Blob 目录
+一个 Go Binary + 一个 SQLite 文件 + 一个内容寻址 Blob 目录（+ restic 备份旁路）
 ```
 
 ```text
@@ -30,6 +30,8 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端。
 - 资源治理任务（启动 + 每 24h）：历史保留扫描（Markdown/附件差异化）、
   历史字节硬预算、孤儿 blob 回收、过期分享清理、changes 裁剪、
   SQLite checkpoint / 按需 VACUUM，并输出资源统计日志
+- 备份是**服务器旁路能力**（v0.6）：不改动 revision / changes / E2EE / merge
+  任何协议；restic 仅在备份任务执行时 fork，无常驻内存开销
 
 ## 一键部署 / 更新
 
@@ -85,6 +87,10 @@ $env:OBSYNC_TOKEN = 'your-random-token'; go run ./cmd/obsync
 | `OBSYNC_CHANGES_DAYS` | `90` | changes 保留天数（旧游标自动 snapshot 对账） |
 | `OBSYNC_CHANGES_MAX` | `100000` | changes 最大行数 |
 | `OBSYNC_MAINTENANCE_HOURS` | `24` | 资源治理任务间隔（0 = 关闭定时；启动时总会执行一次） |
+| `OBSYNC_BACKUP_KEY_FILE` | （空 = 备份不可用） | 备份配置加密密钥文件；Docker 镜像内默认 `/etc/litesync/backup-config.key` |
+
+Compose 额外变量：`LITESYNC_ETC_DIR`（宿主机密钥目录，默认 `./etc-litesync`，
+只读挂载为容器内 `/etc/litesync`；一键部署脚本自动生成密钥）。
 
 ## HTTPS（生产环境必须）
 
@@ -101,10 +107,12 @@ sync.example.com {
 
 认证方式（`/api/*`）：
 
-- `Authorization: Bearer <token>`（插件 / CLI）→ **完整权限**
+- `Authorization: Bearer <token>`（插件 / CLI）→ **完整权限**（含 admin）
 - Web 只读会话 Cookie（`POST /web/session` 登录换取，HttpOnly +
-  SameSite=Strict）→ **仅白名单 GET**（info / snapshot / file / history /
-  version / vault-key），写操作一律 403
+  SameSite=Strict，7 天）→ **仅白名单 GET**（info / snapshot / file /
+  history / version / vault-key），写操作一律 403
+- Admin 会话 Cookie（`POST /web/session` 传 `"admin":true` 换取，30 分钟）
+  → **仅 `/api/v1/admin/*`**（备份管理）；只读会话触碰 admin 接口一律 403
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -123,7 +131,14 @@ sync.example.com {
 | POST | `/api/v1/share` | 创建分享（body 为独立 Share Key 加密的密文） |
 | GET | `/api/v1/shares` | 分享列表 |
 | DELETE | `/api/v1/share?id=...` | 撤销分享 |
-| POST / DELETE | `/web/session` | Web 登录（Token 换只读会话）/ 登出（无需已有认证） |
+| GET | `/api/v1/admin/backup/status` | 备份状态（上次/下次备份、仓库统计、错误） |
+| GET / PUT | `/api/v1/admin/backup/config` | 备份配置；**GET 永不返回 Secret**，PUT 中 Secret 留空 = 保持原值 |
+| POST | `/api/v1/admin/backup/test` | R2 连通性 / 凭据 / 仓库状态检测 |
+| POST | `/api/v1/admin/backup/init` | 初始化 restic repository（一次性） |
+| POST | `/api/v1/admin/backup/run` | 立即备份（异步；任务互斥，运行中返回 409） |
+| POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
+| GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
+| POST / DELETE | `/web/session` | Web 登录（Token 换只读会话；`admin:true` 加发 admin 会话）/ 登出 |
 | GET | `/share/{id}` | **公开**读取分享密文（密钥在链接 fragment 中，服务器拿不到） |
 | GET | `/` | **公开** Web 只读端静态资源（embed，CSP 严格策略） |
 
@@ -168,13 +183,78 @@ Obsidian 风格阅读器（文件树 / Markdown / Outline / 文件名搜索 /
 前端源码在仓库 `web/`，构建产物已提交（`server/internal/web/dist`），
 部署无需 Node；改前端后 `cd web && npm run build` 再重新编译服务器。
 
+### 异地备份（Restic → Cloudflare R2，v0.6）
+
+三层数据保护各司其职：**同步** = 实时多设备一致，**版本历史** = 文件级恢复，
+**R2 备份** = 服务器损毁级的灾难恢复。
+
+```text
+BackupManager ── 一致性快照（写锁内 VACUUM INTO + hardlink staging）
+      │
+    restic ────── 加密 / 去重 / 快照管理（fork 子进程，用完即退）
+      │
+Cloudflare R2 ── S3 兼容对象存储（免费额度 10GB/月，egress 免费）
+```
+
+**配置流程**（部署后全程在 Web 完成，无需 SSH）：
+浏览器打开 Web 端 → `⚙` → Backup → Admin unlock（输入 Token）→
+填 R2 Account ID / Bucket / S3 凭据 → Generate 生成 Restic 恢复密码
+（**立即存入密码管理器**，服务器损毁后没有它备份无法解开）→
+Test connection → Initialize → Backup now → 勾选 Enable automatic backup。
+
+- **计划**：每 6 小时备份；每日 forget（keep-last 8 / daily 14 / weekly 8 /
+  monthly 6）、每周 prune、每月 check；单任务互斥，绝不并发
+- **一致性**：绝不直接备份运行中的 `/data`——短暂持全局写锁生成
+  `.backup-staging/`（SQLite `VACUUM INTO` + blob hardlink + manifest），
+  restic 读 staging，同步全程不受影响
+- **安全**：R2 凭据与 Restic 密码以 AES-256-GCM 密文存于 SQLite，解密密钥
+  `backup-config.key` 在 `/data` **之外**（单独拷贝数据目录拿不到凭据）；
+  凭据只经子进程环境变量传给 restic，不进命令行 / 日志；客户端永远接触不到
+- **失败策略**：备份任何失败只标记 `Backup = Failed` 并在下个周期重试，
+  绝不影响同步
+- **R2 侧要求**：Bucket 保持 private；凭据只授予该 Bucket 的
+  Object Read & Write；**绝不要配置 R2 Lifecycle 自动删除**（会损坏 restic
+  仓库，生命周期只能由 forget/prune 管理）；暂不启用 Bucket Lock
+
+### 灾难恢复指南（Disaster Recovery）
+
+前提：你有 ① R2 凭据 ② Restic 恢复密码（密码管理器里那份）。
+
+```bash
+# 1. 停止 LiteSync（新机器则跳过）
+cd litesync/server && docker compose down
+
+# 2. 从 R2 恢复到临时目录（宿主机装 restic 或用容器）
+export RESTIC_REPOSITORY='s3:https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<bucket>/restic'
+export RESTIC_PASSWORD='<恢复密码>'
+export AWS_ACCESS_KEY_ID='<AccessKeyID>' AWS_SECRET_ACCESS_KEY='<SecretAccessKey>'
+restic snapshots                       # 确认快照存在
+restic restore latest --target /tmp/litesync-restore
+
+# 3. 校验并替换 /data（快照内容在 .backup-staging/current/ 下）
+RESTORED=$(find /tmp/litesync-restore -type d -name current -path '*backup-staging*')
+cat "$RESTORED/backup-manifest.json"   # 确认版本与 latestSequence
+mv server/data server/data.broken 2>/dev/null || true
+mkdir -p server/data && cp -a "$RESTORED"/sync.db "$RESTORED"/blobs "$RESTORED"/shares server/data/
+[ -d "$RESTORED/vaults" ] && cp -a "$RESTORED/vaults" server/data/
+
+# 4. 重新部署并验证（.env 不在备份里，Token 丢了就重新生成并更新各设备）
+bash scripts/litesync-install.sh
+curl http://127.0.0.1:8080/health
+```
+
+恢复后各设备照常连接：客户端游标若新于恢复点，changes 接口会触发
+snapshot 全量对账自动回齐，不需要手工干预。
+
 ## 测试
 
 ```bash
 go test ./...
 ```
 
-覆盖：认证与只读会话矩阵、上传/下载/删除、revision 冲突、幂等重传、
+覆盖：认证与只读/admin 会话矩阵、上传/下载/删除、revision 冲突、幂等重传、
 changes 顺序/分页/裁剪与 resync、路径穿越（含 URL encoded）、中文路径、
 版本历史与 retention、vault-key 保护、分享生命周期、维护任务、
-HEAD→blob 迁移、CSP 响应头、双设备协议场景。
+HEAD→blob 迁移、CSP 响应头、双设备协议场景，以及备份专项
+（加密配置往返与防泄露、staging 一致性快照、restic 调用参数/env 隔离、
+任务互斥、Secret 永不出现在 API 响应）。

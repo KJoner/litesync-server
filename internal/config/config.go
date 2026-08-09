@@ -29,15 +29,20 @@ type Config struct {
 	ChangesMax  int // OBSYNC_CHANGES_MAX, 默认 100000（0 = 不限）
 
 	MaintenanceHours int // OBSYNC_MAINTENANCE_HOURS, 默认 24（0 = 关闭定时维护）
+
+	// BackupKeyFile 备份配置加密密钥文件路径（OBSYNC_BACKUP_KEY_FILE，默认空 = 备份功能不可用）。
+	// 必须位于数据目录之外：单独复制 /data 无法解出 R2 凭据与 Restic 密码。
+	BackupKeyFile string
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Listen:      getenv("OBSYNC_LISTEN", "127.0.0.1:8080"),
-		DataDir:     getenv("OBSYNC_DATA_DIR", "./data"),
-		Token:       os.Getenv("OBSYNC_TOKEN"),
-		MaxFileSize: 100 << 20,
-		LogLevel:    slog.LevelInfo,
+		Listen:        getenv("OBSYNC_LISTEN", "127.0.0.1:8080"),
+		DataDir:       getenv("OBSYNC_DATA_DIR", "./data"),
+		Token:         os.Getenv("OBSYNC_TOKEN"),
+		MaxFileSize:   100 << 20,
+		LogLevel:      slog.LevelInfo,
+		BackupKeyFile: os.Getenv("OBSYNC_BACKUP_KEY_FILE"),
 	}
 
 	if cfg.Token == "" {

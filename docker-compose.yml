@@ -14,6 +14,9 @@ services:
 
     volumes:
       - ./data:/data
+      # 备份配置加密密钥（与 /data 分离：单独拷贝数据目录拿不到 R2 凭据）。
+      # 一键部署脚本会自动生成；目录只读挂载
+      - ${LITESYNC_ETC_DIR:-./etc-litesync}:/etc/litesync:ro
 
     # 默认只监听 localhost，通过 Caddy / Nginx / Cloudflare Tunnel 暴露 HTTPS；
     # 绑定地址与宿主机端口可在 .env 中用 OBSYNC_BIND / OBSYNC_PORT 覆盖

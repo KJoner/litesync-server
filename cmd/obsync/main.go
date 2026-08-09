@@ -14,13 +14,14 @@ import (
 	"time"
 
 	"obsync/internal/api"
+	"obsync/internal/backup"
 	"obsync/internal/config"
 	"obsync/internal/db"
 	"obsync/internal/storage"
 	syncsvc "obsync/internal/sync"
 )
 
-const version = "0.5.0"
+const version = "0.6.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -97,11 +98,19 @@ func run() error {
 			}
 		}()
 	}
+	// v6：备份管理器（restic → Cloudflare R2）。密钥文件不可用时功能禁用但服务照常运行
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	bkp := backup.New(database, svc, backup.NewRunner(""), cfg.DataDir, version, cfg.BackupKeyFile, logger)
+	bkp.StartScheduler(ctx)
+
 	handler := api.New(api.Options{
 		Token:       cfg.Token,
 		MaxFileSize: cfg.MaxFileSize,
 		Version:     version,
 		Logger:      logger,
+		Backup:      bkp,
 	}, svc)
 
 	srv := &http.Server{
@@ -110,9 +119,6 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {

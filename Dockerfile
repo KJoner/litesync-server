@@ -6,13 +6,14 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/obsync ./cmd/obsync
 
-# 运行阶段：仅包含二进制和 CA 证书，镜像保持轻量
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+# 运行阶段：二进制 + CA 证书 + restic（备份用，仅在备份任务运行时 fork，无常驻内存开销）
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates restic
 COPY --from=build /out/obsync /usr/local/bin/obsync
 
 ENV OBSYNC_LISTEN=:8080 \
-    OBSYNC_DATA_DIR=/data
+    OBSYNC_DATA_DIR=/data \
+    OBSYNC_BACKUP_KEY_FILE=/etc/litesync/backup-config.key
 
 VOLUME /data
 EXPOSE 8080

@@ -15,6 +15,8 @@ try {
     $env:OBSYNC_LISTEN = $Listen
     $env:OBSYNC_DATA_DIR = $DataDir
     $env:OBSYNC_LOG_LEVEL = "debug"
+    # 备份配置密钥放在数据目录之外（与生产的分离原则一致）；不存在时服务器自动生成
+    $env:OBSYNC_BACKUP_KEY_FILE = Join-Path (Split-Path $DataDir -Parent) "backup-config.key"
     Write-Host "obsync dev server -> http://$Listen   data: $DataDir" -ForegroundColor Green
     Write-Host "API Token: $Token" -ForegroundColor Green
     .\obsync.exe

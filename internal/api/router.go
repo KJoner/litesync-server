@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"obsync/internal/backup"
 	syncsvc "obsync/internal/sync"
 	"obsync/internal/web"
 )
@@ -17,6 +18,7 @@ type Options struct {
 	MaxFileSize int64
 	Version     string
 	Logger      *slog.Logger
+	Backup      *backup.Manager // 可为 nil（备份功能未启用）
 }
 
 type handlers struct {
@@ -48,6 +50,16 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/share", h.createShare)
 	mux.HandleFunc("GET /api/v1/shares", h.listShares)
 	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
+
+	// 备份管理（v6）：ADMIN capability，只读会话触碰一律 403（见 authGate）
+	mux.HandleFunc("GET /api/v1/admin/backup/status", h.backupStatus)
+	mux.HandleFunc("GET /api/v1/admin/backup/config", h.backupGetConfig)
+	mux.HandleFunc("PUT /api/v1/admin/backup/config", h.backupPutConfig)
+	mux.HandleFunc("POST /api/v1/admin/backup/test", h.backupTest)
+	mux.HandleFunc("POST /api/v1/admin/backup/init", h.backupInit)
+	mux.HandleFunc("POST /api/v1/admin/backup/run", h.backupRun)
+	mux.HandleFunc("POST /api/v1/admin/backup/check", h.backupCheck)
+	mux.HandleFunc("GET /api/v1/admin/backup/snapshots", h.backupSnapshots)
 
 	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
 	mux.HandleFunc("GET /share/{id}", h.getShare)

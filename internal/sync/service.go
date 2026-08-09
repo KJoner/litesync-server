@@ -445,6 +445,14 @@ func (s *Service) LatestSequence() (int64, error) {
 	return db.LatestSequence(s.db)
 }
 
+// WithGlobalLock 短暂持有全局写锁执行 fn（备份一致性快照用）：
+// fn 执行期间没有任何元数据写入与 blob GC，保证快照内部一致。
+func (s *Service) WithGlobalLock(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn()
+}
+
 // Snapshot 返回当前所有未删除文件的元数据与最新 sequence。
 func (s *Service) Snapshot() (int64, []db.File, error) {
 	files, err := db.ListFiles(s.db)

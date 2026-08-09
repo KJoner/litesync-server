@@ -29,12 +29,13 @@ export class AuthError extends Error {
  * v4：浏览器不再持有根 API Token。
  * 登录用 Token 换取 HttpOnly + SameSite=Strict 的只读会话 Cookie，
  * JavaScript 完全接触不到凭据；之后所有请求靠 Cookie 自动携带。
+ * v6：admin=true 时额外下发短期 admin 会话（备份管理页需要）。
  */
-export async function login(token: string): Promise<boolean> {
+export async function login(token: string, admin = false): Promise<boolean> {
 	const res = await fetch("/web/session", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ token }),
+		body: JSON.stringify({ token, admin }),
 	});
 	return res.ok;
 }
@@ -87,4 +88,96 @@ export class Api {
 		if (!res.ok) throw new Error(`version: HTTP ${res.status}`);
 		return res.arrayBuffer();
 	}
+
+	// ---------- 备份管理（ADMIN capability：需要 admin 会话，见 login(token, true)） ----------
+
+	private async adminReq(path: string, init?: RequestInit): Promise<unknown> {
+		const res = await this.req(`/api/v1/admin/backup/${path}`, init);
+		const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+		if (!res.ok && res.status !== 202) {
+			throw new Error(typeof body.error === "string" ? body.error : `HTTP ${res.status}`);
+		}
+		return body;
+	}
+
+	backupStatus(): Promise<BackupStatus> {
+		return this.adminReq("status") as Promise<BackupStatus>;
+	}
+
+	backupConfig(): Promise<BackupConfigView> {
+		return this.adminReq("config") as Promise<BackupConfigView>;
+	}
+
+	backupSaveConfig(update: Record<string, unknown>): Promise<BackupConfigView> {
+		return this.adminReq("config", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(update),
+		}) as Promise<BackupConfigView>;
+	}
+
+	backupTest(): Promise<{ ok: boolean; initialized?: boolean; error?: string }> {
+		return this.adminReq("test", { method: "POST" }) as Promise<{
+			ok: boolean;
+			initialized?: boolean;
+			error?: string;
+		}>;
+	}
+
+	backupInit(): Promise<void> {
+		return this.adminReq("init", { method: "POST" }).then(() => undefined);
+	}
+
+	backupRun(): Promise<void> {
+		return this.adminReq("run", { method: "POST" }).then(() => undefined);
+	}
+
+	backupCheck(): Promise<void> {
+		return this.adminReq("check", { method: "POST" }).then(() => undefined);
+	}
+
+	backupSnapshots(): Promise<{ snapshots: BackupSnapshot[]; initialized: boolean }> {
+		return this.adminReq("snapshots") as Promise<{ snapshots: BackupSnapshot[]; initialized: boolean }>;
+	}
+}
+
+export interface BackupStatus {
+	keyAvailable: boolean;
+	keyError?: string;
+	resticOk: boolean;
+	resticVersion?: string;
+	enabled: boolean;
+	configured: boolean;
+	running: boolean;
+	runningOp?: string;
+	lastStartedAt?: number;
+	lastCompletedAt?: number;
+	lastDurationMs?: number;
+	lastSnapshotId?: string;
+	lastError?: string;
+	nextRunAt?: number;
+	repositorySize?: number;
+	snapshotCount?: number;
+	budgetBytes?: number;
+}
+
+export interface BackupConfigView {
+	enabled: boolean;
+	provider: string;
+	accountId: string;
+	bucket: string;
+	prefix: string;
+	endpoint: string;
+	accessKeyConfigured: boolean;
+	secretKeyConfigured: boolean;
+	resticPasswordConfigured: boolean;
+	budgetGb: number;
+}
+
+export interface BackupSnapshot {
+	id: string;
+	short_id: string;
+	time: string;
+	paths?: string[];
+	tags?: string[];
 }
