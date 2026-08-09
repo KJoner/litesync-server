@@ -264,3 +264,11 @@ changes 顺序/分页/裁剪与 resync、路径穿越（含 URL encoded）、中
 HEAD→blob 迁移、CSP 响应头、双设备协议场景，以及备份专项
 （加密配置往返与防泄露、staging 一致性快照、restic 调用参数/env 隔离、
 任务互斥、Secret 永不出现在 API 响应）。
+
+## 许可（License）
+
+[AGPL-3.0](LICENSE)。你可以自由地自托管、修改和分发本服务器；
+如果你基于修改后的版本对外提供网络服务，必须向该服务的用户提供修改后的源码。
+
+配套的 [Obsidian 插件](https://github.com/KJoner/litesync)为独立程序
+（仅通过 HTTP API 通信），采用 MIT 许可。
