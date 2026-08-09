@@ -12,7 +12,7 @@ import (
 	gosync "sync"
 	"time"
 
-	"obsync/internal/db"
+	"github.com/KJoner/litesync-server/internal/db"
 )
 
 const (

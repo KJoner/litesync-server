@@ -16,10 +16,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"obsync/internal/api"
-	"obsync/internal/db"
-	"obsync/internal/storage"
-	syncsvc "obsync/internal/sync"
+	"github.com/KJoner/litesync-server/internal/api"
+	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/storage"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 const testToken = "test-token-0123456789abcdef0123456789abcdef"

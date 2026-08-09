@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"obsync/internal/storage"
-	syncsvc "obsync/internal/sync"
+	"github.com/KJoner/litesync-server/internal/storage"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 type apiVersion struct {

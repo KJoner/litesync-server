@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"obsync/internal/storage"
-	syncsvc "obsync/internal/sync"
+	"github.com/KJoner/litesync-server/internal/storage"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 // vault key 文档大小上限：正常只有几百字节，64KB 足够宽裕。

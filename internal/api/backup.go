@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 
-	"obsync/internal/backup"
+	"github.com/KJoner/litesync-server/internal/backup"
 )
 
 // 备份管理接口（v6）：全部挂在 /api/v1/admin/* 下，

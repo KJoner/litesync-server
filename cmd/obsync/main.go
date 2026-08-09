@@ -13,15 +13,15 @@ import (
 	"syscall"
 	"time"
 
-	"obsync/internal/api"
-	"obsync/internal/backup"
-	"obsync/internal/config"
-	"obsync/internal/db"
-	"obsync/internal/storage"
-	syncsvc "obsync/internal/sync"
+	"github.com/KJoner/litesync-server/internal/api"
+	"github.com/KJoner/litesync-server/internal/backup"
+	"github.com/KJoner/litesync-server/internal/config"
+	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/storage"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.6.0"
+const version = "0.7.0"
 
 func main() {
 	if err := run(); err != nil {

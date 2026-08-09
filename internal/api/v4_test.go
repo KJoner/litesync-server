@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	syncsvc "obsync/internal/sync"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 // ---------- Web 只读会话 ----------

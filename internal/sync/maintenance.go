@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"obsync/internal/db"
+	"github.com/KJoner/litesync-server/internal/db"
 )
 
 // MaintenanceStats 单次维护任务的结果统计。

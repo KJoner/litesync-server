@@ -17,8 +17,8 @@ import (
 	gosync "sync"
 	"time"
 
-	"obsync/internal/db"
-	"obsync/internal/storage"
+	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/storage"
 )
 
 var (

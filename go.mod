@@ -1,4 +1,4 @@
-module obsync
+module github.com/KJoner/litesync-server
 
 go 1.26
 

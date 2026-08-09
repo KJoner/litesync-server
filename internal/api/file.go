@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"obsync/internal/storage"
-	syncsvc "obsync/internal/sync"
+	"github.com/KJoner/litesync-server/internal/storage"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 // putFile 处理文件上传。

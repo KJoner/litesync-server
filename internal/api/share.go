@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	syncsvc "obsync/internal/sync"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 type apiShare struct {

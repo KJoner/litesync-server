@@ -1,13 +1,19 @@
-# obsync — 单用户 Obsidian 私有同步服务器
+# LiteSync Server
+
+**Self-hosted sync server for the [LiteSync Obsidian plugin](https://github.com/KJoner/litesync).**
+Single-user, low-resource (runs comfortably on a 1-core / 256MB VPS), E2EE-friendly.
 
 一个使用 Go + SQLite + 内容寻址 Blob 存储实现的单用户、低资源、增量式
 Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudflare R2 异地备份。
+
+> Obsidian 插件仓库：<https://github.com/KJoner/litesync>
+> （插件与服务器独立发版，兼容性由 `/api/v1/info` 的 `protocolVersion` 区间判定）
 
 > ⚠️ **Sync is not Backup（同步不等于备份）**
 > 同步只保护多设备一致性；灾难恢复请启用内置的 R2 异地备份（见下），
 > 或自行定期备份整个 `/data` 目录。
 
-## 架构（v0.6）
+## 架构（v0.7）
 
 ```text
 一个 Go Binary + 一个 SQLite 文件 + 一个内容寻址 Blob 目录（+ restic 备份旁路）
@@ -36,7 +42,7 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudf
 ## 一键部署 / 更新
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync/master/scripts/litesync-install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync-server/master/scripts/litesync-install.sh)
 ```
 
 首次执行：克隆代码、生成 `.env`（随机 Token，端口被占用时自动改用
@@ -46,7 +52,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync/master/script
 ## 快速开始（Docker）
 
 ```bash
-cd server
+cd litesync-server
 cp .env.example .env
 # 生成随机 token 并填入 .env
 openssl rand -hex 32
@@ -117,7 +123,7 @@ sync.example.com {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 `{"status":"ok"}`（无认证） |
-| GET | `/api/v1/info` | 版本、latestSequence、服务器时间 |
+| GET | `/api/v1/info` | 版本、`protocolVersion` / `minProtocolVersion`（客户端兼容性判定）、latestSequence、服务器时间 |
 | GET | `/api/v1/changes?since=N&limit=500` | 增量变更；游标过旧时返回 `resyncRequired` + `minSequence` |
 | GET | `/api/v1/snapshot` | 当前全部未删除文件的元数据（Web 端 / 全量对账） |
 | GET | `/api/v1/file?path=...` | 下载原始字节，元数据在响应 Header |
@@ -180,7 +186,7 @@ X-Device-ID:      设备标识（可选，用于日志与历史）
 
 Obsidian 风格阅读器（文件树 / Markdown / Outline / 文件名搜索 /
 版本历史 / Diff），E2EE 在浏览器本地解密（密钥只存内存，刷新需重新解锁）。
-前端源码在仓库 `web/`，构建产物已提交（`server/internal/web/dist`），
+前端源码在仓库 `web/`，构建产物已提交（`internal/web/dist`），
 部署无需 Node；改前端后 `cd web && npm run build` 再重新编译服务器。
 
 ### 异地备份（Restic → Cloudflare R2，v0.6）

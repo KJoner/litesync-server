@@ -11,11 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	"obsync/internal/api"
-	"obsync/internal/backup"
-	"obsync/internal/db"
-	"obsync/internal/storage"
-	syncsvc "obsync/internal/sync"
+	"github.com/KJoner/litesync-server/internal/api"
+	"github.com/KJoner/litesync-server/internal/backup"
+	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/storage"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 // newBackupTestServer 构建带真实 backup.Manager 的测试服务器

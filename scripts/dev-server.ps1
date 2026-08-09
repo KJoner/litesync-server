@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent
 
-Push-Location (Join-Path $repo "server")
+Push-Location $repo
 try {
     go build -o obsync.exe ./cmd/obsync
     $env:OBSYNC_TOKEN = $Token

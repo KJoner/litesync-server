@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"time"
 
-	"obsync/internal/backup"
-	syncsvc "obsync/internal/sync"
-	"obsync/internal/web"
+	"github.com/KJoner/litesync-server/internal/backup"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
+	"github.com/KJoner/litesync-server/internal/web"
 )
 
 type Options struct {
@@ -70,6 +70,14 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, mux)))
 }
 
+// 协议版本（v7 仓库拆分起正式管理）：插件与服务器各自独立发版，
+// 兼容性由 protocol 区间判定而不是比对版本号。
+// 破坏性协议变更时递增 ProtocolVersion；不再兼容旧客户端时抬高 MinProtocolVersion。
+const (
+	ProtocolVersion    = 1
+	MinProtocolVersion = 1
+)
+
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -81,9 +89,11 @@ func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":        h.opts.Version,
-		"latestSequence": latest,
-		"serverTime":     time.Now().Unix(),
+		"version":            h.opts.Version,
+		"protocolVersion":    ProtocolVersion,
+		"minProtocolVersion": MinProtocolVersion,
+		"latestSequence":     latest,
+		"serverTime":         time.Now().Unix(),
 	})
 }
 

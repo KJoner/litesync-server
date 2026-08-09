@@ -1,0 +1,15 @@
+# 运行数据与凭据（绝不入库）
+data/
+.env
+etc-litesync/
+
+# 构建产物
+obsync
+obsync.exe
+
+# Web 前端依赖（构建产物 internal/web/dist 有意提交，部署无需 Node）
+web/node_modules/
+
+# 系统文件
+.DS_Store
+Thumbs.db

@@ -1,3 +1,8 @@
 data/
-*.md
+etc-litesync/
+web/node_modules/
+scripts/
 .env
+.git/
+.github/
+*.md

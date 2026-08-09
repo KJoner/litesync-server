@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"obsync/internal/db"
+	"github.com/KJoner/litesync-server/internal/db"
 )
 
 // ---------- crypto ----------

@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 #
-# litesync 一键部署 / 更新脚本
+# litesync-server 一键部署 / 更新脚本
 #
-# 全新部署（在希望存放代码的目录下执行，会克隆到 ./litesync）：
-#   bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync/master/scripts/litesync-install.sh)
+# 全新部署（在希望存放代码的目录下执行，会克隆到 ./litesync-server）：
+#   bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync-server/master/scripts/litesync-install.sh)
 #
 # 重新部署 / 更新版本：
 #   在同一目录（或仓库目录内）再次执行同一条命令即可。
-#   .env（含 Token）和 data/ 数据目录会被完整保留。
+#   .env（含 Token）、data/ 数据目录与 backup-config.key 会被完整保留。
+#
+# 从旧 monorepo（KJoner/litesync 的 server/ 子目录）部署升级：
+#   在旧 litesync 目录的同级目录执行本脚本，.env / data / 备份密钥自动迁移。
 #
 set -euo pipefail
 
-REPO_URL="https://github.com/KJoner/litesync.git"
+REPO_URL="https://github.com/KJoner/litesync-server.git"
 BRANCH="${LITESYNC_BRANCH:-master}"
 
 info() { printf '\033[1;32m[litesync]\033[0m %s\n' "$*"; }
@@ -32,18 +35,32 @@ else
 fi
 
 # ---------- 定位 / 获取代码 ----------
-is_repo() { [ -f "$1/server/docker-compose.yml" ] && [ -d "$1/.git" ]; }
+is_repo() { [ -f "$1/docker-compose.yml" ] && [ -f "$1/go.mod" ] && [ -d "$1/.git" ]; }
 
 if is_repo "$(pwd)"; then
 	REPO_DIR="$(pwd)"                       # 在仓库根目录内执行
 elif is_repo "$(cd .. && pwd)"; then
-	REPO_DIR="$(cd .. && pwd)"              # 在 server/ 等子目录内执行
-elif is_repo "$(pwd)/litesync"; then
-	REPO_DIR="$(pwd)/litesync"              # 在安装目录的上层执行
+	REPO_DIR="$(cd .. && pwd)"              # 在 scripts/ 等子目录内执行
+elif is_repo "$(pwd)/litesync-server"; then
+	REPO_DIR="$(pwd)/litesync-server"       # 在安装目录的上层执行
 else
-	REPO_DIR="$(pwd)/litesync"
+	REPO_DIR="$(pwd)/litesync-server"
 	info "克隆代码到 $REPO_DIR ..."
 	git clone --depth 1 -b "$BRANCH" "$REPO_URL" "$REPO_DIR"
+fi
+
+# ---------- 旧 monorepo 部署自动迁移（litesync/server/ → litesync-server/） ----------
+OLD_SERVER=""
+for cand in "$(pwd)/litesync/server" "$(cd "$REPO_DIR/.." && pwd)/litesync/server"; do
+	if [ -f "$cand/.env" ] && [ ! -f "$REPO_DIR/.env" ]; then OLD_SERVER="$cand"; break; fi
+done
+if [ -n "$OLD_SERVER" ]; then
+	warn "检测到旧 monorepo 部署 $OLD_SERVER，迁移 .env / data / 备份密钥 ..."
+	( cd "$OLD_SERVER" && { docker compose down 2>/dev/null || docker-compose down 2>/dev/null || true; } )
+	cp -a "$OLD_SERVER/.env" "$REPO_DIR/.env"
+	[ -d "$OLD_SERVER/data" ] && [ ! -d "$REPO_DIR/data" ] && cp -a "$OLD_SERVER/data" "$REPO_DIR/data"
+	[ -d "$OLD_SERVER/etc-litesync" ] && [ ! -d "$REPO_DIR/etc-litesync" ] && cp -a "$OLD_SERVER/etc-litesync" "$REPO_DIR/etc-litesync"
+	info "迁移完成；确认新部署正常后可手动删除旧目录 $(dirname "$OLD_SERVER")"
 fi
 
 cd "$REPO_DIR"
@@ -52,8 +69,6 @@ info "更新代码到最新版本 ..."
 git fetch --depth 1 origin "$BRANCH"
 git reset --hard "origin/$BRANCH" >/dev/null
 VERSION="$(git log -1 --format='%h %s')"
-
-cd server
 
 # ---------- 生成 .env（仅首次；重新部署保留原配置） ----------
 port_busy() { ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
@@ -145,7 +160,7 @@ echo " litesync 部署完成 ✓   $(health)"
 echo "--------------------------------------------------------------"
 echo " 当前版本  : $VERSION"
 echo " 安装目录  : $REPO_DIR"
-echo " 数据目录  : $REPO_DIR/server/data   ← 唯一需要备份的目录"
+echo " 数据目录  : $REPO_DIR/data   （建议同时启用 Web 端的 R2 异地备份）"
 echo " 监听地址  : http://$BIND:$PORT"
 echo " API Token : ${OBSYNC_TOKEN}"
 echo "--------------------------------------------------------------"
@@ -159,7 +174,7 @@ echo "--------------------------------------------------------------"
 echo " 异地备份  : 浏览器打开 Web 端 → ⚙ → Backup 配置 Cloudflare R2"
 echo "             （backup-config.key 位于 $ETC_DIR，请勿删除）"
 echo "--------------------------------------------------------------"
-echo " 常用命令（在 $REPO_DIR/server 下执行）："
+echo " 常用命令（在 $REPO_DIR 下执行）："
 echo "   查看日志 : $COMPOSE logs -f"
 echo "   重启服务 : $COMPOSE restart"
 echo "   停止服务 : $COMPOSE down"

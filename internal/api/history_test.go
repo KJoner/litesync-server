@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	syncsvc "obsync/internal/sync"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 func (e *testEnv) history(t *testing.T, path string) (*http.Response, map[string]any) {
