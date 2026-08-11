@@ -340,10 +340,23 @@ func TestDeleteFlow(t *testing.T) {
 		t.Fatalf("delete missing = %d, want 404", resp4.StatusCode)
 	}
 
-	// 删除后重新创建：baseRevision=0 或 tombstone revision 均可
+	// v9 tombstone 防复活：baseRevision=0 不再穿透墓碑 → 409，
+	// 响应携带 deleted=true + tombstone revision + priorHash（删除前内容）
 	resp5, body5 := e.upload(t, "Notes/del.md", 0, []byte("recreated"))
-	if resp5.StatusCode != http.StatusOK || body5["revision"].(float64) != 3 {
-		t.Fatalf("recreate = %d, revision %v", resp5.StatusCode, body5["revision"])
+	if resp5.StatusCode != http.StatusConflict {
+		t.Fatalf("recreate with base 0 = %d, want 409", resp5.StatusCode)
+	}
+	if body5["deleted"] != true || body5["revision"].(float64) != 2 {
+		t.Fatalf("tombstone conflict body = %v", body5)
+	}
+	if body5["priorHash"] != sha256Hex(content) {
+		t.Fatalf("priorHash = %v, want hash of pre-delete content", body5["priorHash"])
+	}
+
+	// 基于 tombstone revision 的显式重建 → 允许
+	resp6, body6 := e.upload(t, "Notes/del.md", 2, []byte("recreated"))
+	if resp6.StatusCode != http.StatusOK || body6["revision"].(float64) != 3 {
+		t.Fatalf("recreate with tombstone revision = %d, revision %v", resp6.StatusCode, body6["revision"])
 	}
 }
 

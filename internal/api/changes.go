@@ -43,6 +43,8 @@ func (h *handlers) changes(w http.ResponseWriter, r *http.Request) {
 	if res.ResyncRequired {
 		// 客户端游标早于已裁剪的水位线：必须走 snapshot 全量对账重建游标
 		writeJSON(w, http.StatusOK, map[string]any{
+			"repoEpoch":      res.RepoEpoch,
+			"headSequence":   res.LatestSequence,
 			"latestSequence": res.LatestSequence,
 			"resyncRequired": true,
 			"minSequence":    res.MinSequence,
@@ -62,6 +64,8 @@ func (h *handlers) changes(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"repoEpoch":      res.RepoEpoch,
+		"headSequence":   res.LatestSequence,
 		"latestSequence": res.LatestSequence,
 		"hasMore":        res.HasMore,
 		"changes":        out,

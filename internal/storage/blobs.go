@@ -8,8 +8,21 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// syncDir 在 rename 后 fsync 父目录，保证目录项本身落盘（掉电后 rename 不丢失）。
+// Windows 不支持目录句柄 fsync，跳过；其余平台尽力而为。
+func syncDir(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if f, err := os.Open(dir); err == nil {
+		f.Sync() //nolint:errcheck
+		f.Close()
+	}
+}
 
 var ErrInvalidBlobID = errors.New("invalid blob id")
 
@@ -92,6 +105,7 @@ func (b *BlobStore) PutReader(hash string, r io.Reader) error {
 		os.Remove(tmp)
 		return err
 	}
+	syncDir(filepath.Dir(p))
 	return nil
 }
 
@@ -123,24 +137,38 @@ func (b *BlobStore) IngestVerify(r io.Reader) (tmpPath, hashHex string, size int
 }
 
 // Commit 把 IngestVerify 的临时文件原子改名为 blob；blob 已存在则丢弃临时文件（去重）。
+// v9：去重命中时校验现有 blob 的大小——若已被截断/损坏，用刚校验过 hash 的
+// 临时文件原子替换，而不是沿用坏文件继续服务下载。
 func (b *BlobStore) Commit(tmpPath, hash string) error {
 	p, err := b.path(hash)
 	if err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
-	if _, err := os.Stat(p); err == nil {
-		os.Remove(tmpPath)
-		return nil
+	if cur, err := os.Stat(p); err == nil {
+		tmpInfo, terr := os.Stat(tmpPath)
+		if terr == nil && cur.Size() == tmpInfo.Size() {
+			os.Remove(tmpPath)
+			return nil
+		}
+		// 现有 blob 尺寸异常 → 落到下方 rename 覆盖修复
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
 	if err := os.Rename(tmpPath, p); err != nil {
+		// Windows 的 rename 不能覆盖已存在文件（损坏修复路径）：先移除再试一次
+		if os.Remove(p) == nil {
+			if err2 := os.Rename(tmpPath, p); err2 == nil {
+				syncDir(filepath.Dir(p))
+				return nil
+			}
+		}
 		os.Remove(tmpPath)
 		return err
 	}
+	syncDir(filepath.Dir(p))
 	return nil
 }
 

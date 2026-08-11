@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	gosync "sync"
 	"time"
@@ -84,11 +86,53 @@ func (s *sessionStore) revoke(id string) {
 	delete(s.sessions, id)
 }
 
-func secureRequest(r *http.Request) bool {
-	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+// parseTrustedProxies 把 IP / CIDR 列表解析为前缀；非法条目忽略。
+func parseTrustedProxies(entries []string) []netip.Prefix {
+	var out []netip.Prefix
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(e); err == nil {
+			out = append(out, p)
+			continue
+		}
+		if a, err := netip.ParseAddr(e); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out
 }
 
-func setSessionCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+// secureRequest：请求是否来自 HTTPS。
+// v9：X-Forwarded-Proto 只信任配置的反向代理来源（默认 loopback），
+// 不再无条件相信任意客户端伪造的转发头。
+func (h *handlers) secureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range h.trusted {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *handlers) setSessionCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,
 		Value:    value,
@@ -96,7 +140,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, name, value string
 		MaxAge:   maxAge,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   secureRequest(r),
+		Secure:   h.secureRequest(r),
 	})
 }
 
@@ -116,9 +160,9 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
-	setSessionCookie(w, r, sessionCookieName, h.web.create(false), int(sessionTTL.Seconds()))
+	h.setSessionCookie(w, r, sessionCookieName, h.web.create(false), int(sessionTTL.Seconds()))
 	if req.Admin {
-		setSessionCookie(w, r, adminCookieName, h.web.create(true), int(adminTTL.Seconds()))
+		h.setSessionCookie(w, r, adminCookieName, h.web.create(true), int(adminTTL.Seconds()))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "admin": req.Admin})
 }

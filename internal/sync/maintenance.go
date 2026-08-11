@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"fmt"
 	"os"
 	"time"
 
@@ -166,10 +165,13 @@ func (s *Service) maintainHistoryBudget() (int, error) {
 }
 
 // maintainOrphanBlobs：清理数据库中无任何引用的 blob 文件。
-// 只处理 1 小时前的文件，避开“blob 已写入、事务未提交”的上传窗口。
+// v9 竞态修复：无锁扫描只收集候选；真正删除前在 s.mu 内二次确认引用——
+// 否则「GC 判定无引用 → 上传去重复用同一 blob 并提交 HEAD → GC 删文件」
+// 会留下指向不存在 blob 的已确认 HEAD（下载 404，历史不可恢复）。
+// 1 小时门槛只用来避开「blob 已写入、事务未提交」的上传窗口，不构成正确性保证。
 func (s *Service) maintainOrphanBlobs() (int, error) {
 	cutoff := time.Now().Add(-1 * time.Hour)
-	removed := 0
+	var candidates []string
 	err := s.blobs.Walk(func(hash string, info os.FileInfo) error {
 		if info.ModTime().After(cutoff) {
 			return nil
@@ -178,11 +180,21 @@ func (s *Service) maintainOrphanBlobs() (int, error) {
 		if err != nil || ref {
 			return nil //nolint:nilerr
 		}
-		if err := s.blobs.Remove(hash); err == nil {
-			removed++
-		}
+		candidates = append(candidates, hash)
 		return nil
 	})
+
+	removed := 0
+	for _, hash := range candidates {
+		s.mu.Lock()
+		ref, rerr := db.BlobReferenced(s.db, hash)
+		if rerr == nil && !ref {
+			if s.blobs.Remove(hash) == nil {
+				removed++
+			}
+		}
+		s.mu.Unlock()
+	}
 	return removed, err
 }
 
@@ -269,17 +281,9 @@ func (s *Service) maintainChanges(now int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// 水位线单调递增
-	cur, _, err := db.GetMeta(tx, watermarkMetaKey)
-	if err != nil {
+	// 水位线记录在 repo_state（v9），与删除同一事务提交，且只增不减
+	if err := db.SetMinRetainedSequence(tx, deleteUpTo); err != nil {
 		return 0, err
-	}
-	var curN int64
-	fmt.Sscanf(cur, "%d", &curN) //nolint:errcheck
-	if deleteUpTo > curN {
-		if err := db.SetMeta(tx, watermarkMetaKey, fmt.Sprintf("%d", deleteUpTo), now); err != nil {
-			return 0, err
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err

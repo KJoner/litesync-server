@@ -21,13 +21,46 @@ import (
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.8.2"
+const version = "0.9.0"
 
 func main() {
+	// rotate-epoch：灾备恢复后的必要步骤（服务停止时执行）。
+	// 旋转 repo_epoch 使所有客户端进入恢复合并流程，而不是沿用旧游标
+	// 静默跳过「恢复点之后曾经存在」的 sequence 区间。
+	if len(os.Args) > 1 && os.Args[1] == "rotate-epoch" {
+		if err := rotateEpoch(); err != nil {
+			fmt.Fprintln(os.Stderr, "obsync rotate-epoch:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "obsync:", err)
 		os.Exit(1)
 	}
+}
+
+func rotateEpoch() error {
+	dataDir := os.Getenv("OBSYNC_DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	dbPath := filepath.Join(dataDir, "sync.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("database not found at %s (set OBSYNC_DATA_DIR): %w", dbPath, err)
+	}
+	database, err := db.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	epoch, err := db.RotateEpoch(database)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("repo epoch rotated: %s\n", epoch)
+	fmt.Println("clients will pause normal sync and enter recovery merge on next contact")
+	return nil
 }
 
 func run() error {
@@ -45,7 +78,7 @@ func run() error {
 	}
 	os.Chmod(cfg.DataDir, 0o700) //nolint:errcheck // 已存在目录也收紧；Windows 上是 no-op
 	dbPath := filepath.Join(cfg.DataDir, "sync.db")
-	database, err := db.Open(dbPath)
+	database, err := db.OpenWithSync(dbPath, cfg.DurabilityStrict)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -83,6 +116,10 @@ func run() error {
 	if err := svc.BackfillVersions(); err != nil {
 		logger.Warn("backfill versions", "error", err)
 	}
+	// v9：为旧库补跨平台归一化 key，并对已存在的路径碰撞告警
+	if err := svc.BackfillCanonicalKeys(); err != nil {
+		logger.Warn("backfill canonical keys", "error", err)
+	}
 	// v4：HEAD 收编进 blob store，消除双份存储（幂等）
 	if err := svc.MigrateHeadToBlobs(); err != nil {
 		logger.Warn("head migration", "error", err)
@@ -106,11 +143,12 @@ func run() error {
 	bkp.StartScheduler(ctx)
 
 	handler := api.New(api.Options{
-		Token:       cfg.Token,
-		MaxFileSize: cfg.MaxFileSize,
-		Version:     version,
-		Logger:      logger,
-		Backup:      bkp,
+		Token:          cfg.Token,
+		MaxFileSize:    cfg.MaxFileSize,
+		Version:        version,
+		Logger:         logger,
+		Backup:         bkp,
+		TrustedProxies: cfg.TrustedProxies,
 	}, svc)
 
 	srv := &http.Server{

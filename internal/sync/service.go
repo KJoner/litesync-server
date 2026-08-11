@@ -6,13 +6,16 @@
 package sync
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	gosync "sync"
 	"time"
@@ -24,12 +27,29 @@ import (
 var (
 	ErrNotFound       = errors.New("file not found")
 	ErrVaultKeyExists = errors.New("vault key already exists")
+	// ErrPlaintextRejected：E2EE migrating/encrypted 状态下拒绝非 LSE1 密文上传
+	//（明文写冻结：旧设备不能在迁移中/迁移后把明文写回仓库）
+	ErrPlaintextRejected = errors.New("plaintext upload rejected: vault encryption is enabled")
+	// ErrVaultKeyCAS：vault key 替换时的 CAS 校验失败（fingerprint 不匹配或缺失）
+	ErrVaultKeyCAS = errors.New("vault key fingerprint mismatch")
+	// ErrEncryptionState：E2EE 状态机转换非法（如已 encrypted 再 begin）
+	ErrEncryptionState = errors.New("invalid encryption state transition")
 )
 
-const (
-	vaultKeyMetaKey  = "vault-key"
-	watermarkMetaKey = "changes-watermark" // 已裁剪到的 sequence（含）
-)
+const vaultKeyMetaKey = "vault-key"
+
+// lse1Magic：LiteSync 加密文件格式头（客户端 crypto.ts 同源常量）。
+var lse1Magic = []byte{0x4c, 0x53, 0x45, 0x31} // "LSE1"
+
+// PathCollisionError：新路径与现有未删除路径在大小写/Unicode 归一化后冲突。
+type PathCollisionError struct {
+	Path     string
+	Existing string
+}
+
+func (e *PathCollisionError) Error() string {
+	return fmt.Sprintf("path %q collides with existing file %q on case-insensitive filesystems", e.Path, e.Existing)
+}
 
 // ConflictError 表示 baseRevision 与服务器当前 revision 不一致。
 type ConflictError struct {
@@ -37,6 +57,9 @@ type ConflictError struct {
 	Revision int64
 	Hash     string
 	Deleted  bool
+	// PriorHash：tombstone 冲突时删除前最后一个版本的内容 hash，
+	// 客户端用它识别「陈旧副本复活」与「同名新内容重建」
+	PriorHash string
 }
 
 func (e *ConflictError) Error() string {
@@ -58,12 +81,29 @@ type DeleteResult struct {
 }
 
 type ChangesResult struct {
-	LatestSequence int64
+	RepoEpoch      string
+	LatestSequence int64 // = repo_state.head_sequence（与响应内容同一事务读出）
 	HasMore        bool
 	Changes        []db.Change
 	// ResyncRequired：客户端游标早于已裁剪的水位线，必须走 snapshot 全量对账
 	ResyncRequired bool
 	MinSequence    int64
+}
+
+// SnapshotResult：与 sequence 严格对应同一时刻状态的全量快照。
+type SnapshotResult struct {
+	RepoEpoch string
+	Sequence  int64
+	Files     []db.File
+}
+
+// RepoInfo：/api/v1/info 的仓库权威信息（单锁内一致读出）。
+type RepoInfo struct {
+	VaultID         string
+	RepoEpoch       string
+	HeadSequence    int64
+	EncryptionState string
+	KeyEpoch        int64
 }
 
 // Options 控制历史保留与资源治理（v4）。
@@ -149,6 +189,16 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	// E2EE 明文写冻结（v9）：migrating/encrypted 状态下所有内容必须是 LSE1 密文，
+	// 旧设备无法在迁移中或迁移后把明文静默写回仓库
+	if rs.EncryptionState != db.EncryptionPlaintext && !fileHasMagic(tmp, lse1Magic) {
+		return nil, ErrPlaintextRejected
+	}
+
 	cur, err := db.GetFile(s.db, path)
 	if err != nil {
 		return nil, err
@@ -156,11 +206,7 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 
 	// 幂等：内容与服务器现状一致时直接成功（覆盖“重复提交同一个 change”场景）
 	if cur != nil && !cur.Deleted && cur.ContentHash == claimedHash {
-		seq, err := db.LastSequenceForPath(s.db, path)
-		if err != nil {
-			return nil, err
-		}
-		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: seq}, nil
+		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: rs.HeadSequence}, nil
 	}
 
 	// revision 校验（数据安全红线）
@@ -169,9 +215,22 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		if baseRevision != 0 {
 			return nil, &ConflictError{Path: path, Revision: 0}
 		}
+		// 跨平台路径碰撞（v9）：与现有未删除路径大小写/NFC 归一化后相同 → 拒绝并存
+		if other, err := db.FindCanonicalCollision(s.db, storage.CanonicalKey(path), path); err != nil {
+			return nil, err
+		} else if other != "" {
+			return nil, &PathCollisionError{Path: path, Existing: other}
+		}
 	case cur.Deleted:
-		if baseRevision != 0 && baseRevision != cur.Revision {
-			return nil, &ConflictError{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Deleted: true}
+		// tombstone 防复活（v9）：baseRevision=0 不再允许穿透墓碑——
+		// 客户端必须显式基于 tombstone revision 重建（并自行核对 priorHash，
+		// 陈旧副本回传与「同名新内容」由客户端据此区分）
+		if baseRevision != cur.Revision {
+			prior, perr := db.PriorContentHash(s.db, path)
+			if perr != nil {
+				return nil, perr
+			}
+			return nil, &ConflictError{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Deleted: true, PriorHash: prior}
 		}
 	default:
 		if baseRevision != cur.Revision {
@@ -203,14 +262,15 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	defer tx.Rollback() //nolint:errcheck
 
 	if err := db.UpsertFile(tx, &db.File{
-		Path:        path,
-		ContentHash: actualHash,
-		Size:        size,
-		Mtime:       mtime,
-		Revision:    newRevision,
-		Deleted:     false,
-		CreatedAt:   createdAt,
-		UpdatedAt:   now,
+		Path:         path,
+		ContentHash:  actualHash,
+		Size:         size,
+		Mtime:        mtime,
+		Revision:     newRevision,
+		Deleted:      false,
+		CreatedAt:    createdAt,
+		UpdatedAt:    now,
+		CanonicalKey: storage.CanonicalKey(path),
 	}); err != nil {
 		return nil, err
 	}
@@ -409,40 +469,62 @@ func (s *Service) OpenVersion(path string, revision int64) (*db.FileVersion, io.
 // Changes -----------------------------------------------------------------
 
 // Changes 返回 since 之后的变更；since 早于裁剪水位线时要求客户端走 snapshot 对账。
+// v9：全程持 s.mu（所有写入方都持同一把锁），epoch/head/水位线/changes 是同一
+// 时刻的一致读——绝不返回「与内容不对应的 sequence」。
 func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
-	watermark, err := s.changesWatermark()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rs, err := db.GetRepoState(s.db)
 	if err != nil {
 		return nil, err
 	}
-	latest, err := db.LatestSequence(s.db)
-	if err != nil {
-		return nil, err
-	}
-	if since < watermark {
-		return &ChangesResult{LatestSequence: latest, ResyncRequired: true, MinSequence: watermark}, nil
+	if since < rs.MinRetainedSequence {
+		return &ChangesResult{
+			RepoEpoch:      rs.RepoEpoch,
+			LatestSequence: rs.HeadSequence,
+			ResyncRequired: true,
+			MinSequence:    rs.MinRetainedSequence,
+		}, nil
 	}
 	changes, err := db.ListChanges(s.db, since, limit)
 	if err != nil {
 		return nil, err
 	}
-	// latest 需要重取一次以覆盖 List 期间的新写入导致的 hasMore 误判？
-	// 这里保持先取 latest：若期间有新写入，客户端下轮拉取自然补齐。
-	hasMore := len(changes) > 0 && changes[len(changes)-1].Sequence < latest
-	return &ChangesResult{LatestSequence: latest, HasMore: hasMore, Changes: changes}, nil
+	hasMore := len(changes) > 0 && changes[len(changes)-1].Sequence < rs.HeadSequence
+	return &ChangesResult{RepoEpoch: rs.RepoEpoch, LatestSequence: rs.HeadSequence, HasMore: hasMore, Changes: changes}, nil
 }
 
-func (s *Service) changesWatermark() (int64, error) {
-	v, ok, err := db.GetMeta(s.db, watermarkMetaKey)
-	if err != nil || !ok {
+// LatestSequence 返回权威 head_sequence（repo_state，不再依赖可裁剪的 changes 表）。
+func (s *Service) LatestSequence() (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
 		return 0, err
 	}
-	var n int64
-	fmt.Sscanf(v, "%d", &n) //nolint:errcheck
-	return n, nil
+	return rs.HeadSequence, nil
 }
 
-func (s *Service) LatestSequence() (int64, error) {
-	return db.LatestSequence(s.db)
+// RepoInfo 返回 /api/v1/info 所需的仓库权威信息（单锁内一致读出）。
+func (s *Service) RepoInfo() (*RepoInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vaultID, err := s.vaultIDLocked()
+	if err != nil {
+		return nil, err
+	}
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	return &RepoInfo{
+		VaultID:         vaultID,
+		RepoEpoch:       rs.RepoEpoch,
+		HeadSequence:    rs.HeadSequence,
+		EncryptionState: rs.EncryptionState,
+		KeyEpoch:        rs.KeyEpoch,
+	}, nil
 }
 
 // WithGlobalLock 短暂持有全局写锁执行 fn（备份一致性快照用）：
@@ -454,16 +536,116 @@ func (s *Service) WithGlobalLock(fn func() error) error {
 }
 
 // Snapshot 返回当前所有未删除文件的元数据与最新 sequence。
-func (s *Service) Snapshot() (int64, []db.File, error) {
+// v9：持 s.mu 保证文件列表与 sequence 严格对应同一时刻——修复
+// 「ListFiles 与 LatestSequence 之间的写入使客户端游标跳过一次变更」的漏同步。
+func (s *Service) Snapshot() (*SnapshotResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	files, err := db.ListFiles(s.db)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	latest, err := db.LatestSequence(s.db)
+	rs, err := db.GetRepoState(s.db)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	return latest, files, nil
+	return &SnapshotResult{RepoEpoch: rs.RepoEpoch, Sequence: rs.HeadSequence, Files: files}, nil
+}
+
+// E2EE 状态机（v9）---------------------------------------------------------
+//
+// plaintext → (Begin) → migrating → (Complete，全部 HEAD 验证为密文) → encrypted
+// migrating/encrypted 状态下 Upload 拒绝非 LSE1 内容（明文写冻结）。
+
+// BeginE2eeMigration 进入迁移状态并冻结明文写；重复调用幂等（断点续传）。
+func (s *Service) BeginE2eeMigration() (*db.RepoState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	switch rs.EncryptionState {
+	case db.EncryptionMigrating:
+		return rs, nil // 幂等：迁移中断后重新执行
+	case db.EncryptionEncrypted:
+		return nil, ErrEncryptionState
+	}
+	if err := db.SetEncryptionState(s.db, db.EncryptionMigrating, true); err != nil {
+		return nil, err
+	}
+	return db.GetRepoState(s.db)
+}
+
+// CompleteE2eeMigration 验证所有未删除 HEAD 均为 LSE1 密文后切换到 encrypted。
+// 任何一个 HEAD 仍是明文都拒绝完成——绝不允许「标记已加密但仓库里还有明文」。
+func (s *Service) CompleteE2eeMigration() (*db.RepoState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.EncryptionState != db.EncryptionMigrating {
+		return nil, ErrEncryptionState
+	}
+	files, err := db.ListFiles(s.db)
+	if err != nil {
+		return nil, err
+	}
+	for i := range files {
+		f, err := s.blobs.Open(files[i].ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("verify %q: blob missing: %w", files[i].Path, err)
+		}
+		head := make([]byte, len(lse1Magic))
+		_, rerr := io.ReadFull(f, head)
+		f.Close()
+		if rerr != nil || !bytes.Equal(head, lse1Magic) {
+			return nil, fmt.Errorf("%w: %q is not encrypted", ErrEncryptionState, files[i].Path)
+		}
+	}
+	if err := db.SetEncryptionState(s.db, db.EncryptionEncrypted, false); err != nil {
+		return nil, err
+	}
+	return db.GetRepoState(s.db)
+}
+
+// AbortE2eeMigration 放弃迁移，回到 plaintext（仅 migrating 状态下允许）。
+func (s *Service) AbortE2eeMigration() (*db.RepoState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.EncryptionState != db.EncryptionMigrating {
+		return nil, ErrEncryptionState
+	}
+	if err := db.SetEncryptionState(s.db, db.EncryptionPlaintext, false); err != nil {
+		return nil, err
+	}
+	return db.GetRepoState(s.db)
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// fileHasMagic 检查磁盘文件是否以 magic 开头（E2EE 明文冻结用）。
+func fileHasMagic(path string, magic []byte) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, len(magic))
+	if _, err := io.ReadFull(f, head); err != nil {
+		return false
+	}
+	return bytes.Equal(head, magic)
 }
 
 // Shares ------------------------------------------------------------------
@@ -547,15 +729,32 @@ func (s *Service) GetVaultKey() (string, error) {
 	return doc, nil
 }
 
-func (s *Service) SetVaultKey(doc string, replace bool) error {
+// VaultKeyFingerprint 计算 key 文档的指纹（CAS 用；空文档返回 ""）。
+func VaultKeyFingerprint(doc string) string {
+	if doc == "" {
+		return ""
+	}
+	sum := sha256Hex([]byte(doc))
+	return sum
+}
+
+// SetVaultKey 保存 vault key 文档。
+// v9 CAS：replace=true 时必须携带当前文档的指纹（expectedFingerprint），
+// 不匹配返回 ErrVaultKeyCAS——防止并发迁移/误操作无条件覆盖导致密文永久不可读。
+func (s *Service) SetVaultKey(doc string, replace bool, expectedFingerprint string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, exists, err := db.GetMeta(s.db, vaultKeyMetaKey)
+	cur, exists, err := db.GetMeta(s.db, vaultKeyMetaKey)
 	if err != nil {
 		return err
 	}
-	if exists && !replace {
-		return ErrVaultKeyExists
+	if exists {
+		if !replace {
+			return ErrVaultKeyExists
+		}
+		if expectedFingerprint == "" || expectedFingerprint != VaultKeyFingerprint(cur) {
+			return ErrVaultKeyCAS
+		}
 	}
 	return db.SetMeta(s.db, vaultKeyMetaKey, doc, time.Now().Unix())
 }
@@ -597,6 +796,56 @@ func (s *Service) PruneHistoryBefore(path string, before int64) (int, error) {
 	}
 	s.gcBlobs(pruneBlobs)
 	return removed, nil
+}
+
+// BackfillCanonicalKeys 为旧库行补 canonical_key（幂等，启动时调用）。
+// 已存在的归一化碰撞只告警不中断——历史数据保留，新增碰撞由上传路径拒绝。
+func (s *Service) BackfillCanonicalKeys() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(`SELECT path FROM files WHERE canonical_key = ''`)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			return err
+		}
+		paths = append(paths, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if _, err := s.db.Exec(`UPDATE files SET canonical_key = ? WHERE path = ?`, storage.CanonicalKey(p), p); err != nil {
+			return err
+		}
+	}
+	if len(paths) > 0 {
+		s.log.Info("canonical key backfill", "count", len(paths))
+	}
+	// 已存在的碰撞检查（只告警）
+	dup, err := s.db.Query(
+		`SELECT canonical_key, COUNT(*) FROM files WHERE deleted = 0 GROUP BY canonical_key HAVING COUNT(*) > 1`)
+	if err != nil {
+		return err
+	}
+	defer dup.Close()
+	for dup.Next() {
+		var key string
+		var n int
+		if err := dup.Scan(&key, &n); err != nil {
+			return err
+		}
+		s.log.Warn("existing path collision (case/normalization); these files may overwrite each other on Windows/macOS",
+			"canonicalKey", key, "count", n)
+	}
+	return dup.Err()
 }
 
 // BackfillVersions 为升级前已存在、但还没有任何历史记录的文件补一条当前版本。

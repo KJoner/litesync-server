@@ -16,6 +16,7 @@ const maxVaultKeySize = 64 << 10
 
 // getVaultKey 返回客户端存放的加密 vault key（服务器不理解其内容）。
 // GET /api/v1/vault-key
+// v9：响应携带 X-Vault-Key-Fingerprint，replace 时作为 CAS 凭据传回。
 func (h *handlers) getVaultKey(w http.ResponseWriter, _ *http.Request) {
 	doc, err := h.svc.GetVaultKey()
 	if err != nil {
@@ -27,13 +28,15 @@ func (h *handlers) getVaultKey(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Vault-Key-Fingerprint", syncsvc.VaultKeyFingerprint(doc))
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, doc) //nolint:errcheck
 }
 
 // putVaultKey 保存加密 vault key 文档。
-// PUT /api/v1/vault-key?replace=true
-// 已存在且未带 replace=true 时返回 409，防止误覆盖导致密文数据永久不可读。
+// PUT /api/v1/vault-key?replace=true + Header X-Expected-Fingerprint
+// 已存在且未带 replace=true 时返回 409；replace 必须携带当前文档指纹（CAS），
+// 防止并发迁移/误操作无条件覆盖导致密文数据永久不可读。
 func (h *handlers) putVaultKey(w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxVaultKeySize+1))
 	if err != nil || len(raw) == 0 || len(raw) > maxVaultKeySize {
@@ -47,12 +50,17 @@ func (h *handlers) putVaultKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replace := r.URL.Query().Get("replace") == "true"
-	if err := h.svc.SetVaultKey(string(raw), replace); err != nil {
-		if errors.Is(err, syncsvc.ErrVaultKeyExists) {
+	expected := r.Header.Get("X-Expected-Fingerprint")
+	if err := h.svc.SetVaultKey(string(raw), replace, expected); err != nil {
+		switch {
+		case errors.Is(err, syncsvc.ErrVaultKeyExists):
 			writeErr(w, http.StatusConflict, "vault key already exists; pass replace=true to overwrite")
-			return
+		case errors.Is(err, syncsvc.ErrVaultKeyCAS):
+			writeErr(w, http.StatusPreconditionFailed,
+				"vault key fingerprint mismatch; fetch the current key document and retry with X-Expected-Fingerprint")
+		default:
+			h.internalError(w, "vault-key put", err)
 		}
-		h.internalError(w, "vault-key put", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true})

@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func (e *testEnv) putVaultKey(t *testing.T, body string, replace bool) (*http.Response, map[string]any) {
+func (e *testEnv) putVaultKey(t *testing.T, body string, replace bool, fingerprint string) (*http.Response, map[string]any) {
 	t.Helper()
 	u := e.ts.URL + "/api/v1/vault-key"
 	if replace {
@@ -18,6 +18,9 @@ func (e *testEnv) putVaultKey(t *testing.T, body string, replace bool) (*http.Re
 	req, _ := http.NewRequest(http.MethodPut, u, bytes.NewReader([]byte(body)))
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	req.Header.Set("Content-Type", "application/json")
+	if fingerprint != "" {
+		req.Header.Set("X-Expected-Fingerprint", fingerprint)
+	}
 	return e.do(t, req)
 }
 
@@ -45,19 +48,23 @@ func TestVaultKeyFlow(t *testing.T) {
 
 	// 上传（服务器视为 opaque JSON）
 	doc := `{"version":1,"kdf":"pbkdf2-sha256","iterations":600000,"salt":"c2FsdA==","iv":"aXY=","wrappedKey":"d3JhcHBlZA==","enabled":false}`
-	resp2, _ := e.putVaultKey(t, doc, false)
+	resp2, _ := e.putVaultKey(t, doc, false, "")
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("put vault-key = %d", resp2.StatusCode)
 	}
 
-	// 原样读回
+	// 原样读回（v9：带 CAS 指纹 Header）
 	resp3, raw := e.getVaultKey(t)
 	if resp3.StatusCode != http.StatusOK || string(raw) != doc {
 		t.Fatalf("get vault-key = %d, body %q", resp3.StatusCode, raw)
 	}
+	fp := resp3.Header.Get("X-Vault-Key-Fingerprint")
+	if fp == "" {
+		t.Fatal("missing X-Vault-Key-Fingerprint header")
+	}
 
 	// 重复上传（无 replace）→ 409：防止误覆盖导致密文永久不可读
-	resp4, _ := e.putVaultKey(t, `{"version":2}`, false)
+	resp4, _ := e.putVaultKey(t, `{"version":2}`, false, "")
 	if resp4.StatusCode != http.StatusConflict {
 		t.Fatalf("overwrite without replace = %d, want 409", resp4.StatusCode)
 	}
@@ -67,9 +74,21 @@ func TestVaultKeyFlow(t *testing.T) {
 		t.Fatal("vault key was modified by rejected overwrite")
 	}
 
-	// 显式 replace → 允许（如标记 enabled=true）
+	// v9 CAS：replace 不带指纹 → 412；指纹错误 → 412
+	if resp, _ := e.putVaultKey(t, `{"version":1,"enabled":true}`, true, ""); resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("replace without fingerprint = %d, want 412", resp.StatusCode)
+	}
+	if resp, _ := e.putVaultKey(t, `{"version":1,"enabled":true}`, true, "deadbeef"); resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("replace with wrong fingerprint = %d, want 412", resp.StatusCode)
+	}
+	_, rawAfter := e.getVaultKey(t)
+	if string(rawAfter) != doc {
+		t.Fatal("vault key was modified by rejected CAS replace")
+	}
+
+	// 携带正确指纹的 replace → 允许（如标记 enabled=true）
 	doc2 := `{"version":1,"enabled":true}`
-	resp5, _ := e.putVaultKey(t, doc2, true)
+	resp5, _ := e.putVaultKey(t, doc2, true, fp)
 	if resp5.StatusCode != http.StatusOK {
 		t.Fatalf("replace vault-key = %d", resp5.StatusCode)
 	}
@@ -79,7 +98,7 @@ func TestVaultKeyFlow(t *testing.T) {
 	}
 
 	// 非 JSON → 400
-	resp6, _ := e.putVaultKey(t, "not json", true)
+	resp6, _ := e.putVaultKey(t, "not json", true, "")
 	if resp6.StatusCode != http.StatusBadRequest {
 		t.Fatalf("non-json vault-key = %d, want 400", resp6.StatusCode)
 	}

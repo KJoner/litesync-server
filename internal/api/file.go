@@ -57,10 +57,21 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	var conflict *syncsvc.ConflictError
+	var collision *syncsvc.PathCollisionError
 	var tooBig *http.MaxBytesError
 	switch {
 	case errors.As(err, &conflict):
 		writeConflict(w, conflict)
+	case errors.As(err, &collision):
+		// 422：请求合法但该路径与现有文件在大小写不敏感文件系统上冲突
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":    "path collision",
+			"path":     collision.Path,
+			"existing": collision.Existing,
+		})
+	case errors.Is(err, syncsvc.ErrPlaintextRejected):
+		// E2EE 明文冻结：仓库已启用加密，明文上传一律拒绝
+		writeErr(w, http.StatusConflict, err.Error())
 	case errors.As(err, &tooBig):
 		writeErr(w, http.StatusRequestEntityTooLarge, "file too large")
 	case errors.Is(err, storage.ErrInvalidPath):
@@ -143,13 +154,19 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
-	writeJSON(w, http.StatusConflict, map[string]any{
+	body := map[string]any{
 		"error":    "conflict",
 		"path":     c.Path,
 		"revision": c.Revision,
 		"hash":     c.Hash,
 		"deleted":  c.Deleted,
-	})
+	}
+	if c.PriorHash != "" {
+		// tombstone 冲突：删除前最后一个版本的内容 hash，
+		// 客户端据此区分「陈旧副本复活」与「同名新内容重建」
+		body["priorHash"] = c.PriorHash
+	}
+	writeJSON(w, http.StatusConflict, body)
 }
 
 func isSHA256Hex(s string) bool {

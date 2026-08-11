@@ -83,8 +83,9 @@ func TestVersionHistoryFlow(t *testing.T) {
 		t.Fatalf("unknown revision = %d, want 404", resp.StatusCode)
 	}
 
-	// 文件删除后历史仍在，重新创建继续线性追加
-	e.upload(t, "Notes/h.md", 0, []byte("resurrected"))
+	// 文件删除后历史仍在，基于 tombstone revision 重新创建继续线性追加
+	//（v9：base 0 会被 tombstone 409 拒绝，必须显式携带墓碑 revision）
+	e.upload(t, "Notes/h.md", 3, []byte("resurrected"))
 	_, body2 := e.history(t, "Notes/h.md")
 	if len(body2["versions"].([]any)) != 4 {
 		t.Fatal("history must survive delete + recreate")

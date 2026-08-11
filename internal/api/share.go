@@ -24,7 +24,7 @@ type apiShare struct {
 // snapshot 返回当前所有未删除文件的元数据。
 // GET /api/v1/snapshot
 func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
-	latest, files, err := h.svc.Snapshot()
+	snap, err := h.svc.Snapshot()
 	if err != nil {
 		h.internalError(w, "snapshot", err)
 		return
@@ -36,11 +36,15 @@ func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
 		Size     int64  `json:"size"`
 		Mtime    int64  `json:"mtime"`
 	}
-	out := make([]apiFile, 0, len(files))
-	for _, f := range files {
+	out := make([]apiFile, 0, len(snap.Files))
+	for _, f := range snap.Files {
 		out = append(out, apiFile{Path: f.Path, Revision: f.Revision, Hash: f.ContentHash, Size: f.Size, Mtime: f.Mtime})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sequence": latest, "files": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"repoEpoch": snap.RepoEpoch,
+		"sequence":  snap.Sequence,
+		"files":     out,
+	})
 }
 
 // createShare 保存分享密文（内容为客户端用独立 Share Key 加密的 opaque bytes）。

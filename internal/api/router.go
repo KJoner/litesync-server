@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/backup"
@@ -19,18 +20,22 @@ type Options struct {
 	Version     string
 	Logger      *slog.Logger
 	Backup      *backup.Manager // 可为 nil（备份功能未启用）
+	// TrustedProxies：允许信任其 X-Forwarded-Proto 的反向代理地址（IP 或 CIDR）。
+	// 其余来源的该 Header 一律忽略（v9：不再无条件信任任意请求的转发头）。
+	TrustedProxies []string
 }
 
 type handlers struct {
-	svc  *syncsvc.Service
-	opts Options
-	web  *sessionStore
+	svc     *syncsvc.Service
+	opts    Options
+	web     *sessionStore
+	trusted []netip.Prefix // 可信反向代理（X-Forwarded-Proto 只信它们）
 }
 
 // New 构建完整的 HTTP handler。
 // /api/* 要求 Bearer Token（完整权限）或 Web 只读会话（白名单 GET）。
 func New(opts Options, svc *syncsvc.Service) http.Handler {
-	h := &handlers{svc: svc, opts: opts, web: newSessionStore()}
+	h := &handlers{svc: svc, opts: opts, web: newSessionStore(), trusted: parseTrustedProxies(opts.TrustedProxies)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /web/session", h.createSession)
@@ -47,6 +52,11 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/vault-key", h.getVaultKey)
 	mux.HandleFunc("PUT /api/v1/vault-key", h.putVaultKey)
 	mux.HandleFunc("GET /api/v1/snapshot", h.snapshot)
+
+	// E2EE 状态机（v9）：迁移期间冻结明文写，完成时验证全部 HEAD 均为密文
+	mux.HandleFunc("POST /api/v1/e2ee/begin", h.e2eeBegin)
+	mux.HandleFunc("POST /api/v1/e2ee/complete", h.e2eeComplete)
+	mux.HandleFunc("POST /api/v1/e2ee/abort", h.e2eeAbort)
 	mux.HandleFunc("POST /api/v1/share", h.createShare)
 	mux.HandleFunc("GET /api/v1/shares", h.listShares)
 	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
@@ -79,9 +89,13 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 // 协议版本（v7 仓库拆分起正式管理）：插件与服务器各自独立发版，
 // 兼容性由 protocol 区间判定而不是比对版本号。
 // 破坏性协议变更时递增 ProtocolVersion；不再兼容旧客户端时抬高 MinProtocolVersion。
+//
+// v2（v9 架构加固）：repoEpoch/headSequence、tombstone 拒绝 base 0、
+// E2EE 状态机与明文冻结、vault-key CAS。旧客户端的「tombstone 自动复活」
+// 行为不安全，因此 MinProtocolVersion 同步抬到 2。
 const (
-	ProtocolVersion    = 1
-	MinProtocolVersion = 1
+	ProtocolVersion    = 2
+	MinProtocolVersion = 2
 )
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
@@ -89,14 +103,11 @@ func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
-	latest, err := h.svc.LatestSequence()
-	if err != nil {
-		h.internalError(w, "info", err)
-		return
-	}
 	// vaultId：本仓库的稳定身份（v8）。客户端 Bootstrap 后保存，
-	// 发现同一 URL 上 vaultId 变化（服务器重装/换库）即停止自动同步重新接入
-	vaultID, err := h.svc.VaultID()
+	// 发现同一 URL 上 vaultId 变化（服务器重装/换库）即停止自动同步重新接入。
+	// repoEpoch（v9）：sequence 空间的世代——从备份恢复后旋转，
+	// 客户端据此进入灾备合并而不是沿用旧游标漏掉变更。
+	ri, err := h.svc.RepoInfo()
 	if err != nil {
 		h.internalError(w, "info", err)
 		return
@@ -105,8 +116,12 @@ func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
 		"version":            h.opts.Version,
 		"protocolVersion":    ProtocolVersion,
 		"minProtocolVersion": MinProtocolVersion,
-		"vaultId":            vaultID,
-		"latestSequence":     latest,
+		"vaultId":            ri.VaultID,
+		"repoEpoch":          ri.RepoEpoch,
+		"headSequence":       ri.HeadSequence,
+		"latestSequence":     ri.HeadSequence,
+		"encryptionState":    ri.EncryptionState,
+		"keyEpoch":           ri.KeyEpoch,
 		"serverTime":         time.Now().Unix(),
 	})
 }

@@ -29,6 +29,11 @@ var ErrPairingNotFound = errors.New("pairing not found or expired")
 func (s *Service) VaultID() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.vaultIDLocked()
+}
+
+// vaultIDLocked：调用方必须已持有 s.mu。
+func (s *Service) vaultIDLocked() (string, error) {
 	id, ok, err := db.GetMeta(s.db, vaultIDMetaKey)
 	if err != nil {
 		return "", err

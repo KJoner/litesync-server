@@ -33,6 +33,15 @@ type Config struct {
 	// BackupKeyFile 备份配置加密密钥文件路径（OBSYNC_BACKUP_KEY_FILE，默认空 = 备份功能不可用）。
 	// 必须位于数据目录之外：单独复制 /data 无法解出 R2 凭据与 Restic 密码。
 	BackupKeyFile string
+
+	// DurabilityStrict（OBSYNC_DURABILITY，默认 strict）：
+	// strict → SQLite synchronous=FULL（掉电后已确认事务绝不回滚）；
+	// normal → synchronous=NORMAL（更快，但掉电可能丢最近已确认的事务）。
+	DurabilityStrict bool
+
+	// TrustedProxies（OBSYNC_TRUSTED_PROXIES，逗号分隔 IP/CIDR，默认 loopback）：
+	// 只有来自这些地址的请求，其 X-Forwarded-Proto 才被信任。
+	TrustedProxies []string
 }
 
 func Load() (*Config, error) {
@@ -118,6 +127,21 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid OBSYNC_HISTORY_MAX_BYTES: %q", v)
 		}
 		cfg.HistoryMaxBytes = n
+	}
+
+	switch strings.ToLower(getenv("OBSYNC_DURABILITY", "strict")) {
+	case "strict":
+		cfg.DurabilityStrict = true
+	case "normal":
+		cfg.DurabilityStrict = false
+	default:
+		return nil, fmt.Errorf("invalid OBSYNC_DURABILITY: %q (use strict/normal)", os.Getenv("OBSYNC_DURABILITY"))
+	}
+
+	for _, e := range strings.Split(getenv("OBSYNC_TRUSTED_PROXIES", "127.0.0.1,::1"), ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			cfg.TrustedProxies = append(cfg.TrustedProxies, e)
+		}
 	}
 
 	switch strings.ToLower(getenv("OBSYNC_LOG_LEVEL", "info")) {

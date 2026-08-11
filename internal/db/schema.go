@@ -63,4 +63,18 @@ CREATE TABLE IF NOT EXISTS pairings (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+
+-- v9 仓库权威状态（单行）：head_sequence 是唯一的全局时钟，在每次变更事务内递增，
+-- 永不回退；changes 只是可裁剪日志，不再兼任时钟。repo_epoch 标识 sequence 空间的
+-- 世代：从备份恢复后必须旋转（obsync rotate-epoch），客户端据此进入灾备合并而不是
+-- 沿用旧游标静默漏掉变更。
+CREATE TABLE IF NOT EXISTS repo_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    repo_epoch TEXT NOT NULL,
+    head_sequence INTEGER NOT NULL,
+    min_retained_sequence INTEGER NOT NULL DEFAULT 0,
+    encryption_state TEXT NOT NULL DEFAULT 'plaintext'
+        CHECK (encryption_state IN ('plaintext','migrating','encrypted')),
+    key_epoch INTEGER NOT NULL DEFAULT 0
+);
 `

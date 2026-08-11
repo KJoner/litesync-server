@@ -16,6 +16,9 @@ type File struct {
 	Deleted     bool
 	CreatedAt   int64
 	UpdatedAt   int64
+	// CanonicalKey：跨平台归一化后的路径（NFC + 小写），用于拒绝
+	// 大小写/Unicode 规范化不同但会在 Windows/macOS 上映射为同一文件的路径并存
+	CanonicalKey string
 }
 
 // Change 对应 changes 表的一行。
@@ -40,9 +43,9 @@ func GetFile(q dbtx, path string) (*File, error) {
 	f := &File{}
 	var deleted int64
 	err := q.QueryRow(
-		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at
+		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key
 		 FROM files WHERE path = ?`, path,
-	).Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime, &f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt)
+	).Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime, &f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt, &f.CanonicalKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -53,6 +56,19 @@ func GetFile(q dbtx, path string) (*File, error) {
 	return f, nil
 }
 
+// FindCanonicalCollision 返回与 canonicalKey 冲突的其他未删除路径；无冲突返回 ""。
+func FindCanonicalCollision(q dbtx, canonicalKey, excludePath string) (string, error) {
+	var path string
+	err := q.QueryRow(
+		`SELECT path FROM files WHERE canonical_key = ? AND deleted = 0 AND path != ? LIMIT 1`,
+		canonicalKey, excludePath,
+	).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return path, err
+}
+
 // UpsertFile 插入或按 path 更新文件记录。
 func UpsertFile(q dbtx, f *File) error {
 	deleted := 0
@@ -60,37 +76,37 @@ func UpsertFile(q dbtx, f *File) error {
 		deleted = 1
 	}
 	_, err := q.Exec(
-		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   content_hash = excluded.content_hash,
 		   size = excluded.size,
 		   mtime = excluded.mtime,
 		   revision = excluded.revision,
 		   deleted = excluded.deleted,
-		   updated_at = excluded.updated_at`,
-		f.Path, f.ContentHash, f.Size, f.Mtime, f.Revision, deleted, f.CreatedAt, f.UpdatedAt,
+		   updated_at = excluded.updated_at,
+		   canonical_key = excluded.canonical_key`,
+		f.Path, f.ContentHash, f.Size, f.Mtime, f.Revision, deleted, f.CreatedAt, f.UpdatedAt, f.CanonicalKey,
 	)
 	return err
 }
 
 // InsertChange 追加一条 change 记录并返回其 sequence。
+// v9：sequence 由 repo_state.head_sequence 在同一事务内分配（全局时钟），
+// changes 只是可裁剪日志——绝不能再用 MAX(changes.sequence) 当时钟。
 func InsertChange(q dbtx, path string, revision int64, action, contentHash string, now int64) (int64, error) {
-	res, err := q.Exec(
-		`INSERT INTO changes (path, revision, action, content_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-		path, revision, action, contentHash, now,
+	seq, err := NextSequence(q)
+	if err != nil {
+		return 0, err
+	}
+	_, err = q.Exec(
+		`INSERT INTO changes (sequence, path, revision, action, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		seq, path, revision, action, contentHash, now,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
-}
-
-// LatestSequence 返回当前最大的 sequence，没有记录时为 0。
-func LatestSequence(q dbtx) (int64, error) {
-	var seq int64
-	err := q.QueryRow(`SELECT COALESCE(MAX(sequence), 0) FROM changes`).Scan(&seq)
-	return seq, err
+	return seq, nil
 }
 
 // LastSequenceForPath 返回某路径最近一次 change 的 sequence，没有记录时为 0。

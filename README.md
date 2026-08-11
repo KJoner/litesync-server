@@ -106,6 +106,8 @@ docker compose up -d
 | `OBSYNC_CHANGES_MAX` | `100000` | changes 最大行数 |
 | `OBSYNC_MAINTENANCE_HOURS` | `24` | 资源治理任务间隔（0 = 关闭定时；启动时总会执行一次） |
 | `OBSYNC_BACKUP_KEY_FILE` | （空 = 备份不可用） | 备份配置加密密钥文件；Docker 镜像内默认 `/etc/litesync/backup-config.key` |
+| `OBSYNC_DURABILITY` | `strict` | `strict` = SQLite `synchronous=FULL`（掉电后已确认事务绝不回滚）；`normal` 更快但掉电可能丢最近事务 |
+| `OBSYNC_TRUSTED_PROXIES` | `127.0.0.1,::1` | 允许信任其 `X-Forwarded-Proto` 的反向代理（IP/CIDR，逗号分隔）；其余来源的该 Header 一律忽略 |
 
 Compose 额外变量：`LITESYNC_ETC_DIR`（宿主机密钥目录，默认 `./etc-litesync`，
 只读挂载为容器内 `/etc/litesync`；一键部署脚本自动生成密钥）。
@@ -156,6 +158,9 @@ sync.example.com {
 | POST | `/api/v1/admin/backup/run` | 立即备份（异步；任务互斥，运行中返回 409） |
 | POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
+| POST | `/api/v1/e2ee/begin` | E2EE 迁移开始（0.9.0）：进入 migrating，冻结一切明文写入 |
+| POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE1 密文后切换到 encrypted |
+| POST | `/api/v1/e2ee/abort` | 放弃迁移，回到 plaintext |
 | POST | `/api/v1/pairing` | 创建一次性加密配对包（0.8.0；只存密文，默认 5 分钟过期） |
 | DELETE | `/api/v1/pairing/{id}` | 撤销配对包（配对窗口关闭时调用） |
 | POST | `/pair/{id}/consume` | **公开**消费配对包（一次性；密文仍需链接 fragment 中的密钥解密） |
@@ -179,8 +184,12 @@ X-Device-ID:      设备标识（可选，用于日志与历史）
 
 - baseRevision 与服务器不一致 → `409`，响应携带服务器当前 `revision/hash/deleted`
 - 上传内容与服务器现有内容相同 → 幂等成功，不产生新 revision（安全重试）
-- 已删除文件重新上传 → `baseRevision` 用 0 或 tombstone revision 均可
-- 任何路径穿越（`../`、绝对路径、`\`、盘符）→ `400`
+- 已删除文件重新上传（v0.9 防复活）→ 必须显式携带 tombstone revision；
+  `baseRevision=0` 返回 `409`（附 `priorHash` = 删除前内容 hash，客户端据此
+  区分「陈旧副本回传」与「同名新内容」）
+- 任何路径穿越（`../`、绝对路径、`\`、盘符）→ `400`；Windows 保留名 /
+  尾随空格句点 → `400`；与现有文件大小写/NFC 归一化冲突的新路径 → `422`
+- E2EE migrating/encrypted 状态下，非 LSE1 密文上传一律 `409`（明文写冻结）
 
 ## 功能说明
 
@@ -260,13 +269,19 @@ mv server/data server/data.broken 2>/dev/null || true
 mkdir -p server/data && cp -a "$RESTORED"/sync.db "$RESTORED"/blobs "$RESTORED"/shares server/data/
 [ -d "$RESTORED/vaults" ] && cp -a "$RESTORED/vaults" server/data/
 
-# 4. 重新部署并验证（.env 不在备份里，Token 丢了就重新生成并更新各设备）
+# 4.【必须】旋转 repo epoch（v0.9+）：作废所有客户端的旧游标
+#    否则游标新于恢复点的设备会静默跳过恢复后产生的变更区间
+docker run --rm -v "$PWD/server/data:/data" kjoner/litesync-server:latest rotate-epoch
+#（或本地二进制：OBSYNC_DATA_DIR=server/data obsync rotate-epoch）
+
+# 5. 重新部署并验证（.env 不在备份里，Token 丢了就重新生成并更新各设备）
 bash scripts/litesync-install.sh
 curl http://127.0.0.1:8080/health
 ```
 
-恢复后各设备照常连接：客户端游标若新于恢复点，changes 接口会触发
-snapshot 全量对账自动回齐，不需要手工干预。
+恢复后各设备下次连接会检测到 repoEpoch 变化，自动暂停增量同步并提示
+重新走接入向导的「安全合并」：本地在备份点之后产生的新内容全部保留，
+与服务器恢复版本的差异走正常冲突流程，不会被静默覆盖或丢弃。
 
 ## 开发与源码构建
 

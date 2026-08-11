@@ -68,6 +68,21 @@ func GetVersion(q dbtx, path string, revision int64) (*FileVersion, error) {
 	return v, nil
 }
 
+// PriorContentHash 返回该路径最近一个有内容版本的 hash
+//（tombstone 409 时告知客户端删除前内容，用于识别陈旧副本复活；无历史返回 ""）。
+func PriorContentHash(q dbtx, path string) (string, error) {
+	var h string
+	err := q.QueryRow(
+		`SELECT content_hash FROM file_versions
+		 WHERE path = ? AND action != 'delete' AND COALESCE(content_hash, '') != ''
+		 ORDER BY revision DESC LIMIT 1`, path,
+	).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return h, err
+}
+
 // CountBlobRefs 返回仍引用该 blob 的版本数量。
 func CountBlobRefs(q dbtx, blobID string) (int64, error) {
 	var n int64
