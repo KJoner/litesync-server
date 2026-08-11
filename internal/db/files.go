@@ -28,10 +28,15 @@ type File struct {
 	CreatedAt   int64
 	UpdatedAt   int64
 	// CanonicalKey：跨平台归一化后的路径（NFC + 小写），用于拒绝
-	// 大小写/Unicode 规范化不同但会在 Windows/macOS 上映射为同一文件的路径并存
+	// 大小写/Unicode 规范化不同但会在 Windows/macOS 上映射为同一文件的路径并存。
+	// 元数据加密模式下为 "h:"+HMAC（客户端计算，服务器不知路径仍可拒同名并存）
 	CanonicalKey string
 	// FileID：稳定文件身份（v9.3）——path 可变，file_id 跟随内容跨 MOVE 不变
 	FileID string
+	// MetaEnc：LSM1 加密元数据（真实路径等；base64，v9.3 三期）。明文模式为空
+	MetaEnc string
+	// MetaGeneration：元数据自身的单调世代（改名 = 元数据更新）
+	MetaGeneration int64
 }
 
 // Change 对应 changes 表的一行。
@@ -42,6 +47,9 @@ type Change struct {
 	Action      string // "upsert" | "delete"
 	ContentHash string // delete 时为空
 	CreatedAt   int64
+	// MetaGeneration（v9.3）：>0 表示该变更携带元数据世代——
+	// hash 未变但 metaGeneration 变新 = 仅改名（客户端做本地 rename 而非下载）
+	MetaGeneration int64
 }
 
 // dbtx 同时兼容 *sql.DB 和 *sql.Tx。
@@ -56,9 +64,11 @@ func GetFile(q dbtx, path string) (*File, error) {
 	f := &File{}
 	var deleted int64
 	err := q.QueryRow(
-		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key, file_id
+		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key, file_id,
+		        COALESCE(meta_enc, ''), COALESCE(meta_generation, 0)
 		 FROM files WHERE path = ?`, path,
-	).Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime, &f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt, &f.CanonicalKey, &f.FileID)
+	).Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime, &f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt,
+		&f.CanonicalKey, &f.FileID, &f.MetaEnc, &f.MetaGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -89,8 +99,8 @@ func UpsertFile(q dbtx, f *File) error {
 		deleted = 1
 	}
 	_, err := q.Exec(
-		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key, file_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key, file_id, meta_enc, meta_generation)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   content_hash = excluded.content_hash,
 		   size = excluded.size,
@@ -99,8 +109,11 @@ func UpsertFile(q dbtx, f *File) error {
 		   deleted = excluded.deleted,
 		   updated_at = excluded.updated_at,
 		   canonical_key = excluded.canonical_key,
-		   file_id = excluded.file_id`,
-		f.Path, f.ContentHash, f.Size, f.Mtime, f.Revision, deleted, f.CreatedAt, f.UpdatedAt, f.CanonicalKey, f.FileID,
+		   file_id = excluded.file_id,
+		   meta_enc = excluded.meta_enc,
+		   meta_generation = excluded.meta_generation`,
+		f.Path, f.ContentHash, f.Size, f.Mtime, f.Revision, deleted, f.CreatedAt, f.UpdatedAt,
+		f.CanonicalKey, f.FileID, f.MetaEnc, f.MetaGeneration,
 	)
 	return err
 }
@@ -109,13 +122,19 @@ func UpsertFile(q dbtx, f *File) error {
 // v9：sequence 由 repo_state.head_sequence 在同一事务内分配（全局时钟），
 // changes 只是可裁剪日志——绝不能再用 MAX(changes.sequence) 当时钟。
 func InsertChange(q dbtx, path string, revision int64, action, contentHash string, now int64) (int64, error) {
+	return InsertChangeMeta(q, path, revision, action, contentHash, now, 0)
+}
+
+// InsertChangeMeta 追加携带元数据世代的 change（v9.3；metaGen=0 表示无元数据语义）。
+func InsertChangeMeta(q dbtx, path string, revision int64, action, contentHash string, now, metaGen int64) (int64, error) {
 	seq, err := NextSequence(q)
 	if err != nil {
 		return 0, err
 	}
 	_, err = q.Exec(
-		`INSERT INTO changes (sequence, path, revision, action, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		seq, path, revision, action, contentHash, now,
+		`INSERT INTO changes (sequence, path, revision, action, content_hash, created_at, meta_generation)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		seq, path, revision, action, contentHash, now, metaGen,
 	)
 	if err != nil {
 		return 0, err
@@ -133,7 +152,7 @@ func LastSequenceForPath(q dbtx, path string) (int64, error) {
 // ListChanges 返回 sequence > since 的 change，按 sequence 升序，最多 limit 条。
 func ListChanges(q dbtx, since, limit int64) ([]Change, error) {
 	rows, err := q.Query(
-		`SELECT sequence, path, revision, action, COALESCE(content_hash, ''), created_at
+		`SELECT sequence, path, revision, action, COALESCE(content_hash, ''), created_at, COALESCE(meta_generation, 0)
 		 FROM changes WHERE sequence > ? ORDER BY sequence ASC LIMIT ?`, since, limit,
 	)
 	if err != nil {
@@ -144,7 +163,7 @@ func ListChanges(q dbtx, since, limit int64) ([]Change, error) {
 	changes := make([]Change, 0, 16)
 	for rows.Next() {
 		var c Change
-		if err := rows.Scan(&c.Sequence, &c.Path, &c.Revision, &c.Action, &c.ContentHash, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.Sequence, &c.Path, &c.Revision, &c.Action, &c.ContentHash, &c.CreatedAt, &c.MetaGeneration); err != nil {
 			return nil, err
 		}
 		changes = append(changes, c)

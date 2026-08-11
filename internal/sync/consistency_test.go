@@ -49,7 +49,10 @@ func newService(t *testing.T, opts syncsvc.Options) *syncsvc.Service {
 
 func upload(t *testing.T, s *syncsvc.Service, path string, base int64, content []byte) *syncsvc.UploadResult {
 	t.Helper()
-	res, err := s.Upload(path, base, sha256HexT(content), bytes.NewReader(content), 0, "test-device", "upsert", "")
+	res, err := s.Upload(syncsvc.UploadParams{
+		Path: path, BaseRevision: base, ClaimedHash: sha256HexT(content),
+		DeviceID: "test-device", Action: "upsert",
+	}, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("upload %s: %v", path, err)
 	}
@@ -75,8 +78,10 @@ func TestSnapshotLinearizability(t *testing.T) {
 		defer close(done)
 		for i := 0; i < total; i++ {
 			content := []byte(fmt.Sprintf("content-%d", i))
-			if _, err := s.Upload(fmt.Sprintf("f-%04d.md", i), 0, sha256HexT(content),
-				bytes.NewReader(content), 0, "w", "upsert", ""); err != nil {
+			if _, err := s.Upload(syncsvc.UploadParams{
+				Path: fmt.Sprintf("f-%04d.md", i), ClaimedHash: sha256HexT(content),
+				DeviceID: "w", Action: "upsert",
+			}, bytes.NewReader(content)); err != nil {
 				writeErr = err
 				return
 			}
@@ -214,7 +219,9 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 	}
 
 	// 陈旧设备用 base 0 回传旧内容 → 409 + priorHash
-	_, err := s.Upload("secret.md", 0, sha256HexT(old), bytes.NewReader(old), 0, "stale-device", "upsert", "")
+	_, err := s.Upload(syncsvc.UploadParams{
+		Path: "secret.md", ClaimedHash: sha256HexT(old), DeviceID: "stale-device", Action: "upsert",
+	}, bytes.NewReader(old))
 	var conflict *syncsvc.ConflictError
 	if !asConflict(err, &conflict) || !conflict.Deleted {
 		t.Fatalf("base-0 on tombstone = %v, want deleted conflict", err)
@@ -225,7 +232,10 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 
 	// 显式基于墓碑 revision 的重建仍然允许（同名新内容）
 	newContent := []byte("brand new note")
-	res, err := s.Upload("secret.md", conflict.Revision, sha256HexT(newContent), bytes.NewReader(newContent), 0, "d2", "upsert", "")
+	res, err := s.Upload(syncsvc.UploadParams{
+		Path: "secret.md", BaseRevision: conflict.Revision, ClaimedHash: sha256HexT(newContent),
+		DeviceID: "d2", Action: "upsert",
+	}, bytes.NewReader(newContent))
 	if err != nil || res.Revision != 3 {
 		t.Fatalf("explicit recreate = %v rev %v", err, res)
 	}

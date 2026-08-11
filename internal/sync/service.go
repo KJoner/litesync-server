@@ -35,6 +35,11 @@ var (
 	ErrVaultKeyCAS = errors.New("vault key fingerprint mismatch")
 	// ErrEncryptionState：E2EE 状态机转换非法（如已 encrypted 再 begin）
 	ErrEncryptionState = errors.New("invalid encryption state transition")
+	// ErrMetaRequired（v9.3 三期）：meta-encrypted 态下路径必须是伪名（=fileId）
+	// 且建档必须携带加密元数据与 canonical HMAC——明文路径无法再进入仓库
+	ErrMetaRequired = errors.New("metadata encryption is enabled: pseudonymous path and encrypted metadata required")
+	// ErrMetaCAS：元数据更新的 metaGeneration CAS 失败（并发改名）
+	ErrMetaCAS = errors.New("metadata generation mismatch")
 )
 
 const vaultKeyMetaKey = "vault-key"
@@ -117,6 +122,7 @@ type RepoInfo struct {
 	HeadSequence    int64
 	EncryptionState string
 	KeyEpoch        int64
+	MetaState       string
 }
 
 // Options 控制历史保留与资源治理（v4）。
@@ -171,11 +177,30 @@ func (s *Service) retentionFor(path string) (days, maxPerFile int) {
 	return s.opts.HistoryAttachmentDays, s.opts.HistoryAttachmentMax
 }
 
+// UploadParams：上传参数（v9.3 起结构化；字段随协议演进增长）。
+type UploadParams struct {
+	Path         string
+	BaseRevision int64
+	ClaimedHash  string
+	Mtime        int64
+	DeviceID     string
+	Action       string
+	// ClientFileID（v9.3，可空）：E2EE 客户端为新文件预生成的稳定身份——
+	// LSE3 密文的 AAD 绑定 fileId，必须在加密前确定
+	ClientFileID string
+	// MetaEnc（v9.3 三期，可空）：LSM1 加密元数据（真实路径等，base64）。
+	// meta-encrypted 态下建档必带
+	MetaEnc string
+	// CanonicalHash（v9.3 三期，可空）：客户端 HMAC 的 canonical 碰撞键
+	//（服务器不知真实路径仍可拒绝同名并存）
+	CanonicalHash string
+}
+
 // Upload 处理文件上传。
 // v4 流程：收流 + SHA-256（锁外）→ 加锁 → revision 校验 → blob 原子提交 → SQLite 事务。
-// clientFileID（v9.3，可空）：E2EE 客户端为新文件预生成的稳定身份——
-// LSE3 密文的 AAD 绑定 fileId，必须在加密前确定，因此新文件的 id 由客户端提供。
-func (s *Service) Upload(path string, baseRevision int64, claimedHash string, body io.Reader, mtime int64, deviceID, action, clientFileID string) (*UploadResult, error) {
+func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) {
+	path, baseRevision, claimedHash := p.Path, p.BaseRevision, p.ClaimedHash
+	mtime, deviceID, action, clientFileID := p.Mtime, p.DeviceID, p.Action, p.ClientFileID
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
 	}
@@ -222,6 +247,27 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		return nil, err
 	}
 
+	// 元数据加密态（v9.3 三期）：服务器可见 path 只能是 32-hex 伪名（=file_id），
+	// 建档必须携带加密元数据与 canonical HMAC，内容必须是 LSE3——
+	// 任何明文路径都无法再进入仓库（隐私冻结，等价于 E2EE 的明文写冻结）
+	if rs.MetaState == db.MetaEncrypted {
+		if !isHex32(path) {
+			return nil, ErrMetaRequired
+		}
+		if cur == nil {
+			if p.MetaEnc == "" || p.CanonicalHash == "" {
+				return nil, ErrMetaRequired
+			}
+			if clientFileID != "" && clientFileID != path {
+				return nil, ErrMetaRequired // 伪名约定：path 必须等于 fileId
+			}
+			clientFileID = path
+		}
+		if _, isV3 := lse3GenerationFromFile(tmp); !isV3 {
+			return nil, ErrPlaintextRejected
+		}
+	}
+
 	// 幂等：内容与服务器现状一致时直接成功（覆盖“重复提交同一个 change”场景）
 	if cur != nil && !cur.Deleted && cur.ContentHash == claimedHash {
 		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: rs.HeadSequence, FileID: cur.FileID}, nil
@@ -238,14 +284,24 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		}
 	}
 
+	// canonical 碰撞键：明文模式服务器计算；meta 模式用客户端 HMAC（服务器不知路径）。
+	// 内容更新未携带 hash 时保留现值（不能用伪名路径覆盖掉 HMAC 键）
+	canonicalKey := storage.CanonicalKey(path)
+	if p.CanonicalHash != "" {
+		canonicalKey = "h:" + p.CanonicalHash
+	} else if cur != nil {
+		canonicalKey = cur.CanonicalKey
+	}
+
 	// revision 校验（数据安全红线）
 	switch {
 	case cur == nil:
 		if baseRevision != 0 {
 			return nil, &ConflictError{Path: path, Revision: 0}
 		}
-		// 跨平台路径碰撞（v9）：与现有未删除路径大小写/NFC 归一化后相同 → 拒绝并存
-		if other, err := db.FindCanonicalCollision(s.db, storage.CanonicalKey(path), path); err != nil {
+		// 跨平台路径碰撞（v9）：与现有未删除路径归一化后相同 → 拒绝并存
+		//（meta 模式下比较的是 HMAC——同名判定不泄露路径）
+		if other, err := db.FindCanonicalCollision(s.db, canonicalKey, path); err != nil {
 			return nil, err
 		} else if other != "" {
 			return nil, &PathCollisionError{Path: path, Existing: other}
@@ -308,17 +364,28 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	}
 	defer tx.Rollback() //nolint:errcheck
 
+	// 元数据继承：内容更新保留现有 meta；建档采用本次携带的 meta（明文模式为空）
+	metaEnc := ""
+	metaGen := int64(0)
+	if cur != nil {
+		metaEnc, metaGen = cur.MetaEnc, cur.MetaGeneration
+	}
+	if cur == nil && p.MetaEnc != "" {
+		metaEnc, metaGen = p.MetaEnc, 1
+	}
 	if err := db.UpsertFile(tx, &db.File{
-		Path:         path,
-		ContentHash:  actualHash,
-		Size:         size,
-		Mtime:        mtime,
-		Revision:     newRevision,
-		Deleted:      false,
-		CreatedAt:    createdAt,
-		UpdatedAt:    now,
-		CanonicalKey: storage.CanonicalKey(path),
-		FileID:       fileID,
+		Path:           path,
+		ContentHash:    actualHash,
+		Size:           size,
+		Mtime:          mtime,
+		Revision:       newRevision,
+		Deleted:        false,
+		CreatedAt:      createdAt,
+		UpdatedAt:      now,
+		CanonicalKey:   canonicalKey,
+		FileID:         fileID,
+		MetaEnc:        metaEnc,
+		MetaGeneration: metaGen,
 	}); err != nil {
 		return nil, err
 	}
@@ -457,6 +524,23 @@ func (s *Service) Delete(path string, baseRevision int64, deviceID string) (*Del
 	}
 
 	return &DeleteResult{Path: path, Revision: newRevision, Sequence: seq}, nil
+}
+
+// FileInfo 返回未删除文件的元数据行（轻量，改名流用）。
+func (s *Service) FileInfo(path string) (*db.File, error) {
+	if err := storage.ValidatePath(path); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := db.GetFile(s.db, path)
+	if err != nil {
+		return nil, err
+	}
+	if f == nil || f.Deleted {
+		return nil, ErrNotFound
+	}
+	return f, nil
 }
 
 // OpenFile 返回文件元数据和内容读取器（blob 优先，旧部署回退 vault 文件）。
@@ -616,6 +700,7 @@ func (s *Service) RepoInfo() (*RepoInfo, error) {
 		HeadSequence:    rs.HeadSequence,
 		EncryptionState: rs.EncryptionState,
 		KeyEpoch:        rs.KeyEpoch,
+		MetaState:       rs.MetaState,
 	}, nil
 }
 

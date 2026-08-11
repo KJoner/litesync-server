@@ -58,6 +58,14 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/e2ee/begin", h.e2eeBegin)
 	mux.HandleFunc("POST /api/v1/e2ee/complete", h.e2eeComplete)
 	mux.HandleFunc("POST /api/v1/e2ee/abort", h.e2eeAbort)
+
+	// 元数据加密（v9.3 三期）：改名 = 元数据更新；complete = 明文路径抹除（单向）
+	mux.HandleFunc("GET /api/v1/file/meta", h.getFileMeta)
+	mux.HandleFunc("PUT /api/v1/file/meta", h.updateFileMeta)
+	mux.HandleFunc("POST /api/v1/meta/migrate", h.migrateFileMeta)
+	mux.HandleFunc("POST /api/v1/meta/begin", h.metaBegin)
+	mux.HandleFunc("POST /api/v1/meta/complete", h.metaComplete)
+	mux.HandleFunc("POST /api/v1/meta/abort", h.metaAbort)
 	mux.HandleFunc("POST /api/v1/share", h.createShare)
 	mux.HandleFunc("GET /api/v1/shares", h.listShares)
 	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
@@ -103,10 +111,12 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 // E2EE 状态机与明文冻结、vault-key CAS。
 // v3（v9 二阶段）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
 // v4（v9 三阶段二期）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）、
-// E2EE 原子 MOVE。LSE3 密文对 v3 客户端不可读（安全停止同步），Min 抬到 4。
+// E2EE 原子 MOVE。
+// v5（v9 三阶段三期）：元数据加密——伪名路径 + LSM1 加密元数据 + 改名即
+// 元数据更新。meta-encrypted 态对 v4 客户端完全不可用（只见伪名），Min 抬到 5。
 const (
-	ProtocolVersion    = 4
-	MinProtocolVersion = 4
+	ProtocolVersion    = 5
+	MinProtocolVersion = 5
 )
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
@@ -133,6 +143,7 @@ func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
 		"latestSequence":     ri.HeadSequence,
 		"encryptionState":    ri.EncryptionState,
 		"keyEpoch":           ri.KeyEpoch,
+		"metaState":          ri.MetaState,
 		"serverTime":         time.Now().Unix(),
 	})
 }

@@ -156,6 +156,67 @@ export async function decryptFile(
 	}
 }
 
+// ---------- 元数据加密（v9.3 三期：LSM1） ----------
+
+const LSM_MAGIC = [0x4c, 0x53, 0x4d, 0x31]; // "LSM1"
+
+export interface MetaKeys {
+	enc: CryptoKey;
+}
+
+/** HKDF 从 VMK 原始字节派生元数据解密密钥（与插件同源参数）。 */
+export async function deriveMetaKeys(vmkRaw: Uint8Array): Promise<MetaKeys> {
+	const master = await crypto.subtle.importKey("raw", vmkRaw as BufferSource, "HKDF", false, ["deriveKey"]);
+	const enc = await crypto.subtle.deriveKey(
+		{
+			name: "HKDF",
+			hash: "SHA-256",
+			salt: new Uint8Array(32) as BufferSource,
+			info: new TextEncoder().encode("litesync/v5/meta-enc") as BufferSource,
+		},
+		master,
+		{ name: "AES-GCM", length: 256 },
+		false,
+		["decrypt"],
+	);
+	return { enc };
+}
+
+/** LSM1 解密：返回 { path, metaGeneration }；失败返回 null。 */
+export async function decryptMeta(
+	keys: MetaKeys,
+	payloadB64: string,
+	vaultId: string,
+	fileId: string,
+): Promise<{ path: string; metaGeneration: number } | null> {
+	let raw: Uint8Array;
+	try {
+		raw = b64decode(payloadB64);
+	} catch {
+		return null;
+	}
+	const head = 4 + EPOCH_LEN + GEN_LEN;
+	if (raw.byteLength < head + IV_LEN + 16 || !LSM_MAGIC.every((b, i) => raw[i] === b)) return null;
+	const view = new DataView(raw.buffer, raw.byteOffset);
+	const keyEpoch = view.getUint32(4, false);
+	const metaGeneration = Number(view.getBigUint64(4 + EPOCH_LEN, false));
+	try {
+		const iv = raw.subarray(head, head + IV_LEN);
+		const ct = raw.subarray(head + IV_LEN);
+		const aad = new TextEncoder().encode(`litesync/v5/meta:${vaultId}:${keyEpoch}:${fileId}:${metaGeneration}`);
+		const plain = await crypto.subtle.decrypt(
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource },
+			keys.enc,
+			ct as BufferSource,
+		);
+		const meta = JSON.parse(new TextDecoder().decode(plain)) as { path?: string };
+		if (typeof meta.path !== "string" || meta.path === "") return null;
+		return { path: meta.path, metaGeneration };
+	} catch {
+		return null;
+	}
+}
+
 /** 解密 LSS1 分享（独立 Share Key）；失败返回 null。 */
 export async function decryptShare(keyRaw: Uint8Array, payload: ArrayBuffer): Promise<ArrayBuffer | null> {
 	if (!isEncryptedShare(payload)) return null;

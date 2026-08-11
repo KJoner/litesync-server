@@ -16,6 +16,14 @@ const (
 	EncryptionEncrypted = "encrypted"
 )
 
+// 元数据加密状态机（v9.3 三期）：plain → migrating → encrypted。
+// encrypted 态下服务器可见 path 只是伪名（=file_id），真实路径在 meta_enc 里。
+const (
+	MetaPlain     = "plain"
+	MetaMigrating = "migrating"
+	MetaEncrypted = "encrypted"
+)
+
 // RepoState 对应 repo_state 单行（id=1）。
 type RepoState struct {
 	RepoEpoch           string
@@ -23,6 +31,7 @@ type RepoState struct {
 	MinRetainedSequence int64
 	EncryptionState     string
 	KeyEpoch            int64
+	MetaState           string
 }
 
 func randomEpoch() (string, error) {
@@ -77,13 +86,19 @@ func initRepoState(d *sql.DB) error {
 func GetRepoState(q dbtx) (*RepoState, error) {
 	rs := &RepoState{}
 	err := q.QueryRow(
-		`SELECT repo_epoch, head_sequence, min_retained_sequence, encryption_state, key_epoch
+		`SELECT repo_epoch, head_sequence, min_retained_sequence, encryption_state, key_epoch, COALESCE(meta_state, 'plain')
 		 FROM repo_state WHERE id = 1`,
-	).Scan(&rs.RepoEpoch, &rs.HeadSequence, &rs.MinRetainedSequence, &rs.EncryptionState, &rs.KeyEpoch)
+	).Scan(&rs.RepoEpoch, &rs.HeadSequence, &rs.MinRetainedSequence, &rs.EncryptionState, &rs.KeyEpoch, &rs.MetaState)
 	if err != nil {
 		return nil, err
 	}
 	return rs, nil
+}
+
+// SetMetaState 更新元数据加密状态机。
+func SetMetaState(q dbtx, state string) error {
+	_, err := q.Exec(`UPDATE repo_state SET meta_state = ? WHERE id = 1`, state)
+	return err
 }
 
 // NextSequence 在变更事务内分配下一个 sequence（head_sequence += 1）。

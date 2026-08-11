@@ -16,9 +16,12 @@ import {
 } from "./api";
 import {
 	decryptFile,
+	decryptMeta,
+	deriveMetaKeys,
 	FileKeyBinding,
 	importVmk,
 	isEncryptedFile,
+	MetaKeys,
 	subtleAvailable,
 	unlockVaultKey,
 	VaultKeyDoc,
@@ -38,6 +41,8 @@ interface State {
 	vmk: CryptoKey | null;
 	/** LSE2 信封的 AAD 绑定材料（v9.2，来自 /info） */
 	binding?: FileKeyBinding;
+	/** 元数据解密密钥（v9.3 三期，meta 模式；解锁时派生） */
+	metaKeys?: MetaKeys;
 }
 
 let S: State | null = null;
@@ -141,10 +146,23 @@ async function boot(): Promise<void> {
 
 async function enterMain(): Promise<void> {
 	const snap = await S!.api.snapshot();
+	// meta 模式（v9.3 三期）：条目是伪名 + 加密元数据 → 本地解出真实路径建树
+	for (const f of snap.files) {
+		if (!f.metaEnc || !f.fileId) continue;
+		f.serverPath = f.path;
+		if (!S!.metaKeys || !S!.binding?.vaultId) continue; // 无法解密：以伪名显示
+		const dec = await decryptMeta(S!.metaKeys, f.metaEnc, S!.binding.vaultId, f.fileId);
+		if (dec) f.path = dec.path;
+	}
 	S!.files = snap.files.filter((f) => isVisible(f.path));
 	S!.byPath = new Map(S!.files.map((f) => [f.path, f]));
 	renderMain();
 	onRoute();
+}
+
+/** 内容/历史请求用的服务器路径（meta 模式为伪名）。 */
+function serverPathFor(path: string): string {
+	return S?.byPath.get(path)?.serverPath ?? path;
 }
 
 // ---------- 登录 / 解锁 ----------
@@ -212,6 +230,8 @@ function renderUnlock(err?: string): void {
 		}
 		// VMK 只保留在内存 CryptoKey：不写任何浏览器存储，刷新即需重新解锁
 		S!.vmk = await importVmk(raw);
+		// 元数据密钥（v9.3）：派生后立即清零原始字节
+		S!.metaKeys = await deriveMetaKeys(raw);
 		raw.fill(0);
 		await enterMain();
 	};
@@ -469,7 +489,7 @@ async function showNote(path: string): Promise<void> {
 	body.textContent = "加载中…";
 
 	try {
-		const raw = await S!.api.file(path);
+		const raw = await S!.api.file(serverPathFor(path));
 		const data = await decodeContent(path, raw);
 		if (path.toLowerCase().endsWith(".md")) {
 			renderMarkdownInto(body, path, new TextDecoder().decode(data));
@@ -520,7 +540,7 @@ function renderMarkdownInto(container: HTMLElement, path: string, src: string): 
 		img.removeAttribute("src");
 		void (async () => {
 			try {
-				const data = await decodeContent(finalTarget, await S!.api.file(finalTarget));
+				const data = await decodeContent(finalTarget, await S!.api.file(serverPathFor(finalTarget)));
 				img.src = trackBlob(new Blob([data]));
 			} catch {
 				img.alt = `⚠ 无法加载 ${finalTarget}`;
@@ -555,7 +575,7 @@ async function openHistory(path: string): Promise<void> {
 	document.body.append(drawer);
 
 	try {
-		const versions = await S!.api.history(path);
+		const versions = await S!.api.history(serverPathFor(path));
 		if (versions.length === 0) {
 			list.append(el("p", "muted", "暂无历史版本"));
 			return;
@@ -604,7 +624,7 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	body.textContent = "加载中…";
 
 	try {
-		const data = await decodeContent(path, await S!.api.version(path, v.revision));
+		const data = await decodeContent(path, await S!.api.version(serverPathFor(path), v.revision));
 		if (!path.toLowerCase().endsWith(".md")) {
 			body.innerHTML = "";
 			const a = el("a", "primary-link", "下载此版本") as HTMLAnchorElement;
@@ -638,7 +658,7 @@ async function showDiff(path: string, v: VersionEntry, oldText: string): Promise
 	box.textContent = "对比中…";
 
 	try {
-		const curData = await decodeContent(path, await S!.api.file(path));
+		const curData = await decodeContent(path, await S!.api.file(serverPathFor(path)));
 		const curText = new TextDecoder().decode(curData);
 		const lines: DiffLine[] | null = diffLines(oldText, curText);
 		box.innerHTML = "";

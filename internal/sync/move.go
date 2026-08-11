@@ -45,6 +45,11 @@ func (s *Service) Move(fromPath, toPath string, baseRevision int64, deviceID str
 	if err != nil {
 		return nil, err
 	}
+	// 元数据加密（v9.3 三期）：migrating 走 migrate-file，encrypted 态改名
+	// 走 UpdateFileMeta（元数据更新）——路径式 MOVE 不再适用
+	if rs.MetaState != db.MetaPlain {
+		return nil, ErrEncryptionState
+	}
 
 	from, err := db.GetFile(s.db, fromPath)
 	if err != nil {

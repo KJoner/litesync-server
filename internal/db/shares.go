@@ -73,7 +73,8 @@ func MarkShareRevoked(q dbtx, id string) error {
 // ListFiles 返回当前所有未删除文件的元数据（snapshot API 用）。
 func ListFiles(q dbtx) ([]File, error) {
 	rows, err := q.Query(
-		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, file_id
+		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, file_id,
+		        COALESCE(meta_enc, ''), COALESCE(meta_generation, 0)
 		 FROM files WHERE deleted = 0 ORDER BY path ASC`)
 	if err != nil {
 		return nil, err
@@ -85,7 +86,7 @@ func ListFiles(q dbtx) ([]File, error) {
 		var f File
 		var deleted int64
 		if err := rows.Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime,
-			&f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt, &f.FileID); err != nil {
+			&f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt, &f.FileID, &f.MetaEnc, &f.MetaGeneration); err != nil {
 			return nil, err
 		}
 		f.Deleted = deleted != 0

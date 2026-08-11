@@ -8,6 +8,11 @@ export interface FileEntry {
 	mtime: number;
 	/** 稳定文件身份（0.11.0+；LSE3 解密的 AAD 输入） */
 	fileId?: string;
+	/** 加密元数据（0.12.0+，meta 模式；真实路径在里面） */
+	metaEnc?: string;
+	metaGeneration?: number;
+	/** meta 模式下的服务器伪名（path 已被替换为解密出的真实路径，前端字段） */
+	serverPath?: string;
 }
 
 export interface VersionEntry {

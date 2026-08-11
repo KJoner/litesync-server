@@ -11,6 +11,9 @@ type apiChange struct {
 	Action   string `json:"action"`
 	Revision int64  `json:"revision"`
 	Hash     string `json:"hash,omitempty"`
+	// MetaGeneration（v9.3）：>0 时该变更携带元数据世代——
+	// hash 未变但世代变新 = 仅改名，客户端做本地 rename 而不是下载内容
+	MetaGeneration int64 `json:"metaGeneration,omitempty"`
 }
 
 // changes 返回 since 之后的增量变更。
@@ -56,11 +59,12 @@ func (h *handlers) changes(w http.ResponseWriter, r *http.Request) {
 	out := make([]apiChange, 0, len(res.Changes))
 	for _, c := range res.Changes {
 		out = append(out, apiChange{
-			Sequence: c.Sequence,
-			Path:     c.Path,
-			Action:   c.Action,
-			Revision: c.Revision,
-			Hash:     c.ContentHash,
+			Sequence:       c.Sequence,
+			Path:           c.Path,
+			Action:         c.Action,
+			Revision:       c.Revision,
+			Hash:           c.ContentHash,
+			MetaGeneration: c.MetaGeneration,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

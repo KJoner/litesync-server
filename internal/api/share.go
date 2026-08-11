@@ -36,10 +36,16 @@ func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
 		Size     int64  `json:"size"`
 		Mtime    int64  `json:"mtime"`
 		FileID   string `json:"fileId,omitempty"`
+		// v9.3 三期：加密元数据（真实路径在里面；快照是对账与接入的权威清单）
+		MetaEnc        string `json:"metaEnc,omitempty"`
+		MetaGeneration int64  `json:"metaGeneration,omitempty"`
 	}
 	out := make([]apiFile, 0, len(snap.Files))
 	for _, f := range snap.Files {
-		out = append(out, apiFile{Path: f.Path, Revision: f.Revision, Hash: f.ContentHash, Size: f.Size, Mtime: f.Mtime, FileID: f.FileID})
+		out = append(out, apiFile{
+			Path: f.Path, Revision: f.Revision, Hash: f.ContentHash, Size: f.Size, Mtime: f.Mtime,
+			FileID: f.FileID, MetaEnc: f.MetaEnc, MetaGeneration: f.MetaGeneration,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"repoEpoch": snap.RepoEpoch,

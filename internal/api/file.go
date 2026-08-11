@@ -39,11 +39,21 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	}
 	action := r.Header.Get("X-Action") // ""/upsert/merge/restore
 	deviceID := auditDeviceID(r)
-	// X-File-Id（v9.3，可选）：E2EE 客户端为新文件预生成的稳定身份
-	clientFileID := r.Header.Get("X-File-Id")
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
-	res, err := h.svc.Upload(path, baseRevision, hash, body, mtime, deviceID, action, clientFileID)
+	res, err := h.svc.Upload(syncsvc.UploadParams{
+		Path:         path,
+		BaseRevision: baseRevision,
+		ClaimedHash:  hash,
+		Mtime:        mtime,
+		DeviceID:     deviceID,
+		Action:       action,
+		// X-File-Id（v9.3）：E2EE 客户端为新文件预生成的稳定身份
+		ClientFileID: r.Header.Get("X-File-Id"),
+		// v9.3 三期：加密元数据与 canonical HMAC（meta 模式建档必带）
+		MetaEnc:       r.Header.Get("X-Meta-Enc"),
+		CanonicalHash: r.Header.Get("X-Canonical-Hash"),
+	}, body)
 	if err != nil {
 		h.writeUploadError(w, err)
 		return
@@ -75,6 +85,9 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	case errors.Is(err, syncsvc.ErrPlaintextRejected):
 		// E2EE 明文冻结：仓库已启用加密，明文上传一律拒绝
 		writeErr(w, http.StatusConflict, err.Error())
+	case errors.Is(err, syncsvc.ErrMetaRequired):
+		// 元数据加密态：伪名路径 + 加密元数据缺失
+		writeErr(w, http.StatusBadRequest, err.Error())
 	case errors.As(err, &tooBig):
 		writeErr(w, http.StatusRequestEntityTooLarge, "file too large")
 	case errors.Is(err, storage.ErrInvalidPath):
@@ -165,6 +178,11 @@ func (h *handlers) getFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-File-Size", strconv.FormatInt(meta.Size, 10))
 	w.Header().Set("X-File-Mtime", strconv.FormatInt(meta.Mtime, 10))
 	w.Header().Set("X-File-Id", meta.FileID)
+	if meta.MetaEnc != "" {
+		// v9.3 三期：加密元数据随下载返回（客户端解出真实路径）
+		w.Header().Set("X-Meta-Enc", meta.MetaEnc)
+		w.Header().Set("X-Meta-Generation", strconv.FormatInt(meta.MetaGeneration, 10))
+	}
 	io.Copy(w, rc) //nolint:errcheck // 传输中断由客户端 hash 校验兜底
 }
 

@@ -50,6 +50,8 @@ func routeScope(method, path string) (scope string, rootOnly bool) {
 		return syncsvc.ScopeKeyAdmin, false
 	case strings.HasPrefix(path, "/api/v1/e2ee/"):
 		return syncsvc.ScopeKeyAdmin, false
+	case strings.HasPrefix(path, "/api/v1/meta/"):
+		return syncsvc.ScopeKeyAdmin, false // 元数据加密状态机（v9.3）
 	case path == "/api/v1/whoami":
 		return "", false // 任何有效凭据均可
 	default:

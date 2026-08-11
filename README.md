@@ -172,6 +172,9 @@ sync.example.com {
 | POST | `/api/v1/admin/backup/run` | 立即备份（异步；任务互斥，运行中返回 409） |
 | POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
+| GET / PUT | `/api/v1/file/meta` | 元数据读取 / 改名=元数据更新（0.12.0，metaGeneration CAS） |
+| POST | `/api/v1/meta/migrate` | 元数据迁移：单文件真实路径 → 伪名（断点续传安全） |
+| POST | `/api/v1/meta/begin` / `complete` / `abort` | 元数据加密状态机；complete = 明文路径抹除（单向，需显式确认） |
 | POST | `/api/v1/e2ee/begin` | E2EE 迁移开始（0.9.0）：进入 migrating，冻结一切明文写入 |
 | POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE1/LSE2 密文后切换到 encrypted |
 | POST | `/api/v1/e2ee/abort` | 放弃迁移，回到 plaintext |
@@ -226,6 +229,15 @@ X-Device-ID:      设备标识（可选，用于日志与历史）
 服务器对 E2EE 零感知：只代存一份客户端上传的**加密** vault key 文档
 （带覆盖保护 + CAS，防止误覆盖导致密文永久不可读）。启用后文件内容均为
 LSE 密文，服务器永远无法获得解密密钥或任何明文。
+
+**路径与文件名加密（0.12.0，可选）**：插件命令「加密路径与文件名」把服务器上
+所有路径替换为随机伪名（=fileId），真实路径改存 **LSM1** 加密元数据
+（AAD 绑定 vaultId+keyEpoch+fileId+metaGeneration）。此后服务器与其备份
+完全不知道目录结构与文件名；同名并存判定靠客户端 HMAC（服务器只见散列）；
+改名 = 元数据更新，内容零重传。完成时执行**明文路径抹除**（删除墓碑行、
+清除旧信封历史、全量裁剪 changes）——不可逆，需显式确认，且要求先完成
+「升级加密信封 LSE1 → LSE3」。剩余的元数据暴露面：文件大小、修改时间与
+访问模式（见三阶段计划的 padding/批处理评估）。
 
 信封格式（0.11.0）：新写入使用 **LSE3**——AAD 绑定 vaultId + keyEpoch +
 **fileId + contentGeneration**：恶意服务器既无法用其他 vault / 其他密钥世代 /

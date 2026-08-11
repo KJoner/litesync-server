@@ -101,6 +101,27 @@ func migrateColumns(d *sql.DB) error {
 			return err
 		}
 	}
+
+	// v9.3 三期：元数据加密。meta_enc = LSM1 加密的真实路径等元数据
+	//（meta-encrypted 态下服务器可见的 path 只是 32-hex 伪名 = file_id）；
+	// meta_generation = 元数据自身的单调世代（改名 = 元数据更新，与内容无关）；
+	// changes.meta_generation 让客户端区分「内容变更」与「仅改名」。
+	for _, m := range []struct{ table, column, ddl string }{
+		{"files", "meta_enc", `ALTER TABLE files ADD COLUMN meta_enc TEXT NOT NULL DEFAULT ''`},
+		{"files", "meta_generation", `ALTER TABLE files ADD COLUMN meta_generation INTEGER NOT NULL DEFAULT 0`},
+		{"changes", "meta_generation", `ALTER TABLE changes ADD COLUMN meta_generation INTEGER NOT NULL DEFAULT 0`},
+		{"repo_state", "meta_state", `ALTER TABLE repo_state ADD COLUMN meta_state TEXT NOT NULL DEFAULT 'plain'`},
+	} {
+		has, err := columnExists(d, m.table, m.column)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.Exec(m.ddl); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
