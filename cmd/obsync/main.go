@@ -21,7 +21,7 @@ import (
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.8.0"
+const version = "0.8.2"
 
 func main() {
 	if err := run(); err != nil {

@@ -2,7 +2,10 @@ name: litesync
 
 services:
   obsync:
-    build: .
+    # 默认使用 Docker Hub 预构建镜像（multi-arch：linux/amd64 + linux/arm64）。
+    # 固定版本：在 .env 设置 LITESYNC_VERSION=0.8.2（默认跟随 latest）；
+    # 源码构建：docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    image: ${LITESYNC_IMAGE:-kjoner/litesync-server}:${LITESYNC_VERSION:-latest}
     restart: unless-stopped
 
     environment:

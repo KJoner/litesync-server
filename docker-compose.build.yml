@@ -1,0 +1,6 @@
+# 源码构建 overlay（开发 / 镜像不可用时的回退），叠加在 docker-compose.yml 上：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# 正式部署请直接使用 Docker Hub 镜像：docker compose pull && docker compose up -d
+services:
+  obsync:
+    build: .

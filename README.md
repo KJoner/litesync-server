@@ -45,34 +45,46 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudf
 bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync-server/master/scripts/litesync-install.sh)
 ```
 
-首次执行：克隆代码、生成 `.env`（随机 Token，端口被占用时自动改用
-8081–8099 中的空闲端口）、构建镜像、启动并输出配置信息。
-再次执行：拉取最新代码重新构建部署，`.env` 和 `data/` 保持不变。
+首次执行：克隆配置、生成 `.env`（随机 Token，端口被占用时自动改用
+8081–8099 中的空闲端口）、拉取 Docker Hub 预构建镜像（multi-arch，
+无需本机编译；镜像不可用时自动回退源码构建）、启动并输出配置信息。
+再次执行：拉取最新配置与镜像完成升级，`.env` 和 `data/` 保持不变。
 
-## 快速开始（Docker）
+## 快速开始（Docker Hub 镜像）
+
+镜像：[`kjoner/litesync-server`](https://hub.docker.com/r/kjoner/litesync-server)
+（multi-arch manifest，同时支持 `linux/amd64` / `linux/arm64`）。
+正式部署不需要克隆源码，也不需要本机编译：
 
 ```bash
-cd litesync-server
-cp .env.example .env
-# 生成随机 token 并填入 .env
-openssl rand -hex 32
+mkdir litesync-server && cd litesync-server
+wget https://raw.githubusercontent.com/KJoner/litesync-server/master/docker-compose.yml
+wget -O .env https://raw.githubusercontent.com/KJoner/litesync-server/master/.env.example
+# 编辑 .env，填入 OBSYNC_TOKEN（openssl rand -hex 32 生成）
 
+docker compose pull
 docker compose up -d
 curl http://127.0.0.1:8080/health
 ```
 
 只需要持久化 `./data` 目录。compose 已配置日志轮转（10MB × 3）。
+如需 R2 备份，另需备份密钥（一键部署脚本自动生成，手动部署可
+`mkdir etc-litesync && openssl rand -hex 32 > etc-litesync/backup-config.key`）。
 
-## 本地运行（不使用 Docker）
+### 版本与升级
+
+Git tag `v0.8.2` 发布后，Docker Hub 会同时存在
+`0.8.2`（精确版本）/ `0.8` / `0`（滚动次/主版本）/ `latest`（最新正式版）。
+
+- **`latest`**：始终指向最新正式发布，`docker compose pull` 即可升级，适合个人部署；
+- **固定版本**（如 `0.8.2`）：升级完全由你控制，适合谨慎升级的场景，
+  在 `.env` 中设置 `LITESYNC_VERSION=0.8.2`，升级时改版本号再 pull。
+
+升级步骤（数据在 `./data` 挂载卷中，升级不受影响）：
 
 ```bash
-OBSYNC_TOKEN=$(openssl rand -hex 32) go run ./cmd/obsync
-```
-
-Windows PowerShell：
-
-```powershell
-$env:OBSYNC_TOKEN = 'your-random-token'; go run ./cmd/obsync
+docker compose pull
+docker compose up -d
 ```
 
 ## 配置（全部通过环境变量）
@@ -255,6 +267,32 @@ curl http://127.0.0.1:8080/health
 
 恢复后各设备照常连接：客户端游标若新于恢复点，changes 接口会触发
 snapshot 全量对账自动回齐，不需要手工干预。
+
+## 开发与源码构建
+
+本地直接运行（不使用 Docker）：
+
+```bash
+OBSYNC_TOKEN=$(openssl rand -hex 32) go run ./cmd/obsync
+```
+
+Windows PowerShell：
+
+```powershell
+$env:OBSYNC_TOKEN = 'your-random-token'; go run ./cmd/obsync
+```
+
+从源码构建 Docker 镜像（不使用 Docker Hub 预构建镜像时的高级用法，
+一键部署脚本在镜像拉取失败时也会自动走这条路径）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+镜像发布（维护者）：推送 `v*` 格式的 Git tag（须与 `cmd/obsync/main.go`
+中的版本号一致）→ GitHub Actions 自动测试并将 multi-arch 镜像推送到
+Docker Hub（见 `.github/workflows/docker-publish.yml`）；普通 push / PR
+只跑 CI，不发布镜像。
 
 ## 测试
 

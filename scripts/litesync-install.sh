@@ -7,6 +7,9 @@
 #
 # 重新部署 / 更新版本：
 #   在同一目录（或仓库目录内）再次执行同一条命令即可。
+#   默认拉取 Docker Hub 预构建镜像（multi-arch），不在本机编译；
+#   镜像拉取失败（未发布 / 网络受限）自动回退源码构建，
+#   也可用 LITESYNC_SOURCE_BUILD=1 强制源码构建。
 #   .env（含 Token）、data/ 数据目录与 backup-config.key 会被完整保留。
 #
 # 从旧 monorepo（KJoner/litesync 的 server/ 子目录）部署升级：
@@ -124,11 +127,25 @@ else
 	info "检测到已有 backup-config.key，保留不变"
 fi
 
-# ---------- 构建并启动 ----------
-info "构建镜像并启动容器 ..."
-$COMPOSE up -d --build
+# ---------- 拉取镜像并启动 ----------
+# 默认使用 Docker Hub 预构建镜像；LITESYNC_IMAGE / LITESYNC_VERSION 可在 .env 覆盖
+IMAGE_REF="${LITESYNC_IMAGE:-kjoner/litesync-server}:${LITESYNC_VERSION:-latest}"
+source_build() {
+	$COMPOSE -f docker-compose.yml -f docker-compose.build.yml up -d --build
+}
+if [ "${LITESYNC_SOURCE_BUILD:-0}" = "1" ]; then
+	info "LITESYNC_SOURCE_BUILD=1：从源码构建镜像并启动 ..."
+	source_build
+elif { info "拉取镜像 $IMAGE_REF ..."; $COMPOSE pull; }; then
+	info "启动容器 ..."
+	$COMPOSE up -d
+else
+	warn "拉取 $IMAGE_REF 失败（镜像未发布或网络受限），回退到本地源码构建 ..."
+	source_build
+fi
 
-# 清理更新后遗留的悬空镜像（不影响使用中的镜像）
+# 清理旧版脚本本地构建的镜像与更新后遗留的悬空镜像（不影响使用中的镜像）
+docker image rm litesync-obsync litesync_obsync >/dev/null 2>&1 || true
 docker image prune -f >/dev/null 2>&1 || true
 
 # ---------- 健康检查 ----------
@@ -159,6 +176,7 @@ echo "=============================================================="
 echo " litesync 部署完成 ✓   $(health)"
 echo "--------------------------------------------------------------"
 echo " 当前版本  : $VERSION"
+echo " 运行镜像  : $IMAGE_REF"
 echo " 安装目录  : $REPO_DIR"
 echo " 数据目录  : $REPO_DIR/data   （建议同时启用 Web 端的 R2 异地备份）"
 echo " 监听地址  : http://$BIND:$PORT"
@@ -178,5 +196,5 @@ echo " 常用命令（在 $REPO_DIR 下执行）："
 echo "   查看日志 : $COMPOSE logs -f"
 echo "   重启服务 : $COMPOSE restart"
 echo "   停止服务 : $COMPOSE down"
-echo " 更新版本  : 重新执行本安装命令即可（保留 Token 与数据）"
+echo " 更新版本  : 重新执行本安装命令，或 $COMPOSE pull && $COMPOSE up -d"
 echo "=============================================================="

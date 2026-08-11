@@ -1,10 +1,15 @@
-# 构建阶段
-FROM golang:1.26-alpine AS build
+# 构建阶段：始终在构建机原生架构上交叉编译（CGO 已禁用、sqlite 为纯 Go 实现），
+# 避免 buildx 多架构构建时 arm64 落入 QEMU 模拟编译（慢一个数量级）。
+# 普通 docker build 下 TARGETOS/TARGETARCH 为空，Go 回退到本机默认值，行为不变。
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/obsync ./cmd/obsync
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/obsync ./cmd/obsync
 
 # 运行阶段：二进制 + CA 证书 + restic（备份用，仅在备份任务运行时 fork，无常驻内存开销）
 FROM alpine:3.22
