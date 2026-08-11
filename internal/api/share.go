@@ -135,6 +135,10 @@ func (h *handlers) getShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
+	// CORS（v9.2）：允许「离线单文件 viewer」（本地打开的 HTML）跨源读取分享密文。
+	// 内容本就是拿到链接即可下载的密文（密钥只在 fragment 里），放开 GET 不降低安全性；
+	// 反而让用户可以用不受本服务器控制的本地 viewer 解密——服务器被攻陷也偷不到密钥
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(share.Size, 10))
 	w.Header().Set("Cache-Control", "no-store")

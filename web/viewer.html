@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LiteSync 离线分享查看器</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2rem 1rem; min-height: 100vh;
+  background: #16181d; color: #dcddde;
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.6;
+}
+.wrap { max-width: 760px; margin: 0 auto; }
+.brand { font-size: 1.15rem; font-weight: 600; margin-bottom: .25rem; }
+.muted { color: #8a8f98; font-size: .85rem; }
+.bar { display: flex; gap: .5rem; margin: 1rem 0 .5rem; }
+input {
+  flex: 1; padding: .55rem .7rem; border-radius: 6px;
+  border: 1px solid #34383f; background: #1e2127; color: inherit; font-size: .9rem;
+}
+button {
+  padding: .55rem 1rem; border-radius: 6px; border: none; cursor: pointer;
+  background: #5b7cfa; color: #fff; font-weight: 600;
+}
+button:hover { background: #6f8cfb; }
+#status { min-height: 1.4rem; font-size: .85rem; color: #8a8f98; }
+.ok { color: #4cc38a; } .err { color: #e5686d; }
+#note {
+  margin-top: 1rem; padding: 1.25rem 1.4rem; border-radius: 10px;
+  background: #1e2127; border: 1px solid #2a2e35; overflow-x: auto;
+}
+#note:empty { display: none; }
+#note pre { background: #16181d; padding: .75rem; border-radius: 6px; overflow-x: auto; }
+#note code { background: #16181d; padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+#note pre code { padding: 0; }
+#note blockquote { border-left: 3px solid #5b7cfa; margin-left: 0; padding-left: 1rem; color: #a8adb5; }
+#note img { max-width: 100%; }
+#note table { border-collapse: collapse; } #note td, #note th { border: 1px solid #34383f; padding: .3rem .6rem; }
+#note a { color: #7d9bff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">◈ LiteSync 离线分享查看器</div>
+  <div class="muted">
+    自包含单文件页面：从仓库下载后本地保存打开。解密密钥只在分享链接的 # 片段中，
+    仅在本页面内存中使用，绝不发送给任何服务器——即使 LiteSync 服务器被攻陷，
+    这个本地文件也不会被替换。
+  </div>
+  <div class="bar">
+    <input id="link" type="text" placeholder="粘贴分享链接：https://your-server/share.html#id.key" autocomplete="off">
+    <button id="view">查看</button>
+  </div>
+  <div id="status"></div>
+  <div id="note" class="markdown-body"></div>
+</div>
+<script>/*__VIEWER_JS__*/</script>
+</body>
+</html>

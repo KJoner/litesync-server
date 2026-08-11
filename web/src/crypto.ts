@@ -1,4 +1,4 @@
-/** 浏览器端 E2EE：与插件同一套格式（LSE1 文件 / LSS1 分享）。解密全部在本地完成。 */
+/** 浏览器端 E2EE：与插件同一套格式（LSE1/LSE2 文件 / LSS1 分享）。解密全部在本地完成。 */
 
 export interface VaultKeyDoc {
 	version: number;
@@ -11,8 +11,16 @@ export interface VaultKeyDoc {
 }
 
 const LSE_MAGIC = [0x4c, 0x53, 0x45, 0x31]; // "LSE1"
+const LSE2_MAGIC = [0x4c, 0x53, 0x45, 0x32]; // "LSE2"（v9.2：AAD 绑定 vaultId+keyEpoch+path）
 const LSS_MAGIC = [0x4c, 0x53, 0x53, 0x31]; // "LSS1"
 const IV_LEN = 12;
+const EPOCH_LEN = 4;
+
+/** LSE2 的 AAD 绑定材料（来自 /api/v1/info）。 */
+export interface FileKeyBinding {
+	vaultId: string;
+	keyEpoch: number;
+}
 
 const VMK_AAD = new TextEncoder().encode("litesync/v1/vault-key");
 const SHARE_AAD = new TextEncoder().encode("litesync/v1/share");
@@ -45,7 +53,7 @@ function hasMagic(data: ArrayBuffer, magic: number[]): boolean {
 }
 
 export function isEncryptedFile(data: ArrayBuffer): boolean {
-	return hasMagic(data, LSE_MAGIC);
+	return hasMagic(data, LSE_MAGIC) || hasMagic(data, LSE2_MAGIC);
 }
 
 export function isEncryptedShare(data: ArrayBuffer): boolean {
@@ -83,9 +91,30 @@ export async function importVmk(raw: Uint8Array): Promise<CryptoKey> {
 	return crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, false, ["decrypt"]);
 }
 
-/** 解密 LSE1 文件（路径绑定 AAD）；失败返回 null。 */
-export async function decryptFile(vmk: CryptoKey, path: string, payload: ArrayBuffer): Promise<ArrayBuffer | null> {
-	if (!isEncryptedFile(payload)) return null;
+/** 解密 LSE1/LSE2 文件；失败返回 null。LSE2 需要 binding（vaultId 来自 /info）。 */
+export async function decryptFile(
+	vmk: CryptoKey,
+	path: string,
+	payload: ArrayBuffer,
+	binding?: FileKeyBinding,
+): Promise<ArrayBuffer | null> {
+	if (hasMagic(payload, LSE2_MAGIC)) {
+		if (!binding?.vaultId) return null;
+		try {
+			const envelopeEpoch = new DataView(payload).getUint32(4, false);
+			const iv = new Uint8Array(payload, 4 + EPOCH_LEN, IV_LEN);
+			const ct = new Uint8Array(payload, 4 + EPOCH_LEN + IV_LEN);
+			const aad = new TextEncoder().encode(`litesync/v2/file:${binding.vaultId}:${envelopeEpoch}:${path}`);
+			return await crypto.subtle.decrypt(
+				{ name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource },
+				vmk,
+				ct,
+			);
+		} catch {
+			return null;
+		}
+	}
+	if (!hasMagic(payload, LSE_MAGIC)) return null;
 	try {
 		const iv = new Uint8Array(payload, 4, IV_LEN);
 		const ct = new Uint8Array(payload, 4 + IV_LEN);

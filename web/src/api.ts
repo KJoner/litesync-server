@@ -51,7 +51,7 @@ export class Api {
 		return res;
 	}
 
-	async info(): Promise<{ version: string; latestSequence: number }> {
+	async info(): Promise<{ version: string; latestSequence: number; vaultId?: string; keyEpoch?: number }> {
 		const res = await this.req("/api/v1/info");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		return res.json();

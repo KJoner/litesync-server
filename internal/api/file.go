@@ -38,7 +38,7 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 		mtime, _ = strconv.ParseInt(v, 10, 64)
 	}
 	action := r.Header.Get("X-Action") // ""/upsert/merge/restore
-	deviceID := r.Header.Get("X-Device-ID")
+	deviceID := auditDeviceID(r)
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
 	res, err := h.svc.Upload(path, baseRevision, hash, body, mtime, deviceID, action)
@@ -130,7 +130,7 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	res, err := h.svc.Delete(req.Path, req.BaseRevision, r.Header.Get("X-Device-ID"))
+	res, err := h.svc.Delete(req.Path, req.BaseRevision, auditDeviceID(r))
 	if err != nil {
 		var conflict *syncsvc.ConflictError
 		switch {
@@ -167,6 +167,15 @@ func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
 		body["priorHash"] = c.PriorHash
 	}
 	writeJSON(w, http.StatusConflict, body)
+}
+
+// auditDeviceID：历史记录里的设备身份。设备 Token 认证时用服务器侧的可信
+// 设备 ID（v9.2，客户端自报的 X-Device-ID 不再作为审计身份）；根 Token 保留自报值。
+func auditDeviceID(r *http.Request) string {
+	if me := identityFrom(r); me != nil && me.DeviceID != "" {
+		return me.DeviceID
+	}
+	return r.Header.Get("X-Device-ID")
 }
 
 func isSHA256Hex(s string) bool {

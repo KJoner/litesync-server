@@ -200,6 +200,33 @@ func (b *BlobStore) Walk(fn func(hash string, info os.FileInfo) error) error {
 	})
 }
 
+// StatSize 返回 blob 的磁盘尺寸；不存在或非法 id 返回 (0, false)。
+func (b *BlobStore) StatSize(hash string) (int64, bool) {
+	p, err := b.path(hash)
+	if err != nil {
+		return 0, false
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return 0, false
+	}
+	return info.Size(), true
+}
+
+// VerifyHash 全量读取 blob 并校验内容 SHA-256 与文件名一致（scrub 用）。
+func (b *BlobStore) VerifyHash(hash string) (bool, error) {
+	f, err := b.Open(hash)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == hash, nil
+}
+
 func (b *BlobStore) Open(hash string) (*os.File, error) {
 	p, err := b.path(hash)
 	if err != nil {

@@ -35,7 +35,9 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudf
 - E2EE 与分享对服务器**零感知**：内容一律按 opaque bytes 处理
 - 资源治理任务（启动 + 每 24h）：历史保留扫描（Markdown/附件差异化）、
   历史字节硬预算、孤儿 blob 回收、过期分享清理、changes 裁剪、
-  SQLite checkpoint / 按需 VACUUM，并输出资源统计日志
+  SQLite checkpoint / 按需 VACUUM，并输出资源统计日志；
+  0.10.0 起含**完整性 scrub**（SQLite quick_check + 每个 HEAD blob
+  存在/尺寸校验 + 随机全量 hash 抽查，位腐坏检出即告警隔离）
 - 备份是**服务器旁路能力**（v0.6）：不改动 revision / changes / E2EE / merge
   任何协议；restic 仅在备份任务执行时 fork，无常驻内存开销
 
@@ -125,14 +127,25 @@ sync.example.com {
 
 ## API 一览
 
-认证方式（`/api/*`）：
+认证方式（`/api/*`，0.10.0 起设备级凭据）：
 
-- `Authorization: Bearer <token>`（插件 / CLI）→ **完整权限**（含 admin）
+- **根 Token**（`.env` 中的 `OBSYNC_TOKEN`）→ 完整权限。只用于首台设备注册、
+  设备管理与灾难恢复，正常运行时不再存在于任何设备上
+- **设备 Token**（每台设备独立、只存 hash、可单独撤销）→ 最小权限 scopes：
+  `sync`（文件/变更/快照/历史读）、`share`（分享管理）、`key-admin`
+  （vault-key 写、E2EE 状态机、历史清理）、`pairing`（添加新设备）。
+  备份 admin 与设备管理**不授予任何设备**；历史记录中的设备身份取自
+  服务器侧凭据（客户端自报的 `X-Device-ID` 不再作为审计身份）
 - Web 只读会话 Cookie（`POST /web/session` 登录换取，HttpOnly +
   SameSite=Strict，7 天）→ **仅白名单 GET**（info / snapshot / file /
   history / version / vault-key），写操作一律 403
 - Admin 会话 Cookie（`POST /web/session` 传 `"admin":true` 换取，30 分钟）
   → **仅 `/api/v1/admin/*`**（备份管理）；只读会话触碰 admin 接口一律 403
+
+设备接入流：首台设备填根 Token → 首轮同步自动换发设备凭据；
+后续设备扫配对二维码（包内只有一次性注册凭据，根 Token 绝不下发）→
+`POST /enroll` 换取自己的设备凭据。撤销丢失的设备：
+`curl -X DELETE -H "Authorization: Bearer <根Token>" https://server/api/v1/devices/<id>`
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -159,8 +172,14 @@ sync.example.com {
 | POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
 | POST | `/api/v1/e2ee/begin` | E2EE 迁移开始（0.9.0）：进入 migrating，冻结一切明文写入 |
-| POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE1 密文后切换到 encrypted |
+| POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE1/LSE2 密文后切换到 encrypted |
 | POST | `/api/v1/e2ee/abort` | 放弃迁移，回到 plaintext |
+| POST | `/api/v1/devices` | **根 Token 专属**（0.10.0）：直接创建设备凭据（首台设备自注册） |
+| GET | `/api/v1/devices` | 设备列表（不含凭据材料，`current` 标记当前设备） |
+| DELETE | `/api/v1/devices/{id}` | **根 Token 专属**：撤销设备（下一个请求即 401） |
+| POST | `/api/v1/enrollments` | 生成一次性注册凭据（配对包 v2 携带；secret 只返回一次） |
+| POST | `/enroll` | **公开**（0.10.0）：一次性注册凭据换设备凭据（secret 即认证） |
+| GET | `/api/v1/whoami` | 当前凭据身份（root / device + scopes） |
 | POST | `/api/v1/pairing` | 创建一次性加密配对包（0.8.0；只存密文，默认 5 分钟过期） |
 | DELETE | `/api/v1/pairing/{id}` | 撤销配对包（配对窗口关闭时调用） |
 | POST | `/pair/{id}/consume` | **公开**消费配对包（一次性；密文仍需链接 fragment 中的密钥解密） |
@@ -204,8 +223,21 @@ X-Device-ID:      设备标识（可选，用于日志与历史）
 ### 端到端加密
 
 服务器对 E2EE 零感知：只代存一份客户端上传的**加密** vault key 文档
-（带覆盖保护，防止误覆盖导致密文永久不可读）。启用后文件内容均为
-`LSE1` 密文，服务器永远无法获得解密密钥或任何明文。
+（带覆盖保护 + CAS，防止误覆盖导致密文永久不可读）。启用后文件内容均为
+LSE 密文，服务器永远无法获得解密密钥或任何明文。
+
+信封格式（0.10.0）：新写入使用 **LSE2**（AAD 绑定 vaultId + keyEpoch +
+路径——恶意服务器无法用其他 vault / 其他密钥世代的密文做替换重放），
+旧 LSE1 密文读取兼容；插件命令「升级加密信封」可把存量密文批量升级。
+迁移期间服务器冻结一切明文写入（状态机见 e2ee 接口）。
+
+### 离线分享查看器（0.10.0）
+
+分享查看页的 JS 由同步服务器下发——理论上「已控制服务器的攻击者」可以
+替换页面代码偷取链接 fragment 里的 Share Key。高安全场景请使用仓库中的
+**`viewer/litesync-viewer.html`**：完全自包含的单文件页面，从 GitHub 下载一次
+保存到本地，打开后粘贴分享链接即可本地解密（服务器只被请求密文本身）；
+服务器被攻陷也无法替换你本地保存的这份查看器。
 
 ### Web 只读端
 

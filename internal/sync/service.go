@@ -38,8 +38,16 @@ var (
 
 const vaultKeyMetaKey = "vault-key"
 
-// lse1Magic：LiteSync 加密文件格式头（客户端 crypto.ts 同源常量）。
-var lse1Magic = []byte{0x4c, 0x53, 0x45, 0x31} // "LSE1"
+// LiteSync 加密文件格式头（客户端 crypto.ts 同源常量）。
+// LSE1：v1 信封（AAD 仅绑定 path）；LSE2：v9.2 信封（AAD 绑定 vaultId+keyEpoch+path）。
+var (
+	lse1Magic = []byte{0x4c, 0x53, 0x45, 0x31} // "LSE1"
+	lse2Magic = []byte{0x4c, 0x53, 0x45, 0x32} // "LSE2"
+)
+
+func isEncryptedHead(head []byte) bool {
+	return bytes.Equal(head, lse1Magic) || bytes.Equal(head, lse2Magic)
+}
 
 // PathCollisionError：新路径与现有未删除路径在大小写/Unicode 归一化后冲突。
 type PathCollisionError struct {
@@ -193,9 +201,9 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	if err != nil {
 		return nil, err
 	}
-	// E2EE 明文写冻结（v9）：migrating/encrypted 状态下所有内容必须是 LSE1 密文，
-	// 旧设备无法在迁移中或迁移后把明文静默写回仓库
-	if rs.EncryptionState != db.EncryptionPlaintext && !fileHasMagic(tmp, lse1Magic) {
+	// E2EE 明文写冻结（v9）：migrating/encrypted 状态下所有内容必须是 LSE 密文
+	//（LSE1/LSE2 信封均可），旧设备无法在迁移中或迁移后把明文静默写回仓库
+	if rs.EncryptionState != db.EncryptionPlaintext && !fileHasEncryptedMagic(tmp) {
 		return nil, ErrPlaintextRejected
 	}
 
@@ -602,7 +610,7 @@ func (s *Service) CompleteE2eeMigration() (*db.RepoState, error) {
 		head := make([]byte, len(lse1Magic))
 		_, rerr := io.ReadFull(f, head)
 		f.Close()
-		if rerr != nil || !bytes.Equal(head, lse1Magic) {
+		if rerr != nil || !isEncryptedHead(head) {
 			return nil, fmt.Errorf("%w: %q is not encrypted", ErrEncryptionState, files[i].Path)
 		}
 	}
@@ -634,18 +642,18 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// fileHasMagic 检查磁盘文件是否以 magic 开头（E2EE 明文冻结用）。
-func fileHasMagic(path string, magic []byte) bool {
+// fileHasEncryptedMagic 检查磁盘文件是否以 LSE1/LSE2 信封头开头（明文冻结用）。
+func fileHasEncryptedMagic(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-	head := make([]byte, len(magic))
+	head := make([]byte, len(lse1Magic))
 	if _, err := io.ReadFull(f, head); err != nil {
 		return false
 	}
-	return bytes.Equal(head, magic)
+	return isEncryptedHead(head)
 }
 
 // Shares ------------------------------------------------------------------

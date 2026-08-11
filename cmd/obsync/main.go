@@ -21,7 +21,7 @@ import (
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.9.0"
+const version = "0.10.0"
 
 func main() {
 	// rotate-epoch：灾备恢复后的必要步骤（服务停止时执行）。

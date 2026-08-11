@@ -16,6 +16,7 @@ import {
 } from "./api";
 import {
 	decryptFile,
+	FileKeyBinding,
 	importVmk,
 	isEncryptedFile,
 	subtleAvailable,
@@ -35,6 +36,8 @@ interface State {
 	byPath: Map<string, FileEntry>;
 	vaultDoc: VaultKeyDoc | null;
 	vmk: CryptoKey | null;
+	/** LSE2 信封的 AAD 绑定材料（v9.2，来自 /info） */
+	binding?: FileKeyBinding;
 }
 
 let S: State | null = null;
@@ -85,7 +88,7 @@ function isVisible(path: string): boolean {
 async function decodeContent(path: string, data: ArrayBuffer): Promise<ArrayBuffer> {
 	if (!isEncryptedFile(data)) return data;
 	if (!S?.vmk) throw new Error("已加密内容需要先解锁");
-	const dec = await decryptFile(S.vmk, path, data);
+	const dec = await decryptFile(S.vmk, path, data, S.binding);
 	if (dec === null) throw new Error("解密失败（密钥不匹配或数据损坏）");
 	return dec;
 }
@@ -109,9 +112,13 @@ async function boot(): Promise<void> {
 	applyTheme();
 	const api = new Api();
 	try {
-		await api.info(); // 会话 Cookie 无效 → AuthError → 登录页
+		const info = await api.info(); // 会话 Cookie 无效 → AuthError → 登录页
 		const vaultDoc = await api.vaultKey();
-		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null };
+		const binding =
+			info.vaultId && (info.keyEpoch ?? 0) > 0
+				? { vaultId: info.vaultId, keyEpoch: info.keyEpoch! }
+				: undefined;
+		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null, binding };
 		if (vaultDoc?.enabled) {
 			if (!subtleAvailable()) {
 				renderMessage("此 Vault 已启用端到端加密，浏览器解密需要 HTTPS（或 localhost）访问。");

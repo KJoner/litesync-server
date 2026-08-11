@@ -17,6 +17,8 @@ type MaintenanceStats struct {
 	Vacuumed        bool
 	HistoryBytes    int64
 	ChangesCount    int64
+	// IntegrityIssues：本轮完整性 scrub 发现的问题数（应始终为 0）
+	IntegrityIssues int
 }
 
 // RunMaintenance 执行一轮资源治理（启动时 + 每 N 小时）。
@@ -53,6 +55,14 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 	if _, err := s.maintainPairings(now); err != nil {
 		s.log.Warn("maintenance: pairings", "error", err)
 	}
+	if _, err := s.maintainEnrollments(now); err != nil {
+		s.log.Warn("maintenance: enrollments", "error", err)
+	}
+	if n, err := s.maintainIntegrity(); err != nil {
+		s.log.Warn("maintenance: integrity", "error", err)
+	} else {
+		stats.IntegrityIssues = n
+	}
 	if v, err := s.maintainSQLite(); err != nil {
 		s.log.Warn("maintenance: sqlite", "error", err)
 	} else {
@@ -71,8 +81,70 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 		"vacuumed", stats.Vacuumed,
 		"historyBytes", stats.HistoryBytes,
 		"changesCount", stats.ChangesCount,
+		"integrityIssues", stats.IntegrityIssues,
 	)
 	return stats
+}
+
+// maintainIntegrity：完整性 scrub（v9.2，审查 12 收尾）。
+// - SQLite quick_check；
+// - 每个未删除 HEAD 的 blob 必须存在且尺寸一致（「已确认的 HEAD 必有正确 blob」不变量）；
+// - 随机抽查最多 8 个 HEAD blob 做全量 hash 校验（位腐坏检测）。
+// 发现问题只告警隔离，绝不静默跳过，也不自动删除任何数据。
+func (s *Service) maintainIntegrity() (int, error) {
+	issues := 0
+
+	var check string
+	if err := s.db.QueryRow(`PRAGMA quick_check(1)`).Scan(&check); err != nil {
+		return issues, err
+	}
+	if check != "ok" {
+		issues++
+		s.log.Error("integrity: sqlite quick_check failed", "result", check)
+	}
+
+	s.mu.Lock()
+	files, err := db.ListFiles(s.db)
+	s.mu.Unlock()
+	if err != nil {
+		return issues, err
+	}
+
+	for i := range files {
+		f := &files[i]
+		size, ok := s.blobs.StatSize(f.ContentHash)
+		if !ok {
+			issues++
+			s.log.Error("integrity: HEAD blob missing", "path", f.Path, "blob", f.ContentHash)
+			continue
+		}
+		if size != f.Size {
+			issues++
+			s.log.Error("integrity: HEAD blob size mismatch", "path", f.Path, "want", f.Size, "got", size)
+		}
+	}
+
+	// 随机抽查全量 hash（每轮最多 8 个；伪随机取样即可）
+	sampled := 0
+	for i := range files {
+		if sampled >= 8 {
+			break
+		}
+		if len(files) > 8 && i%(len(files)/8+1) != 0 {
+			continue
+		}
+		f := &files[i]
+		ok, err := s.blobs.VerifyHash(f.ContentHash)
+		if err != nil {
+			continue // 存在性问题已在上面报告
+		}
+		sampled++
+		if !ok {
+			issues++
+			s.log.Error("integrity: blob content corrupted (hash mismatch)", "path", f.Path, "blob", f.ContentHash)
+		}
+	}
+	return issues, nil
 }
 
 // maintainHistoryRetention：对所有路径应用时间/数量保留规则

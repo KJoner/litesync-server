@@ -77,25 +77,34 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /pair/{id}/consume", h.consumePairing)
 	mux.HandleFunc("GET /p/{id}", h.pairLanding)
 
+	// 设备级凭据（v9.2）：配对包 v2 传一次性注册凭据，根 Token 不再下发到新设备
+	mux.HandleFunc("POST /enroll", h.enrollDevice) // 公开：secret 即认证
+	mux.HandleFunc("POST /api/v1/devices", h.createDevice)
+	mux.HandleFunc("GET /api/v1/devices", h.listDevices)
+	mux.HandleFunc("DELETE /api/v1/devices/{id}", h.revokeDevice)
+	mux.HandleFunc("POST /api/v1/enrollments", h.createEnrollment)
+	mux.HandleFunc("GET /api/v1/whoami", h.whoami)
+
 	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
 	mux.HandleFunc("GET /share/{id}", h.getShare)
 	if dist, err := fs.Sub(web.Dist, "dist"); err == nil {
 		mux.Handle("GET /", http.FileServerFS(dist))
 	}
 
-	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, mux)))
+	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, svc, mux)))
 }
 
 // 协议版本（v7 仓库拆分起正式管理）：插件与服务器各自独立发版，
 // 兼容性由 protocol 区间判定而不是比对版本号。
 // 破坏性协议变更时递增 ProtocolVersion；不再兼容旧客户端时抬高 MinProtocolVersion。
 //
-// v2（v9 架构加固）：repoEpoch/headSequence、tombstone 拒绝 base 0、
-// E2EE 状态机与明文冻结、vault-key CAS。旧客户端的「tombstone 自动复活」
-// 行为不安全，因此 MinProtocolVersion 同步抬到 2。
+// v2（v9 一阶段）：repoEpoch/headSequence、tombstone 拒绝 base 0、
+// E2EE 状态机与明文冻结、vault-key CAS。
+// v3（v9 二阶段）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
+// LSE2 密文对 v2 客户端不可读（会安全地停止同步），因此 Min 同步抬到 3。
 const (
-	ProtocolVersion    = 2
-	MinProtocolVersion = 2
+	ProtocolVersion    = 3
+	MinProtocolVersion = 3
 )
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {

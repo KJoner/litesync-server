@@ -49,7 +49,7 @@ func TestRepoEpochAndHeadSequence(t *testing.T) {
 	if info["headSequence"].(float64) != 2 || info["latestSequence"].(float64) != 2 {
 		t.Fatalf("headSequence/latestSequence = %v/%v", info["headSequence"], info["latestSequence"])
 	}
-	if info["encryptionState"] != "plaintext" || info["protocolVersion"].(float64) != 2 {
+	if info["encryptionState"] != "plaintext" || info["protocolVersion"].(float64) != 3 {
 		t.Fatalf("encryptionState/protocolVersion = %v/%v", info["encryptionState"], info["protocolVersion"])
 	}
 
@@ -135,12 +135,16 @@ func TestE2eeStateMachine(t *testing.T) {
 		t.Fatalf("complete = %d %v", resp3.StatusCode, body3)
 	}
 
-	// encrypted：明文永久冻结；密文照常；info 反映状态
+	// encrypted：明文永久冻结；密文照常（LSE1 与 v9.2 的 LSE2 信封均接受）；info 反映状态
 	if resp, _ := e.upload(t, "d.md", 0, plain); resp.StatusCode != http.StatusConflict {
 		t.Fatalf("plaintext upload while encrypted = %d, want 409", resp.StatusCode)
 	}
 	if resp, _ := e.upload(t, "d.md", 0, lse1); resp.StatusCode != http.StatusOK {
 		t.Fatalf("ciphertext upload while encrypted = %d", resp.StatusCode)
+	}
+	lse2 := append([]byte("LSE2"), []byte("\x00\x00\x00\x01pretend-iv-and-ciphertext")...)
+	if resp, _ := e.upload(t, "e.md", 0, lse2); resp.StatusCode != http.StatusOK {
+		t.Fatalf("LSE2 upload while encrypted = %d", resp.StatusCode)
 	}
 	if info := e.info(t); info["encryptionState"] != "encrypted" {
 		t.Fatalf("info encryptionState = %v", info["encryptionState"])

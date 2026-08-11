@@ -234,3 +234,49 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 func asConflict(err error, target **syncsvc.ConflictError) bool {
 	return errors.As(err, target)
 }
+
+// 完整性 scrub（v9.2）：位腐坏/截断的 HEAD blob 必须被检出并计入 IntegrityIssues。
+func TestIntegrityScrubDetectsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(filepath.Join(dir, "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	store, _ := storage.New(filepath.Join(dir, "vault"))
+	blobs, _ := storage.NewBlobStore(filepath.Join(dir, "blobs"))
+	shares, _ := storage.NewShareStore(filepath.Join(dir, "shares"))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := syncsvc.New(database, store, blobs, shares, syncsvc.Options{}, logger)
+
+	content := []byte("healthy content for scrub test")
+	upload(t, s, "ok.md", 0, content)
+	bad := []byte("this blob will be corrupted!")
+	upload(t, s, "bad.md", 0, bad)
+
+	// 健康状态：0 issues
+	if stats := s.RunMaintenance(); stats.IntegrityIssues != 0 {
+		t.Fatalf("healthy scrub issues = %d, want 0", stats.IntegrityIssues)
+	}
+
+	// 截断 bad.md 的 blob（尺寸不符必被检出，不依赖抽样）
+	hash := sha256HexT(bad)
+	p := filepath.Join(dir, "blobs", hash[:2], hash)
+	if err := os.WriteFile(p, bad[:4], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stats := s.RunMaintenance(); stats.IntegrityIssues == 0 {
+		t.Fatal("truncated HEAD blob must be reported by scrub")
+	}
+
+	// 同尺寸位翻转（尺寸校验发现不了）→ 全量 hash 抽查兜底：
+	// 文件数 ≤ 8 时全部抽查，必被检出
+	flipped := append([]byte{}, bad...)
+	flipped[0] ^= 0xff
+	if err := os.WriteFile(p, flipped, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stats := s.RunMaintenance(); stats.IntegrityIssues == 0 {
+		t.Fatal("bit-flipped blob must be caught by hash sampling")
+	}
+}

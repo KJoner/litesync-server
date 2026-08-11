@@ -64,6 +64,29 @@ CREATE TABLE IF NOT EXISTS pairings (
     expires_at INTEGER NOT NULL
 );
 
+-- v9.2 设备级凭据：每台设备独立 token（只存 hash）+ 最小权限 scopes，可单独撤销。
+-- 根 Token（.env）保留全权限，仅用于首台设备注册、设备管理与灾难恢复。
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    token_hash TEXT NOT NULL UNIQUE,
+    scopes TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL DEFAULT 0,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+
+-- 一次性注册凭据（配对包 v2 携带的是它，不再是根 Token）：
+-- 消费即作废，过期自动清理；秘密只存 hash
+CREATE TABLE IF NOT EXISTS enrollments (
+    id TEXT PRIMARY KEY,
+    secret_hash TEXT NOT NULL UNIQUE,
+    scopes TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER NOT NULL DEFAULT 0
+);
+
 -- v9 仓库权威状态（单行）：head_sequence 是唯一的全局时钟，在每次变更事务内递增，
 -- 永不回退；changes 只是可裁剪日志，不再兼任时钟。repo_epoch 标识 sequence 空间的
 -- 世代：从备份恢复后必须旋转（obsync rotate-epoch），客户端据此进入灾备合并而不是
