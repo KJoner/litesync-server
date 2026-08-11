@@ -46,6 +46,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/file", h.getFile)
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
+	mux.HandleFunc("POST /api/v1/file/move", h.moveFile) // v9.3 原子改名（明文模式）
 	mux.HandleFunc("GET /api/v1/history", h.history)
 	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
 	mux.HandleFunc("GET /api/v1/version", h.version)
@@ -101,10 +102,11 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 // v2（v9 一阶段）：repoEpoch/headSequence、tombstone 拒绝 base 0、
 // E2EE 状态机与明文冻结、vault-key CAS。
 // v3（v9 二阶段）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
-// LSE2 密文对 v2 客户端不可读（会安全地停止同步），因此 Min 同步抬到 3。
+// v4（v9 三阶段二期）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）、
+// E2EE 原子 MOVE。LSE3 密文对 v3 客户端不可读（安全停止同步），Min 抬到 4。
 const (
-	ProtocolVersion    = 3
-	MinProtocolVersion = 3
+	ProtocolVersion    = 4
+	MinProtocolVersion = 4
 )
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {

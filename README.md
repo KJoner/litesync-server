@@ -156,6 +156,7 @@ sync.example.com {
 | GET | `/api/v1/file?path=...` | 下载原始字节，元数据在响应 Header |
 | PUT | `/api/v1/file` | 上传原始字节，参数在请求 Header（见下） |
 | DELETE | `/api/v1/file` | 逻辑删除，Body: `{"path","baseRevision"}` |
+| POST | `/api/v1/file/move` | 原子改名（0.11.0，明文模式）：单事务 tombstone+新行，file_id 跟随内容；E2EE/目标占用/revision 不符 → 409，客户端回退 delete+upsert |
 | GET | `/api/v1/history?path=...` | 历史版本列表（revision 降序） |
 | DELETE | `/api/v1/history?path=...&beforeRevision=N` | 清理该 revision 之前的历史（E2EE 迁移用） |
 | GET | `/api/v1/version?path=...&revision=N` | 下载某历史版本的原始字节 |
@@ -226,9 +227,12 @@ X-Device-ID:      设备标识（可选，用于日志与历史）
 （带覆盖保护 + CAS，防止误覆盖导致密文永久不可读）。启用后文件内容均为
 LSE 密文，服务器永远无法获得解密密钥或任何明文。
 
-信封格式（0.10.0）：新写入使用 **LSE2**（AAD 绑定 vaultId + keyEpoch +
-路径——恶意服务器无法用其他 vault / 其他密钥世代的密文做替换重放），
-旧 LSE1 密文读取兼容；插件命令「升级加密信封」可把存量密文批量升级。
+信封格式（0.11.0）：新写入使用 **LSE3**——AAD 绑定 vaultId + keyEpoch +
+**fileId + contentGeneration**：恶意服务器既无法用其他 vault / 其他密钥世代 /
+其他文件的密文做替换重放，也无法把同一文件的**旧版本**当最新 HEAD 重放
+（generation 单调，客户端与服务器双侧拒绝回退）；且路径不入 AAD，
+E2EE 下改名走原子 MOVE、无需重新加密内容。旧 LSE1/LSE2 密文读取兼容；
+插件命令「升级加密信封」可把存量密文批量升级到 LSE3。
 迁移期间服务器冻结一切明文写入（状态机见 e2ee 接口）。
 
 ### 离线分享查看器（0.10.0）

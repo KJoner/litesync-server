@@ -12,9 +12,11 @@ export interface VaultKeyDoc {
 
 const LSE_MAGIC = [0x4c, 0x53, 0x45, 0x31]; // "LSE1"
 const LSE2_MAGIC = [0x4c, 0x53, 0x45, 0x32]; // "LSE2"（v9.2：AAD 绑定 vaultId+keyEpoch+path）
+const LSE3_MAGIC = [0x4c, 0x53, 0x45, 0x33]; // "LSE3"（v9.3：AAD 绑定 vaultId+keyEpoch+fileId+generation）
 const LSS_MAGIC = [0x4c, 0x53, 0x53, 0x31]; // "LSS1"
 const IV_LEN = 12;
 const EPOCH_LEN = 4;
+const GEN_LEN = 8;
 
 /** LSE2 的 AAD 绑定材料（来自 /api/v1/info）。 */
 export interface FileKeyBinding {
@@ -53,7 +55,7 @@ function hasMagic(data: ArrayBuffer, magic: number[]): boolean {
 }
 
 export function isEncryptedFile(data: ArrayBuffer): boolean {
-	return hasMagic(data, LSE_MAGIC) || hasMagic(data, LSE2_MAGIC);
+	return hasMagic(data, LSE_MAGIC) || hasMagic(data, LSE2_MAGIC) || hasMagic(data, LSE3_MAGIC);
 }
 
 export function isEncryptedShare(data: ArrayBuffer): boolean {
@@ -91,13 +93,38 @@ export async function importVmk(raw: Uint8Array): Promise<CryptoKey> {
 	return crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, false, ["decrypt"]);
 }
 
-/** 解密 LSE1/LSE2 文件；失败返回 null。LSE2 需要 binding（vaultId 来自 /info）。 */
+/**
+ * 解密 LSE1/LSE2/LSE3 文件；失败返回 null。
+ * LSE2 需要 binding（vaultId 来自 /info）；LSE3 还需要 fileId（snapshot 提供）。
+ */
 export async function decryptFile(
 	vmk: CryptoKey,
 	path: string,
 	payload: ArrayBuffer,
 	binding?: FileKeyBinding,
+	fileId?: string,
 ): Promise<ArrayBuffer | null> {
+	if (hasMagic(payload, LSE3_MAGIC)) {
+		if (!binding?.vaultId || !fileId) return null;
+		try {
+			const view = new DataView(payload);
+			const envelopeEpoch = view.getUint32(4, false);
+			const generation = view.getBigUint64(4 + EPOCH_LEN, false);
+			const head = 4 + EPOCH_LEN + GEN_LEN;
+			const iv = new Uint8Array(payload, head, IV_LEN);
+			const ct = new Uint8Array(payload, head + IV_LEN);
+			const aad = new TextEncoder().encode(
+				`litesync/v3/file:${binding.vaultId}:${envelopeEpoch}:${fileId}:${generation}`,
+			);
+			return await crypto.subtle.decrypt(
+				{ name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource },
+				vmk,
+				ct,
+			);
+		} catch {
+			return null;
+		}
+	}
 	if (hasMagic(payload, LSE2_MAGIC)) {
 		if (!binding?.vaultId) return null;
 		try {

@@ -35,10 +35,11 @@ func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
 		Hash     string `json:"hash"`
 		Size     int64  `json:"size"`
 		Mtime    int64  `json:"mtime"`
+		FileID   string `json:"fileId,omitempty"`
 	}
 	out := make([]apiFile, 0, len(snap.Files))
 	for _, f := range snap.Files {
-		out = append(out, apiFile{Path: f.Path, Revision: f.Revision, Hash: f.ContentHash, Size: f.Size, Mtime: f.Mtime})
+		out = append(out, apiFile{Path: f.Path, Revision: f.Revision, Hash: f.ContentHash, Size: f.Size, Mtime: f.Mtime, FileID: f.FileID})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"repoEpoch": snap.RepoEpoch,

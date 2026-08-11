@@ -6,6 +6,8 @@ export interface FileEntry {
 	hash: string;
 	size: number;
 	mtime: number;
+	/** 稳定文件身份（0.11.0+；LSE3 解密的 AAD 输入） */
+	fileId?: string;
 }
 
 export interface VersionEntry {

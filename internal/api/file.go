@@ -39,9 +39,11 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	}
 	action := r.Header.Get("X-Action") // ""/upsert/merge/restore
 	deviceID := auditDeviceID(r)
+	// X-File-Id（v9.3，可选）：E2EE 客户端为新文件预生成的稳定身份
+	clientFileID := r.Header.Get("X-File-Id")
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
-	res, err := h.svc.Upload(path, baseRevision, hash, body, mtime, deviceID, action)
+	res, err := h.svc.Upload(path, baseRevision, hash, body, mtime, deviceID, action, clientFileID)
 	if err != nil {
 		h.writeUploadError(w, err)
 		return
@@ -52,6 +54,7 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 		"hash":     res.Hash,
 		"size":     res.Size,
 		"sequence": res.Sequence,
+		"fileId":   res.FileID,
 	})
 }
 
@@ -81,6 +84,50 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	default:
 		h.internalError(w, "upload", err)
 	}
+}
+
+// moveFile 原子改名（v9.3）。Body：{"fromPath","toPath","baseRevision"}
+// 明文模式专用；E2EE / 目标占用 / revision 不符时客户端回退 delete+upsert。
+func (h *handlers) moveFile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		FromPath     string `json:"fromPath"`
+		ToPath       string `json:"toPath"`
+		BaseRevision int64  `json:"baseRevision"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
+		req.FromPath == "" || req.ToPath == "" {
+		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	res, err := h.svc.Move(req.FromPath, req.ToPath, req.BaseRevision, auditDeviceID(r))
+	if err != nil {
+		var conflict *syncsvc.ConflictError
+		var collision *syncsvc.PathCollisionError
+		switch {
+		case errors.As(err, &conflict):
+			writeConflict(w, conflict)
+		case errors.As(err, &collision):
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": "path collision", "path": collision.Path, "existing": collision.Existing,
+			})
+		case errors.Is(err, syncsvc.ErrEncryptionState):
+			writeErr(w, http.StatusConflict, "move is not supported while vault encryption is enabled")
+		case errors.Is(err, syncsvc.ErrNotFound):
+			writeErr(w, http.StatusNotFound, "not found")
+		case errors.Is(err, storage.ErrInvalidPath):
+			writeErr(w, http.StatusBadRequest, "invalid path")
+		default:
+			h.internalError(w, "move", err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fromPath":          res.FromPath,
+		"toPath":            res.ToPath,
+		"revision":          res.Revision,
+		"tombstoneRevision": res.TombstoneRevision,
+		"sequence":          res.Sequence,
+	})
 }
 
 // getFile 下载文件原始字节，元数据通过响应 Header 返回。
@@ -117,6 +164,7 @@ func (h *handlers) getFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Hash", meta.ContentHash)
 	w.Header().Set("X-File-Size", strconv.FormatInt(meta.Size, 10))
 	w.Header().Set("X-File-Mtime", strconv.FormatInt(meta.Mtime, 10))
+	w.Header().Set("X-File-Id", meta.FileID)
 	io.Copy(w, rc) //nolint:errcheck // 传输中断由客户端 hash 校验兜底
 }
 

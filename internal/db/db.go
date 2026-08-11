@@ -67,8 +67,72 @@ func migrateColumns(d *sql.DB) error {
 			return err
 		}
 	}
-	_, err = d.Exec(`CREATE INDEX IF NOT EXISTS idx_files_canonical ON files(canonical_key)`)
-	return err
+	if _, err := d.Exec(`CREATE INDEX IF NOT EXISTS idx_files_canonical ON files(canonical_key)`); err != nil {
+		return err
+	}
+
+	// v9.3（三阶段一期）：file_id——path 是可变展示属性，file_id 是稳定身份。
+	// MOVE 之后 file_id 跟随内容走到新路径；二期 LSE3 的 AAD 将绑定它。
+	hasID, err := columnExists(d, "files", "file_id")
+	if err != nil {
+		return err
+	}
+	if !hasID {
+		if _, err := d.Exec(`ALTER TABLE files ADD COLUMN file_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if err := backfillFileIDs(d); err != nil {
+		return err
+	}
+	if _, err := d.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_files_file_id ON files(file_id)`); err != nil {
+		return err
+	}
+
+	// v9.3 二期：历史版本记录写入时的 file_id——LSE3 密文的 AAD 绑定 fileId，
+	// 下载历史版本解密需要当时的身份（文件被删除重建后 id 会变）。
+	// 旧行留空：LSE1/LSE2 版本的 AAD 绑定 path，无需 fileId。
+	hasVID, err := columnExists(d, "file_versions", "file_id")
+	if err != nil {
+		return err
+	}
+	if !hasVID {
+		if _, err := d.Exec(`ALTER TABLE file_versions ADD COLUMN file_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillFileIDs 为旧行生成随机 file_id（幂等；在建 UNIQUE 索引前执行）。
+func backfillFileIDs(d *sql.DB) error {
+	rows, err := d.Query(`SELECT path FROM files WHERE file_id = ''`)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			return err
+		}
+		paths = append(paths, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		id, err := NewFileID()
+		if err != nil {
+			return err
+		}
+		if _, err := d.Exec(`UPDATE files SET file_id = ? WHERE path = ?`, id, p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func columnExists(d *sql.DB, table, column string) (bool, error) {

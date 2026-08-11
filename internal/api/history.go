@@ -86,5 +86,7 @@ func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-File-Size", strconv.FormatInt(meta.Size, 10))
 	w.Header().Set("X-File-Mtime", strconv.FormatInt(meta.Mtime, 10))
 	w.Header().Set("X-Action", meta.Action)
+	// 写入该版本时的稳定身份（v9.3）：LSE3 历史版本解密需要；旧行为空
+	w.Header().Set("X-File-Id", meta.FileID)
 	io.Copy(w, rc) //nolint:errcheck // 传输中断由客户端 hash 校验兜底
 }

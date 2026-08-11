@@ -49,7 +49,7 @@ func TestRepoEpochAndHeadSequence(t *testing.T) {
 	if info["headSequence"].(float64) != 2 || info["latestSequence"].(float64) != 2 {
 		t.Fatalf("headSequence/latestSequence = %v/%v", info["headSequence"], info["latestSequence"])
 	}
-	if info["encryptionState"] != "plaintext" || info["protocolVersion"].(float64) != 3 {
+	if info["encryptionState"] != "plaintext" || info["protocolVersion"].(float64) != 4 {
 		t.Fatalf("encryptionState/protocolVersion = %v/%v", info["encryptionState"], info["protocolVersion"])
 	}
 

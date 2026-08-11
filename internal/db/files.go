@@ -1,9 +1,20 @@
 package db
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 )
+
+// NewFileID 生成随机稳定文件身份（16B hex）。
+func NewFileID() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
+}
 
 // File 对应 files 表的一行。
 type File struct {
@@ -19,6 +30,8 @@ type File struct {
 	// CanonicalKey：跨平台归一化后的路径（NFC + 小写），用于拒绝
 	// 大小写/Unicode 规范化不同但会在 Windows/macOS 上映射为同一文件的路径并存
 	CanonicalKey string
+	// FileID：稳定文件身份（v9.3）——path 可变，file_id 跟随内容跨 MOVE 不变
+	FileID string
 }
 
 // Change 对应 changes 表的一行。
@@ -43,9 +56,9 @@ func GetFile(q dbtx, path string) (*File, error) {
 	f := &File{}
 	var deleted int64
 	err := q.QueryRow(
-		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key
+		`SELECT id, path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key, file_id
 		 FROM files WHERE path = ?`, path,
-	).Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime, &f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt, &f.CanonicalKey)
+	).Scan(&f.ID, &f.Path, &f.ContentHash, &f.Size, &f.Mtime, &f.Revision, &deleted, &f.CreatedAt, &f.UpdatedAt, &f.CanonicalKey, &f.FileID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -76,8 +89,8 @@ func UpsertFile(q dbtx, f *File) error {
 		deleted = 1
 	}
 	_, err := q.Exec(
-		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at, canonical_key, file_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   content_hash = excluded.content_hash,
 		   size = excluded.size,
@@ -85,8 +98,9 @@ func UpsertFile(q dbtx, f *File) error {
 		   revision = excluded.revision,
 		   deleted = excluded.deleted,
 		   updated_at = excluded.updated_at,
-		   canonical_key = excluded.canonical_key`,
-		f.Path, f.ContentHash, f.Size, f.Mtime, f.Revision, deleted, f.CreatedAt, f.UpdatedAt, f.CanonicalKey,
+		   canonical_key = excluded.canonical_key,
+		   file_id = excluded.file_id`,
+		f.Path, f.ContentHash, f.Size, f.Mtime, f.Revision, deleted, f.CreatedAt, f.UpdatedAt, f.CanonicalKey, f.FileID,
 	)
 	return err
 }

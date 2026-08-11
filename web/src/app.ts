@@ -88,7 +88,8 @@ function isVisible(path: string): boolean {
 async function decodeContent(path: string, data: ArrayBuffer): Promise<ArrayBuffer> {
 	if (!isEncryptedFile(data)) return data;
 	if (!S?.vmk) throw new Error("已加密内容需要先解锁");
-	const dec = await decryptFile(S.vmk, path, data, S.binding);
+	// LSE3 需要 fileId（快照提供）；历史版本用当前文件身份（删除重建过的旧版本会失败并提示）
+	const dec = await decryptFile(S.vmk, path, data, S.binding, S.byPath.get(path)?.fileId);
 	if (dec === null) throw new Error("解密失败（密钥不匹配或数据损坏）");
 	return dec;
 }

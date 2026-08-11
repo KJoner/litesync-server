@@ -17,13 +17,16 @@ type FileVersion struct {
 	Action      string // upsert | delete | restore | merge
 	DeviceID    string
 	CreatedAt   int64
+	// FileID：写入该版本时的稳定文件身份（v9.3；LSE3 密文解密需要）。
+	// LSE1/LSE2 时代的旧行为空。
+	FileID string
 }
 
 func InsertVersion(q dbtx, v *FileVersion) error {
 	_, err := q.Exec(
-		`INSERT INTO file_versions (path, revision, blob_id, content_hash, size, mtime, action, device_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		v.Path, v.Revision, v.BlobID, v.ContentHash, v.Size, v.Mtime, v.Action, v.DeviceID, v.CreatedAt,
+		`INSERT INTO file_versions (path, revision, blob_id, content_hash, size, mtime, action, device_id, created_at, file_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		v.Path, v.Revision, v.BlobID, v.ContentHash, v.Size, v.Mtime, v.Action, v.DeviceID, v.CreatedAt, v.FileID,
 	)
 	return err
 }
@@ -31,7 +34,7 @@ func InsertVersion(q dbtx, v *FileVersion) error {
 // ListVersions 按 revision 降序返回某路径的全部历史版本。
 func ListVersions(q dbtx, path string) ([]FileVersion, error) {
 	rows, err := q.Query(
-		`SELECT id, path, revision, COALESCE(blob_id,''), COALESCE(content_hash,''), size, mtime, action, COALESCE(device_id,''), created_at
+		`SELECT id, path, revision, COALESCE(blob_id,''), COALESCE(content_hash,''), size, mtime, action, COALESCE(device_id,''), created_at, COALESCE(file_id,'')
 		 FROM file_versions WHERE path = ? ORDER BY revision DESC`, path,
 	)
 	if err != nil {
@@ -43,7 +46,7 @@ func ListVersions(q dbtx, path string) ([]FileVersion, error) {
 	for rows.Next() {
 		var v FileVersion
 		if err := rows.Scan(&v.ID, &v.Path, &v.Revision, &v.BlobID, &v.ContentHash,
-			&v.Size, &v.Mtime, &v.Action, &v.DeviceID, &v.CreatedAt); err != nil {
+			&v.Size, &v.Mtime, &v.Action, &v.DeviceID, &v.CreatedAt, &v.FileID); err != nil {
 			return nil, err
 		}
 		versions = append(versions, v)
@@ -55,10 +58,10 @@ func ListVersions(q dbtx, path string) ([]FileVersion, error) {
 func GetVersion(q dbtx, path string, revision int64) (*FileVersion, error) {
 	v := &FileVersion{}
 	err := q.QueryRow(
-		`SELECT id, path, revision, COALESCE(blob_id,''), COALESCE(content_hash,''), size, mtime, action, COALESCE(device_id,''), created_at
+		`SELECT id, path, revision, COALESCE(blob_id,''), COALESCE(content_hash,''), size, mtime, action, COALESCE(device_id,''), created_at, COALESCE(file_id,'')
 		 FROM file_versions WHERE path = ? AND revision = ?`, path, revision,
 	).Scan(&v.ID, &v.Path, &v.Revision, &v.BlobID, &v.ContentHash,
-		&v.Size, &v.Mtime, &v.Action, &v.DeviceID, &v.CreatedAt)
+		&v.Size, &v.Mtime, &v.Action, &v.DeviceID, &v.CreatedAt, &v.FileID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

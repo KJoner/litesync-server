@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -39,14 +40,17 @@ var (
 const vaultKeyMetaKey = "vault-key"
 
 // LiteSync 加密文件格式头（客户端 crypto.ts 同源常量）。
-// LSE1：v1 信封（AAD 仅绑定 path）；LSE2：v9.2 信封（AAD 绑定 vaultId+keyEpoch+path）。
+// LSE1：v1 信封（AAD 仅绑定 path）；LSE2：v9.2（AAD 绑定 vaultId+keyEpoch+path）；
+// LSE3：v9.3（AAD 绑定 vaultId+keyEpoch+fileId+contentGeneration——
+// 路径不再入 AAD，E2EE 下 MOVE 无需重新加密；generation 抗回退重放）。
 var (
 	lse1Magic = []byte{0x4c, 0x53, 0x45, 0x31} // "LSE1"
 	lse2Magic = []byte{0x4c, 0x53, 0x45, 0x32} // "LSE2"
+	lse3Magic = []byte{0x4c, 0x53, 0x45, 0x33} // "LSE3"
 )
 
 func isEncryptedHead(head []byte) bool {
-	return bytes.Equal(head, lse1Magic) || bytes.Equal(head, lse2Magic)
+	return bytes.Equal(head, lse1Magic) || bytes.Equal(head, lse2Magic) || bytes.Equal(head, lse3Magic)
 }
 
 // PathCollisionError：新路径与现有未删除路径在大小写/Unicode 归一化后冲突。
@@ -80,6 +84,7 @@ type UploadResult struct {
 	Hash     string
 	Size     int64
 	Sequence int64
+	FileID   string
 }
 
 type DeleteResult struct {
@@ -168,9 +173,14 @@ func (s *Service) retentionFor(path string) (days, maxPerFile int) {
 
 // Upload 处理文件上传。
 // v4 流程：收流 + SHA-256（锁外）→ 加锁 → revision 校验 → blob 原子提交 → SQLite 事务。
-func (s *Service) Upload(path string, baseRevision int64, claimedHash string, body io.Reader, mtime int64, deviceID, action string) (*UploadResult, error) {
+// clientFileID（v9.3，可空）：E2EE 客户端为新文件预生成的稳定身份——
+// LSE3 密文的 AAD 绑定 fileId，必须在加密前确定，因此新文件的 id 由客户端提供。
+func (s *Service) Upload(path string, baseRevision int64, claimedHash string, body io.Reader, mtime int64, deviceID, action, clientFileID string) (*UploadResult, error) {
 	if err := storage.ValidatePath(path); err != nil {
 		return nil, err
+	}
+	if clientFileID != "" && !isHex32(clientFileID) {
+		return nil, storage.ErrInvalidPath // 语义上 bad request
 	}
 	if action == "" {
 		action = "upsert"
@@ -214,7 +224,18 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 
 	// 幂等：内容与服务器现状一致时直接成功（覆盖“重复提交同一个 change”场景）
 	if cur != nil && !cur.Deleted && cur.ContentHash == claimedHash {
-		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: rs.HeadSequence}, nil
+		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: rs.HeadSequence, FileID: cur.FileID}, nil
+	}
+
+	// LSE3 generation 单调性（v9.3）：信封头是明文，服务器无需密钥即可读。
+	// 同一 HEAD（revision 已校验一致）上 generation 不增反降 = 客户端状态异常
+	// 或回退重放 → 按冲突拒绝，客户端会重新拉取 HEAD 对齐 generation
+	if cur != nil && !cur.Deleted {
+		if newGen, ok := lse3GenerationFromFile(tmp); ok {
+			if curGen, curOk := s.lse3GenerationFromBlob(cur.ContentHash); curOk && newGen <= curGen {
+				return nil, &ConflictError{Path: path, Revision: cur.Revision, Hash: cur.ContentHash}
+			}
+		}
 	}
 
 	// revision 校验（数据安全红线）
@@ -255,9 +276,27 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	now := time.Now().Unix()
 	newRevision := int64(1)
 	createdAt := now
+	fileID := ""
 	if cur != nil {
 		newRevision = cur.Revision + 1
 		createdAt = cur.CreatedAt
+		fileID = cur.FileID
+	}
+	if fileID == "" && clientFileID != "" {
+		// 客户端预生成的身份（E2EE 新文件）：必须未被占用（16B 随机撞车 ≈ 不可能）
+		var used int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM files WHERE file_id = ?`, clientFileID).Scan(&used); err != nil {
+			return nil, err
+		}
+		if used > 0 {
+			return nil, storage.ErrInvalidPath
+		}
+		fileID = clientFileID
+	}
+	if fileID == "" {
+		if fileID, err = db.NewFileID(); err != nil {
+			return nil, err
+		}
 	}
 	if mtime <= 0 {
 		mtime = time.Now().UnixMilli()
@@ -279,6 +318,7 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 		CreatedAt:    createdAt,
 		UpdatedAt:    now,
 		CanonicalKey: storage.CanonicalKey(path),
+		FileID:       fileID,
 	}); err != nil {
 		return nil, err
 	}
@@ -291,7 +331,7 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	if s.opts.HistoryEnabled {
 		if err := db.InsertVersion(tx, &db.FileVersion{
 			Path: path, Revision: newRevision, BlobID: actualHash, ContentHash: actualHash,
-			Size: size, Mtime: mtime, Action: action, DeviceID: deviceID, CreatedAt: now,
+			Size: size, Mtime: mtime, Action: action, DeviceID: deviceID, CreatedAt: now, FileID: fileID,
 		}); err != nil {
 			return nil, err
 		}
@@ -306,7 +346,51 @@ func (s *Service) Upload(path string, baseRevision int64, claimedHash string, bo
 	}
 	s.gcBlobs(prunedBlobs)
 
-	return &UploadResult{Path: path, Revision: newRevision, Hash: actualHash, Size: size, Sequence: seq}, nil
+	return &UploadResult{Path: path, Revision: newRevision, Hash: actualHash, Size: size, Sequence: seq, FileID: fileID}, nil
+}
+
+// isHex32 校验 16 字节 hex 身份格式。
+func isHex32(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// lse3GenerationFromFile 读取 LSE3 信封头中的 contentGeneration；非 LSE3 返回 false。
+// 信封布局："LSE3"(4B) | keyEpoch u32 BE | generation u64 BE | iv | ct。
+func lse3GenerationFromFile(path string) (uint64, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	return lse3GenerationFromReader(f)
+}
+
+func (s *Service) lse3GenerationFromBlob(hash string) (uint64, bool) {
+	f, err := s.blobs.Open(hash)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	return lse3GenerationFromReader(f)
+}
+
+func lse3GenerationFromReader(r io.Reader) (uint64, bool) {
+	head := make([]byte, 16)
+	if _, err := io.ReadFull(r, head); err != nil {
+		return 0, false
+	}
+	if !bytes.Equal(head[:4], lse3Magic) {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(head[8:16]), true
 }
 
 // Delete 逻辑删除文件（tombstone）。内容 blob 由历史保留与孤儿 GC 治理，这里不动磁盘。
