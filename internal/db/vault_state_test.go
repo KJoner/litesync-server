@@ -64,6 +64,8 @@ func TestRepoEpochIsPerVault(t *testing.T) {
 	}
 }
 
+// 覆盖 INV-12：每个查询、变更、Blob 和 sequence 都必须限定到 vault。
+// 这一条针对 sequence：一个租户的写入不得推高另一个租户看到的 head。
 func TestHeadSequenceIsPerVault(t *testing.T) {
 	d, a, b := twoVaults(t)
 

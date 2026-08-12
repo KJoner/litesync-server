@@ -266,6 +266,7 @@ func TestDrillRestoreBadSnapshotLeavesDataIntact(t *testing.T) {
 	t.Log("失败的恢复没有动到任何现有数据")
 }
 
-func ptr(s string) *string   { return &s }
-func ptrBool(b bool) *bool   { return &b }
+func ptr(s string) *string { return &s }
+func ptrBool(b bool) *bool { return &b }
+
 var _ = json.Marshal

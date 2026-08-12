@@ -56,6 +56,9 @@ func uploadOnce(s *syncsvc.Service, path string, base int64, content []byte) (*s
 }
 
 // 逐个注入点跑同一套断言：注入 → 上传必失败 → 不变量成立 → 关掉注入重试必成功。
+// 覆盖 INV-01：服务端返回写入成功时，对应 Blob 已经持久化、存在且 hash 正确。
+// 在 blob 落盘前后、事务提交前后各注入一次崩溃，断言任何一处中断都不会留下
+// 「已确认但内容不在」的状态——最坏情况只是一个无引用的孤儿 blob，由 GC 回收。
 func TestServerCrashPointsLeaveNoHalfCommit(t *testing.T) {
 	points := []struct {
 		name string

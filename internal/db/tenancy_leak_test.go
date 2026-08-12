@@ -13,6 +13,7 @@ import (
 // 同样是泄露，而且更难被发现，因为每一次响应看上去都完全正常。
 
 // changes 游标必须按租户隔离：一个租户的写入不得出现在另一个租户的变更流里。
+// 覆盖 INV-12：变更流必须限定到 vault。
 func TestChangesAreScopedPerVault(t *testing.T) {
 	d := openTestDB(t)
 
@@ -93,6 +94,7 @@ func TestRepoStateIsPartitionedByVault(t *testing.T) {
 //
 // 判据：同一份内容在两个租户里必须落在两个不同的 blob_id 上，
 // 因此「这个 id 存在吗」这个问题在跨租户方向上问不出任何东西。
+// 覆盖 INV-12：Blob 必须限定到 vault（且存在性不可跨租户观测）。
 func TestBlobExistenceIsNotCrossTenantObservable(t *testing.T) {
 	d := openTestDB(t)
 	const sameContent = "0000000000000000000000000000000000000000000000000000000000000001"

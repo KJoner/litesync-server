@@ -345,6 +345,8 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 }
 
 // 迁移中断后可续跑：journal 已 done 的条目不会重做，未完成的继续。
+// 覆盖 INV-11：所有迁移必须可恢复、可重复、幂等。
+// 中途中断后续跑，结果必须与一次跑完等价。
 func TestV6MigrationResumable(t *testing.T) {
 	path := buildV5DB(t)
 	d := openMigrated(t, path)

@@ -68,6 +68,9 @@ func sha256HexT(b []byte) string {
 // 并发快照读出的 (sequence, files) 必须满足 len(files) == sequence。
 // 修复前 ListFiles 与 LatestSequence 分两次查询，会出现 sequence 比文件多 1
 // 的快照，使客户端游标跳过一次变更并永久漏同步。
+// 覆盖 INV-02：同一 repoEpoch 内 headSequence 永不下降；
+// Snapshot 内容必须与返回的 sequence 对应同一时刻。
+// 并发上传与快照读交错进行，断言任何一次快照都不会「看到一半」。
 func TestSnapshotLinearizability(t *testing.T) {
 	s := newService(t, syncsvc.Options{})
 	const total = 120
@@ -116,6 +119,8 @@ func TestSnapshotLinearizability(t *testing.T) {
 
 // changes 被全量裁剪后：head 不回退、Changes 返回 resync 而不是 latest=0、
 // 新写入的 sequence 继续单调递增（绝不复用已发出的 sequence）。
+// 覆盖 INV-02：裁剪 changes 表不得让 headSequence 回退。
+// 水位线是独立记录的，不是从表里 MAX 出来的——后者在整表裁剪后会归零。
 func TestClockSurvivesChangesPrune(t *testing.T) {
 	s := newService(t, syncsvc.Options{ChangesMax: 1})
 	upload(t, s, "a.md", 0, []byte("a"))

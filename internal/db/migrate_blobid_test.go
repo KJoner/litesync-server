@@ -276,6 +276,7 @@ func TestBlobIDMigrationRollsBackRenameWhenRepointFails(t *testing.T) {
 }
 
 // 重复执行必须幂等：已经迁移过的全部落到 Skipped，不再改动任何东西。
+// 覆盖 INV-11：重复执行幂等。
 func TestBlobIDMigrationIsIdempotent(t *testing.T) {
 	d, blobs, blobDir := newBlobEnv(t)
 	secret, _ := seedBlobs(t, d, blobs, 4)

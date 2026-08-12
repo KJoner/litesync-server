@@ -71,6 +71,7 @@ func demoteToLegacyBlobIDs(t *testing.T, s *syncsvc.Service, blobDir string) {
 	}
 }
 
+// 覆盖 INV-11（迁移可恢复/可重复/幂等）与 INV-01（迁移后内容仍完整可读）。
 func TestBlobIDMigrationDrillKeepsEveryFileReadable(t *testing.T) {
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
 

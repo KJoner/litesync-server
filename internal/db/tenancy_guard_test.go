@@ -29,6 +29,7 @@ var scopeConstructorAllowlist = []string{
 	filepath.Join("cmd", "obsync"),   // 运维命令：没有 HTTP 认证上下文，见下
 }
 
+// 覆盖 INV-12：每个查询的 vault 范围只能来自认证上下文。
 func TestScopeConstructorIsNotCalledFromBusinessCode(t *testing.T) {
 	root := repoRoot(t)
 	callRe := regexp.MustCompile(`\bdb\.ScopeFromAuth\(`)
