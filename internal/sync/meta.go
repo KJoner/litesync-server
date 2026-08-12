@@ -544,7 +544,16 @@ func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
 
 // ValidateMetaMigration 执行 ADR-003 §3.5 的全部 11 项检查。
 // 返回的清单是**完整**的——用户需要一次看到所有问题。
+// scope 返回本 Service 当前操作的租户范围。
+//
+// 单用户阶段固定是 default 租户；多租户上线后这里改为从调用方传入的
+// 认证上下文取值——届时 Service 的方法签名会带上 VaultScope 参数，
+// 这个临时方法随之删除。保留它是为了让 db 层**现在就**只接受
+// VaultScope，而不是等多租户那天再一次性改几十处调用。
+func (s *Service) scope() db.VaultScope { return db.LegacyDefaultScope() }
+
 func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
+	scope := s.scope()
 	rs, err := db.GetRepoState(s.db)
 	if err != nil {
 		return nil, err
@@ -591,10 +600,8 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 			badFileID++
 			idExample = truncateID(h.FileID)
 		}
-		var maxGen int64
-		if err := s.db.QueryRow(
-			`SELECT COALESCE(MAX(content_generation), 0) FROM object_versions WHERE vault_id = ? AND file_id = ?`,
-			db.DefaultVaultID, h.FileID).Scan(&maxGen); err != nil {
+		maxGen, err := db.MaxContentGeneration(s.db, scope, h.FileID)
+		if err != nil {
 			return nil, err
 		}
 		if h.ContentGeneration < maxGen {
@@ -609,21 +616,15 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 	add("content generation is monotonic", "GENERATION_NOT_MONOTONIC", badGeneration, genExample)
 
 	// 4) 历史 (file_id, revision) 无重复（UNIQUE 保证，这里再核一次）
-	var dupRevisions int64
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM (SELECT file_id, revision FROM object_versions
-		 WHERE vault_id = ? GROUP BY file_id, revision HAVING COUNT(*) > 1)`,
-		db.DefaultVaultID).Scan(&dupRevisions); err != nil {
+	dupRevisions, err := db.CountDuplicateRevisions(s.db, scope)
+	if err != nil {
 		return nil, err
 	}
 	add("history revisions are unique per object", "REVISION_CONFLICT", dupRevisions, "")
 
 	// 6) 历史全部能归属到已知对象
-	var orphanHistory int64
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM object_versions v WHERE v.vault_id = ?
-		   AND NOT EXISTS (SELECT 1 FROM file_objects o WHERE o.vault_id = v.vault_id AND o.file_id = v.file_id)`,
-		db.DefaultVaultID).Scan(&orphanHistory); err != nil {
+	orphanHistory, err := db.CountOrphanHistory(s.db, scope)
+	if err != nil {
 		return nil, err
 	}
 	add("history rows all resolve to a known object", "ORPHAN_HISTORY", orphanHistory, "")
@@ -640,11 +641,8 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 	// 只看 cutoff 之后：cutoff 之前的变更本来就是迁移前产生的，它们携带明文路径
 	// 是正常的，并且会被 complete 的全量裁剪一并清除。真正要抓的是**迁移期间**
 	// 有设备绕过冻结、又把真实路径写了回来。
-	var staleChanges int64
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM object_changes
-		  WHERE vault_id = ? AND sequence > ? AND pseudonym != file_id`,
-		db.DefaultVaultID, rs.MigrationCutoffSequence).Scan(&staleChanges); err != nil {
+	staleChanges, err := db.CountPlaintextAddressedChangesAfter(s.db, scope, rs.MigrationCutoffSequence)
+	if err != nil {
 		return nil, err
 	}
 	add("no plaintext-addressed change was published after the cutoff", "STALE_CHANGES", staleChanges, "")
@@ -739,7 +737,7 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 	}
 	// 全量裁剪 changes：旧记录里还带着迁移前的明文寻址名，
 	// 且 formatEpoch 变化本来就要求所有客户端重新对账
-	if _, err := tx.Exec(`DELETE FROM object_changes WHERE vault_id = ?`, db.DefaultVaultID); err != nil {
+	if err := db.DeleteAllChanges(tx, s.scope()); err != nil {
 		return nil, err
 	}
 	if err := db.SetMinRetainedSequence(tx, rs.HeadSequence); err != nil {
