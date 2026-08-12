@@ -20,17 +20,23 @@ import (
 func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	path, err := url.PathUnescape(r.Header.Get("X-File-Path"))
 	if err != nil || path == "" {
-		writeErr(w, http.StatusBadRequest, "missing or invalid X-File-Path")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "missing or invalid X-File-Path", false)
 		return
 	}
 	baseRevision, err := strconv.ParseInt(r.Header.Get("X-Base-Revision"), 10, 64)
 	if err != nil || baseRevision < 0 {
-		writeErr(w, http.StatusBadRequest, "missing or invalid X-Base-Revision")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "missing or invalid X-Base-Revision", false)
 		return
 	}
 	hash := strings.ToLower(r.Header.Get("X-Content-Hash"))
 	if !isSHA256Hex(hash) {
-		writeErr(w, http.StatusBadRequest, "X-Content-Hash must be a sha256 hex digest")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "X-Content-Hash must be a sha256 hex digest", false)
+		return
+	}
+	// 元数据 Header 的格式与长度上限（v0.12.1 / LS-121-S04）：
+	// 不再依赖 HTTP Server 的总 Header 上限作为唯一保护
+	if bad := validateMetaHeaders(r.Header); bad != "" {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "invalid "+bad+" header", false)
 		return
 	}
 	var mtime int64
@@ -77,26 +83,41 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 		writeConflict(w, conflict)
 	case errors.As(err, &collision):
 		// 422：请求合法但该路径与现有文件在大小写不敏感文件系统上冲突
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error":    "path collision",
-			"path":     collision.Path,
-			"existing": collision.Existing,
-		})
+		writeCollision(w, collision)
+	case errors.Is(err, syncsvc.ErrEnvelopeTooOld):
+		// 信封降级冻结（LS-121-S01）：HEAD 已是 LSE3，旧信封覆盖一律拒绝。
+		// 机器码让客户端能区分「revision 冲突」与「协议级拒绝」
+		writeCoded(w, http.StatusConflict, CodeEnvelopeTooOld,
+			"current head uses the LSE3 envelope; downgrading to an older envelope is not allowed", false)
+	case errors.Is(err, syncsvc.ErrFileIDConflict):
+		writeCoded(w, http.StatusConflict, CodeFileIDConflict, "client-provided file id is already in use", false)
 	case errors.Is(err, syncsvc.ErrPlaintextRejected):
 		// E2EE 明文冻结：仓库已启用加密，明文上传一律拒绝
-		writeErr(w, http.StatusConflict, err.Error())
+		writeCoded(w, http.StatusConflict, CodePlaintextRejected, err.Error(), false)
 	case errors.Is(err, syncsvc.ErrMetaRequired):
 		// 元数据加密态：伪名路径 + 加密元数据缺失
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeCoded(w, http.StatusBadRequest, CodeMetaRequired, err.Error(), false)
 	case errors.As(err, &tooBig):
-		writeErr(w, http.StatusRequestEntityTooLarge, "file too large")
+		writeCoded(w, http.StatusRequestEntityTooLarge, CodeTooLarge, "file too large", false)
 	case errors.Is(err, storage.ErrInvalidPath):
-		writeErr(w, http.StatusBadRequest, "invalid path")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
 	case errors.Is(err, storage.ErrHashMismatch):
-		writeErr(w, http.StatusBadRequest, "content hash mismatch")
+		writeCoded(w, http.StatusBadRequest, CodeHashMismatch, "content hash mismatch", false)
 	default:
 		h.internalError(w, "upload", err)
 	}
+}
+
+// writeCollision 422：canonical 归一化后与现有文件同名（meta 模式下比较的是 HMAC）。
+func writeCollision(w http.ResponseWriter, c *syncsvc.PathCollisionError) {
+	writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+		"code":      CodeCanonicalCollision,
+		"message":   "path collision",
+		"retryable": false,
+		"error":     "path collision",
+		"path":      c.Path,
+		"existing":  c.Existing,
+	})
 }
 
 // moveFile 原子改名（v9.3）。Body：{"fromPath","toPath","baseRevision"}
@@ -221,11 +242,16 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 
 func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
 	body := map[string]any{
-		"error":    "conflict",
-		"path":     c.Path,
-		"revision": c.Revision,
-		"hash":     c.Hash,
-		"deleted":  c.Deleted,
+		// code=CONFLICT 表示「这是 revision 冲突，响应里带着服务器当前状态」，
+		// 与协议级的 409（如 ENVELOPE_TOO_OLD）区分开（LS-121-S05）
+		"code":      CodeConflict,
+		"message":   "conflict",
+		"retryable": false,
+		"error":     "conflict",
+		"path":      c.Path,
+		"revision":  c.Revision,
+		"hash":      c.Hash,
+		"deleted":   c.Deleted,
 	}
 	if c.PriorHash != "" {
 		// tombstone 冲突：删除前最后一个版本的内容 hash，

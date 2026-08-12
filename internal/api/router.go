@@ -159,8 +159,67 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v) //nolint:errcheck
 }
 
+// 机器可识别错误码（v0.12.1 / LS-121-S05）。
+// 客户端逻辑只允许根据 code 分支，绝不解析 message 文案。
+const (
+	CodeInvalidPath         = "INVALID_PATH"
+	CodeInvalidHeader       = "INVALID_HEADER"
+	CodeInvalidBody         = "INVALID_BODY"
+	CodeConflict            = "CONFLICT"
+	CodeEnvelopeTooOld      = "ENVELOPE_TOO_OLD"
+	CodePlaintextRejected   = "PLAINTEXT_REJECTED"
+	CodeMetaRequired        = "META_REQUIRED"
+	CodeMetaStateInvalid    = "META_STATE_INVALID"
+	CodeStaleMetaGeneration = "STALE_META_GENERATION"
+	CodeCanonicalCollision  = "CANONICAL_COLLISION"
+	CodeFileIDConflict      = "FILE_ID_CONFLICT"
+	CodeTombstonePlaintext  = "TOMBSTONE_PLAINTEXT"
+	CodeHashMismatch        = "HASH_MISMATCH"
+	CodeNotFound            = "NOT_FOUND"
+	CodeUnauthorized        = "UNAUTHORIZED"
+	CodeForbidden           = "FORBIDDEN"
+	CodeTooLarge            = "TOO_LARGE"
+	CodeInternal            = "INTERNAL"
+)
+
+// writeCoded 统一错误响应体：{code, message, retryable}。
+// 同时保留 error 字段，兼容 0.12.0 及更早只读 error 的客户端。
+func writeCoded(w http.ResponseWriter, status int, code, msg string, retryable bool) {
+	writeJSON(w, status, map[string]any{
+		"code":      code,
+		"message":   msg,
+		"retryable": retryable,
+		"error":     msg,
+	})
+}
+
+// writeErr 按状态码推断默认错误码（逐步替换为显式 writeCoded）。
 func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeCoded(w, status, defaultCodeFor(status), msg, status >= http.StatusInternalServerError)
+}
+
+func defaultCodeFor(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return CodeInvalidBody
+	case http.StatusUnauthorized:
+		return CodeUnauthorized
+	case http.StatusForbidden:
+		return CodeForbidden
+	case http.StatusNotFound:
+		return CodeNotFound
+	case http.StatusConflict:
+		return CodeConflict
+	case http.StatusRequestEntityTooLarge:
+		return CodeTooLarge
+	case http.StatusUnprocessableEntity:
+		return CodeCanonicalCollision
+	default:
+		if status >= http.StatusInternalServerError {
+			return CodeInternal
+		}
+		return CodeInvalidBody
+	}
 }
 
 // requestLog 记录每个请求。数据安全红线：绝不记录 Token 与文件内容。

@@ -40,7 +40,57 @@ var (
 	ErrMetaRequired = errors.New("metadata encryption is enabled: pseudonymous path and encrypted metadata required")
 	// ErrMetaCAS：元数据更新的 metaGeneration CAS 失败（并发改名）
 	ErrMetaCAS = errors.New("metadata generation mismatch")
+	// ErrEnvelopeTooOld（v0.12.1 / LS-121-S01）：当前 HEAD 已是 LSE3，
+	// 不允许用 LSE1/LSE2 覆盖。信封只许升级不许降级（INV-07）——
+	// 一次降级写入就会让「AAD 绑 fileId + 单调 generation」的抗回退保护失效，
+	// 还会让 meta 迁移在混合信封上失败。
+	ErrEnvelopeTooOld = errors.New("envelope downgrade rejected: current head is LSE3")
+	// ErrFileIDConflict：客户端预生成的 fileId 已被占用（语义上是 409，不是 400）
+	ErrFileIDConflict = errors.New("file id already in use")
+	// ErrTombstonePlaintext（v0.12.1 / LS-121-S02）：仓库里仍有携带明文路径的
+	// tombstone，无法在保住删除屏障的前提下抹除明文路径
+	ErrTombstonePlaintext = errors.New("plaintext tombstones present: cannot erase paths without losing deletion barriers")
 )
+
+// envelopeVersion 返回内容的信封版本：1/2/3；非 LSE 内容返回 0。
+func envelopeVersion(head []byte) int {
+	switch {
+	case bytes.Equal(head, lse3Magic):
+		return 3
+	case bytes.Equal(head, lse2Magic):
+		return 2
+	case bytes.Equal(head, lse1Magic):
+		return 1
+	default:
+		return 0
+	}
+}
+
+func envelopeVersionOfReader(r io.Reader) int {
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(r, head); err != nil {
+		return 0
+	}
+	return envelopeVersion(head)
+}
+
+func envelopeVersionOfFile(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	return envelopeVersionOfReader(f)
+}
+
+func (s *Service) envelopeVersionOfBlob(hash string) int {
+	f, err := s.blobs.Open(hash)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	return envelopeVersionOfReader(f)
+}
 
 const vaultKeyMetaKey = "vault-key"
 
@@ -273,6 +323,15 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 		return &UploadResult{Path: path, Revision: cur.Revision, Hash: cur.ContentHash, Size: cur.Size, Sequence: rs.HeadSequence, FileID: cur.FileID}, nil
 	}
 
+	// 信封降级冻结（v0.12.1 / LS-121-S01，INV-07）：HEAD 已是 LSE3 时，
+	// LSE1/LSE2/明文覆盖一律拒绝。旧客户端、状态丢失的设备或恶意重放都不能
+	// 把已经升级过的对象拉回弱信封——那会让 fileId-AAD 与 generation 抗回退失效。
+	if cur != nil && !cur.Deleted && s.envelopeVersionOfBlob(cur.ContentHash) == 3 {
+		if envelopeVersionOfFile(tmp) < 3 {
+			return nil, ErrEnvelopeTooOld
+		}
+	}
+
 	// LSE3 generation 单调性（v9.3）：信封头是明文，服务器无需密钥即可读。
 	// 同一 HEAD（revision 已校验一致）上 generation 不增反降 = 客户端状态异常
 	// 或回退重放 → 按冲突拒绝，客户端会重新拉取 HEAD 对齐 generation
@@ -345,7 +404,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 			return nil, err
 		}
 		if used > 0 {
-			return nil, storage.ErrInvalidPath
+			return nil, ErrFileIDConflict
 		}
 		fileID = clientFileID
 	}

@@ -174,7 +174,7 @@ sync.example.com {
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
 | GET / PUT | `/api/v1/file/meta` | 元数据读取 / 改名=元数据更新（0.12.0，metaGeneration CAS） |
 | POST | `/api/v1/meta/migrate` | 元数据迁移：单文件真实路径 → 伪名（断点续传安全） |
-| POST | `/api/v1/meta/begin` / `complete` / `abort` | 元数据加密状态机；complete = 明文路径抹除（单向，需显式确认） |
+| POST | `/api/v1/meta/begin` / `complete` / `abort` | 元数据加密状态机；**complete 自 0.12.1 起在存在明文 tombstone 时返回 409**（见下方 E2EE 小节） |
 | POST | `/api/v1/e2ee/begin` | E2EE 迁移开始（0.9.0）：进入 migrating，冻结一切明文写入 |
 | POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE1/LSE2 密文后切换到 encrypted |
 | POST | `/api/v1/e2ee/abort` | 放弃迁移，回到 plaintext |
@@ -201,18 +201,54 @@ X-Content-Hash:   内容的 SHA-256 hex（E2EE 下即密文 hash）
 X-File-Mtime:     文件修改时间（毫秒，可选）
 X-Action:         upsert（默认）/ merge / restore，记入版本历史
 X-Device-ID:      设备标识（可选，用于日志与历史）
+X-File-Id:        稳定文件身份，32 位小写 hex（0.11.0，E2EE 新文件预生成）
+X-Meta-Enc:       LSM1 加密元数据，≤ 8 KiB 的标准 base64（0.12.0，meta 模式建档必带）
+X-Canonical-Hash: canonical path HMAC，64 位小写 hex（0.12.0）
 ```
+
+上述格式与长度上限自 0.12.1 起在协议层显式校验，违反即 `400 INVALID_HEADER`
+（不再依赖 HTTP Server 的总 Header 上限兜底）。
 
 关键行为：
 
-- baseRevision 与服务器不一致 → `409`，响应携带服务器当前 `revision/hash/deleted`
+- baseRevision 与服务器不一致 → `409 CONFLICT`，响应携带服务器当前 `revision/hash/deleted`
 - 上传内容与服务器现有内容相同 → 幂等成功，不产生新 revision（安全重试）
 - 已删除文件重新上传（v0.9 防复活）→ 必须显式携带 tombstone revision；
   `baseRevision=0` 返回 `409`（附 `priorHash` = 删除前内容 hash，客户端据此
   区分「陈旧副本回传」与「同名新内容」）
 - 任何路径穿越（`../`、绝对路径、`\`、盘符）→ `400`；Windows 保留名 /
   尾随空格句点 → `400`；与现有文件大小写/NFC 归一化冲突的新路径 → `422`
-- E2EE migrating/encrypted 状态下，非 LSE1 密文上传一律 `409`（明文写冻结）
+- E2EE migrating/encrypted 状态下，非 LSE 密文上传一律 `409`（明文写冻结）
+- **信封只升不降（0.12.1）**：当前 HEAD 已是 LSE3 时，明文 / LSE1 / LSE2 覆盖
+  一律 `409 ENVELOPE_TOO_OLD`
+
+### 错误响应（0.12.1 起统一）
+
+所有错误响应体为：
+
+```json
+{ "code": "INVALID_PATH", "message": "safe user-facing message", "retryable": false, "error": "..." }
+```
+
+`error` 为兼容字段（0.12.0 及更早的客户端只读它）。**新客户端必须按 `code` 分支，
+不得解析 `message` 文案。** 当前码表：
+
+| code | HTTP | 含义 |
+| --- | --- | --- |
+| `INVALID_PATH` | 400 | 路径非法（穿越、绝对路径、盘符等） |
+| `INVALID_HEADER` | 400 | 元数据类 Header 格式/长度非法 |
+| `INVALID_BODY` | 400 | 请求体字段非法 |
+| `HASH_MISMATCH` | 400 | 实际内容与 `X-Content-Hash` 不符 |
+| `META_REQUIRED` | 400 | meta 模式下缺伪名路径或加密元数据 |
+| `CONFLICT` | 409 | revision 冲突（响应携带服务器状态） |
+| `ENVELOPE_TOO_OLD` | 409 | 信封降级被拒 |
+| `PLAINTEXT_REJECTED` | 409 | 明文写冻结 / 内容不是 LSE3 |
+| `META_STATE_INVALID` | 409 | 元数据状态机转换非法 |
+| `FILE_ID_CONFLICT` | 409 | 客户端预生成的 fileId 已被占用 |
+| `TOMBSTONE_PLAINTEXT` | 409 | 存在明文 tombstone，拒绝抹除明文路径 |
+| `STALE_META_GENERATION` | 412 | metaGeneration CAS 失败（重取后可重试） |
+| `CANONICAL_COLLISION` | 422 | canonical 归一化后与现有文件同名 |
+| `NOT_FOUND` / `TOO_LARGE` / `INTERNAL` | 404 / 413 / 5xx | — |
 
 ## 功能说明
 
@@ -230,14 +266,21 @@ X-Device-ID:      设备标识（可选，用于日志与历史）
 （带覆盖保护 + CAS，防止误覆盖导致密文永久不可读）。启用后文件内容均为
 LSE 密文，服务器永远无法获得解密密钥或任何明文。
 
-**路径与文件名加密（0.12.0，可选）**：插件命令「加密路径与文件名」把服务器上
-所有路径替换为随机伪名（=fileId），真实路径改存 **LSM1** 加密元数据
-（AAD 绑定 vaultId+keyEpoch+fileId+metaGeneration）。此后服务器与其备份
-完全不知道目录结构与文件名；同名并存判定靠客户端 HMAC（服务器只见散列）；
-改名 = 元数据更新，内容零重传。完成时执行**明文路径抹除**（删除墓碑行、
-清除旧信封历史、全量裁剪 changes）——不可逆，需显式确认，且要求先完成
-「升级加密信封 LSE1 → LSE3」。剩余的元数据暴露面：文件大小、修改时间与
-访问模式（见三阶段计划的 padding/批处理评估）。
+**路径与文件名加密（0.12.0 起，实验功能 / RC）**：插件命令「加密路径与文件名」
+把服务器上所有路径替换为随机伪名（=fileId），真实路径改存 **LSM1** 加密元数据
+（AAD 绑定 vaultId+keyEpoch+fileId+metaGeneration）。迁移后服务器不再看到
+目录结构与文件名；同名并存判定靠客户端 HMAC（服务器只见散列）；
+改名 = 元数据更新，内容零重传。要求先完成「升级加密信封 LSE1 → LSE3」。
+
+> ⚠️ **0.12.1 起 `POST /api/v1/meta/complete`（明文路径抹除）被停用。**
+> 旧实现靠删除全部 tombstone 行来抹掉其中的明文路径，代价是丢失删除屏障——
+> 长期离线的旧设备重新上线会复活已删文件。仓库中只要还存在携带明文路径的
+> tombstone，complete 就返回 `409 TOMBSTONE_PLAINTEXT`，迁移停在可回退的
+> `migrating` 态（`POST /api/v1/meta/abort` 无损退回 `plain`）。
+> 因此**迁移前的 tombstone、旧 changes 与既有备份中仍可能保留明文路径**，
+> 在 v0.13 的隐私 tombstone ledger 完成前不得声称明文路径已不可恢复。
+
+剩余的元数据暴露面：文件大小、修改时间与访问模式（见 v10 计划的 padding/批处理评估）。
 
 信封格式（0.11.0）：新写入使用 **LSE3**——AAD 绑定 vaultId + keyEpoch +
 **fileId + contentGeneration**：恶意服务器既无法用其他 vault / 其他密钥世代 /

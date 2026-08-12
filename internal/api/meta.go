@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/storage"
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
@@ -18,7 +19,7 @@ import (
 //	POST /api/v1/meta/complete  验证全量伪名化后抹除明文路径（单向，需显式确认）
 //	POST /api/v1/meta/abort     migrating → plain（混合态保留，无破坏）
 
-const maxMetaEncSize = 8 << 10 // 加密元数据尺寸上限（正常几百字节）
+const maxMetaEncSize = maxMetaEncHeader // 加密元数据尺寸上限（与 Header 侧同一常量，LS-121-S04）
 
 func (h *handlers) metaError(w http.ResponseWriter, op string, err error) {
 	var conflict *syncsvc.ConflictError
@@ -27,19 +28,27 @@ func (h *handlers) metaError(w http.ResponseWriter, op string, err error) {
 	case errors.As(err, &conflict):
 		writeConflict(w, conflict)
 	case errors.As(err, &collision):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error": "path collision", "path": collision.Path, "existing": collision.Existing,
-		})
+		writeCollision(w, collision)
 	case errors.Is(err, syncsvc.ErrMetaCAS):
-		writeErr(w, http.StatusPreconditionFailed, "metadata generation mismatch; refetch and retry")
+		writeCoded(w, http.StatusPreconditionFailed, CodeStaleMetaGeneration,
+			"metadata generation mismatch; refetch and retry", true)
 	case errors.Is(err, syncsvc.ErrMetaRequired):
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeCoded(w, http.StatusBadRequest, CodeMetaRequired, err.Error(), false)
+	case errors.Is(err, syncsvc.ErrTombstonePlaintext):
+		// LS-121-S02：抹除明文路径会连带丢掉删除屏障 → 拒绝 complete，
+		// 迁移停在 migrating（可 abort 回退）
+		writeCoded(w, http.StatusConflict, CodeTombstonePlaintext,
+			"repository still has tombstones with plaintext paths; erasing them would drop deletion barriers. "+
+				"Path erasure requires the privacy tombstone ledger (protocol v6).", false)
 	case errors.Is(err, syncsvc.ErrPlaintextRejected):
-		writeErr(w, http.StatusConflict, "content must be LSE3 before metadata encryption")
+		writeCoded(w, http.StatusConflict, CodePlaintextRejected,
+			"content must be LSE3 before metadata encryption", false)
 	case errors.Is(err, syncsvc.ErrEncryptionState):
-		writeErr(w, http.StatusConflict, err.Error())
+		writeCoded(w, http.StatusConflict, CodeMetaStateInvalid, err.Error(), false)
 	case errors.Is(err, syncsvc.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "not found")
+		writeCoded(w, http.StatusNotFound, CodeNotFound, "not found", false)
+	case errors.Is(err, storage.ErrInvalidPath):
+		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
 	default:
 		h.internalError(w, op, err)
 	}
@@ -50,7 +59,7 @@ func (h *handlers) metaError(w http.ResponseWriter, op string, err error) {
 func (h *handlers) getFileMeta(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		writeErr(w, http.StatusBadRequest, "missing path")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
 	f, err := h.svc.FileInfo(path)
@@ -77,8 +86,9 @@ func (h *handlers) updateFileMeta(w http.ResponseWriter, r *http.Request) {
 		CanonicalHash      string `json:"canonicalHash"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxMetaEncSize+1024)).Decode(&req); err != nil ||
-		req.Path == "" || len(req.MetaEnc) > maxMetaEncSize {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		req.Path == "" || len(req.MetaEnc) > maxMetaEncSize || !isBase64Header(req.MetaEnc) ||
+		!isLowerHexOfLen(req.CanonicalHash, canonicalHashHexLen) || req.BaseMetaGeneration < 0 {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid body", false)
 		return
 	}
 	res, err := h.svc.UpdateFileMeta(req.Path, req.BaseMetaGeneration, req.MetaEnc, req.CanonicalHash, auditDeviceID(r))
@@ -103,8 +113,9 @@ func (h *handlers) migrateFileMeta(w http.ResponseWriter, r *http.Request) {
 		CanonicalHash string `json:"canonicalHash"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxMetaEncSize+1024)).Decode(&req); err != nil ||
-		req.FromPath == "" || len(req.MetaEnc) > maxMetaEncSize {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		req.FromPath == "" || len(req.MetaEnc) > maxMetaEncSize || !isBase64Header(req.MetaEnc) ||
+		!isLowerHexOfLen(req.CanonicalHash, canonicalHashHexLen) {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid body", false)
 		return
 	}
 	res, err := h.svc.MigrateFileMeta(req.FromPath, req.MetaEnc, req.CanonicalHash, auditDeviceID(r))
@@ -139,7 +150,8 @@ func (h *handlers) metaComplete(w http.ResponseWriter, r *http.Request) {
 		ConfirmErase bool `json:"confirmErase"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || !req.ConfirmErase {
-		writeErr(w, http.StatusBadRequest, "confirmErase:true required (plaintext path erasure is irreversible)")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody,
+			"confirmErase:true required (plaintext path erasure is irreversible)", false)
 		return
 	}
 	rs, err := h.svc.CompleteMetaMigration()

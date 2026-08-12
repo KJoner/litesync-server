@@ -49,13 +49,16 @@ func TestClientProvidedFileID(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK || body2["fileId"] != myID {
 		t.Fatalf("existing file must keep fileId: %v", body2["fileId"])
 	}
-	// 其他新文件占用同一 id → 400
-	if r, _ := e.uploadWithFileID(t, "b.md", 0, []byte("b"), myID); r.StatusCode != http.StatusBadRequest {
-		t.Fatalf("duplicate fileId = %d, want 400", r.StatusCode)
+	// 其他新文件占用同一 id → 409 FILE_ID_CONFLICT（v0.12.1 / LS-121-S05：
+	// 身份被占用是冲突而不是「路径非法」，错误码必须能被客户端机器识别）
+	r3, b3 := e.uploadWithFileID(t, "b.md", 0, []byte("b"), myID)
+	if r3.StatusCode != http.StatusConflict || b3["code"] != "FILE_ID_CONFLICT" {
+		t.Fatalf("duplicate fileId = %d %v, want 409 FILE_ID_CONFLICT", r3.StatusCode, b3)
 	}
-	// 非法格式 → 400
-	if r, _ := e.uploadWithFileID(t, "c.md", 0, []byte("c"), "not-hex"); r.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid fileId = %d, want 400", r.StatusCode)
+	// 非法格式 → 400 INVALID_HEADER（Header 层就被拦下，不再进业务）
+	r4, b4 := e.uploadWithFileID(t, "c.md", 0, []byte("c"), "not-hex")
+	if r4.StatusCode != http.StatusBadRequest || b4["code"] != "INVALID_HEADER" {
+		t.Fatalf("invalid fileId = %d %v, want 400 INVALID_HEADER", r4.StatusCode, b4)
 	}
 }
 
@@ -76,9 +79,24 @@ func TestLse3GenerationMonotonic(t *testing.T) {
 	if r, _ := e.upload(t, "n.md", 1, lse3Payload(1, 3, "g3")); r.StatusCode != http.StatusOK {
 		t.Fatalf("next generation = %d, want 200", r.StatusCode)
 	}
-	// 非 LSE3 覆盖 LSE3（如明文模式下的回退）：单调性检查不拦（磁盘态兼容）
-	if r, _ := e.upload(t, "n.md", 2, []byte("plaintext again")); r.StatusCode != http.StatusOK {
-		t.Fatalf("non-LSE3 over LSE3 in plaintext state = %d, want 200", r.StatusCode)
+	// 信封降级冻结（v0.12.1 / LS-121-S01，INV-07）：HEAD 已是 LSE3 时，
+	// 明文 / LSE1 / LSE2 覆盖一律 409 ENVELOPE_TOO_OLD——旧客户端、状态丢失
+	// 的设备或重放都不能把已升级的对象拉回弱信封
+	rp, bp := e.upload(t, "n.md", 2, []byte("plaintext again"))
+	if rp.StatusCode != http.StatusConflict || bp["code"] != "ENVELOPE_TOO_OLD" {
+		t.Fatalf("plaintext over LSE3 = %d %v, want 409 ENVELOPE_TOO_OLD", rp.StatusCode, bp)
+	}
+	lse1 := append([]byte("LSE1"), []byte("iv-and-ciphertext-old")...)
+	if r, b := e.upload(t, "n.md", 2, lse1); r.StatusCode != http.StatusConflict || b["code"] != "ENVELOPE_TOO_OLD" {
+		t.Fatalf("LSE1 over LSE3 = %d %v, want 409 ENVELOPE_TOO_OLD", r.StatusCode, b)
+	}
+	lse2 := append([]byte("LSE2"), []byte("\x00\x00\x00\x01iv-and-ciphertext-old")...)
+	if r, b := e.upload(t, "n.md", 2, lse2); r.StatusCode != http.StatusConflict || b["code"] != "ENVELOPE_TOO_OLD" {
+		t.Fatalf("LSE2 over LSE3 = %d %v, want 409 ENVELOPE_TOO_OLD", r.StatusCode, b)
+	}
+	// 内容未变（同 hash）时仍走幂等快速路径，不受降级检查影响
+	if r, _ := e.upload(t, "n.md", 2, lse3Payload(1, 3, "g3")); r.StatusCode != http.StatusOK {
+		t.Fatalf("idempotent re-upload of current head = %d, want 200", r.StatusCode)
 	}
 }
 

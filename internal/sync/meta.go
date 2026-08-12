@@ -34,12 +34,24 @@ type MetaUpdateResult struct {
 // UpdateFileMeta 元数据更新（改名）：内容不动，metaGeneration CAS 后 +1，
 // 发布一条 hash 不变但 metaGeneration 变新的 change（客户端据此做本地 rename）。
 func (s *Service) UpdateFileMeta(path string, baseMetaGeneration int64, metaEnc, canonicalHash, deviceID string) (*MetaUpdateResult, error) {
-	if !isHex32(path) || metaEnc == "" || canonicalHash == "" {
+	if !isHex32(path) || metaEnc == "" || !isHex64(canonicalHash) || baseMetaGeneration < 0 {
 		return nil, ErrMetaRequired
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// 状态守卫（v0.12.1 / LS-121-S03）：只有仓库确实处在元数据迁移或
+	// 元数据加密状态时，才允许写入 meta_enc / canonical HMAC / metaGeneration。
+	// plain 状态下这些字段没有任何合法来源——放行等于允许用特制文件名污染
+	// 元数据语义（例如给普通文件挂上伪造的 canonical 键去顶掉别人的路径）。
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.MetaState != db.MetaMigrating && rs.MetaState != db.MetaEncrypted {
+		return nil, ErrEncryptionState
+	}
 
 	cur, err := db.GetFile(s.db, path)
 	if err != nil {
@@ -87,7 +99,7 @@ func (s *Service) UpdateFileMeta(path string, baseMetaGeneration int64, metaEnc,
 
 // MigrateFileMeta 迁移单个文件：真实路径行 → 伪名行（单事务，断点续传安全）。
 func (s *Service) MigrateFileMeta(fromPath, metaEnc, canonicalHash, deviceID string) (*MoveResult, error) {
-	if metaEnc == "" || canonicalHash == "" {
+	if metaEnc == "" || !isHex64(canonicalHash) {
 		return nil, ErrMetaRequired
 	}
 
@@ -222,10 +234,20 @@ func (s *Service) BeginMetaMigration() (*db.RepoState, error) {
 
 // CompleteMetaMigration：验证全部未删除文件均已伪名化（path==file_id 且带 meta），
 // 然后执行明文路径抹除（单向点）：
-//   - 删除全部 tombstone 行（其 path 是明文）
 //   - 清除旧信封（非 LSE3）历史版本（其 path 已改写但内容按路径 AAD 无法再解）
 //   - 全量裁剪 changes 并把水位线推到 head（旧 changes 的明文路径消失，
 //     所有客户端下轮 snapshot 对账，快照只含伪名+密文元数据）
+//
+// v0.12.1（LS-121-S02）：**不再删除 tombstone**。
+//
+// 旧实现用 `DELETE FROM files WHERE deleted = 1` 来抹掉 tombstone 行里的明文
+// 路径，代价是把「删除事实」本身一起丢掉（INV-06）：一台离线很久的旧设备
+// 重新上线后，会把本已删除的文件当成新文件重新建档复活。
+//
+// 「擦除明文」永远不是丢失删除屏障的理由。因此当仓库里还存在携带明文路径的
+// tombstone 时，complete 直接拒绝并返回 ErrTombstonePlaintext——迁移停在
+// migrating（可 abort 回退，已伪名化的行照常工作）。把 tombstone 转成不泄露
+// 路径又能防复活的隐私 ledger 是 v0.13.0 / 协议 v6 的工作。
 func (s *Service) CompleteMetaMigration() (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -248,6 +270,19 @@ func (s *Service) CompleteMetaMigration() (*db.RepoState, error) {
 		if _, isV3 := s.lse3GenerationFromBlob(f.ContentHash); !isV3 {
 			return nil, ErrPlaintextRejected
 		}
+	}
+
+	// 明文 tombstone 检查（LS-121-S02）：只要还有一行删除记录的 path 不是伪名，
+	// 就无法在不丢删除屏障的前提下完成抹除 → 拒绝 complete
+	var plainTombstones int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM files WHERE deleted = 1 AND path != file_id`).Scan(&plainTombstones); err != nil {
+		return nil, err
+	}
+	if plainTombstones > 0 {
+		s.log.Warn("meta complete refused: plaintext tombstones would have to be dropped",
+			"tombstones", plainTombstones)
+		return nil, ErrTombstonePlaintext
 	}
 
 	// 收集将被清除的旧信封历史的 blob（事务后 GC）
@@ -278,9 +313,8 @@ func (s *Service) CompleteMetaMigration() (*db.RepoState, error) {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.Exec(`DELETE FROM files WHERE deleted = 1`); err != nil {
-		return nil, err
-	}
+	// 注意：这里**不删除 tombstone**（LS-121-S02）。删除事实必须保留，
+	// 否则旧设备重新上线会复活已删内容（INV-06）。
 	// 旧信封历史（path AAD，改写路径后永远无法解密）→ 连元数据一起清除
 	if _, err := tx.Exec(
 		`DELETE FROM file_versions WHERE id IN (
@@ -326,6 +360,19 @@ func (s *Service) AbortMetaMigration() (*db.RepoState, error) {
 		return nil, err
 	}
 	return db.GetRepoState(s.db)
+}
+
+// isHex64 校验 32 字节 hex（canonical path HMAC）。
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func placeholders(n int) string {
