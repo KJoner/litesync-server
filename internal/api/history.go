@@ -76,6 +76,10 @@ func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 	meta, rc, err := h.svc.OpenVersion(path, revision)
 	if err != nil {
 		switch {
+		case errors.Is(err, syncsvc.ErrCorrupted):
+			// §7.2：历史版本同样不得在损坏后继续对外返回
+			writeCoded(w, http.StatusServiceUnavailable, CodeCorrupted,
+				"content failed integrity verification", false)
 		case errors.Is(err, syncsvc.ErrNotFound):
 			writeErr(w, http.StatusNotFound, "not found")
 		case errors.Is(err, storage.ErrInvalidPath):

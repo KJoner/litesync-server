@@ -25,6 +25,14 @@ export interface VersionEntry {
 	createdAt: number;
 }
 
+/** 服务器判定该内容已损坏并停止对外提供（§7.2 CONTENT_CORRUPTED）。 */
+export class IntegrityError extends Error {
+	constructor() {
+		super("服务器上的这份内容未通过完整性校验，已停止提供");
+		this.name = "IntegrityError";
+	}
+}
+
 export class AuthError extends Error {
 	constructor() {
 		super("unauthorized");
@@ -55,10 +63,26 @@ export class Api {
 	private async req(path: string, init?: RequestInit): Promise<Response> {
 		const res = await fetch(path, init);
 		if (res.status === 401 || res.status === 403) throw new AuthError();
+		// §7.2 / §7.5：服务器明确说「这份内容坏了」时要单独成一类错误。
+		// 混进普通 HTTP 错误里，用户看到的会是「加载失败」——那读起来像网络问题，
+		// 而实际需要的是管理员从备份恢复
+		if (res.status === 503) {
+			const body = (await res.clone().json().catch(() => ({}))) as { code?: string };
+			if (body.code === "CONTENT_CORRUPTED") throw new IntegrityError();
+		}
 		return res;
 	}
 
-	async info(): Promise<{ version: string; latestSequence: number; vaultId?: string; keyEpoch?: number }> {
+	async info(): Promise<{
+		version: string;
+		latestSequence: number;
+		vaultId?: string;
+		keyEpoch?: number;
+		/** 仓库当前的元数据加密状态（plain / migrating / verifying / encrypted） */
+		metaState?: string;
+		formatEpoch?: number;
+		repoEpoch?: string;
+	}> {
 		const res = await this.req("/api/v1/info");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		return res.json();
@@ -77,10 +101,25 @@ export class Api {
 		return res.json();
 	}
 
-	async file(path: string): Promise<ArrayBuffer> {
+	/**
+	 * 下载 HEAD 内容，连同服务器声明的身份一起返回（v0.13.3 / 计划书 §7.5）。
+	 *
+	 * 只要 bytes 不够：调用方必须能核对「服务器给的是不是我要的那个对象」，
+	 * 否则一个被攻陷的服务器可以拿另一份内容冒充这个文件。
+	 */
+	async fileWithIdentity(path: string): Promise<{ data: ArrayBuffer; fileId: string | null; generation: number | null }> {
 		const res = await this.req(`/api/v1/file?path=${encodeURIComponent(path)}`);
 		if (!res.ok) throw new Error(`file ${path}: HTTP ${res.status}`);
-		return res.arrayBuffer();
+		const gen = res.headers.get("X-Content-Generation");
+		return {
+			data: await res.arrayBuffer(),
+			fileId: res.headers.get("X-File-Id"),
+			generation: gen === null || gen === "" ? null : Number(gen),
+		};
+	}
+
+	async file(path: string): Promise<ArrayBuffer> {
+		return (await this.fileWithIdentity(path)).data;
 	}
 
 	async history(path: string): Promise<VersionEntry[]> {
@@ -90,10 +129,23 @@ export class Api {
 		return body.versions ?? [];
 	}
 
-	async version(path: string, revision: number): Promise<ArrayBuffer> {
+	/**
+	 * 下载历史版本，连同**版本级** fileId 一起返回（§7.5）。
+	 *
+	 * 历史版本的 fileId 未必等于当前 HEAD 的 fileId：文件被删除后重建过的话，
+	 * 旧版本属于旧对象。用当前身份去解旧版本只会得到「解密失败」这种误导性错误。
+	 */
+	async versionWithIdentity(
+		path: string,
+		revision: number,
+	): Promise<{ data: ArrayBuffer; fileId: string | null }> {
 		const res = await this.req(`/api/v1/version?path=${encodeURIComponent(path)}&revision=${revision}`);
 		if (!res.ok) throw new Error(`version: HTTP ${res.status}`);
-		return res.arrayBuffer();
+		return { data: await res.arrayBuffer(), fileId: res.headers.get("X-File-Id") };
+	}
+
+	async version(path: string, revision: number): Promise<ArrayBuffer> {
+		return (await this.versionWithIdentity(path, revision)).data;
 	}
 
 	// ---------- 备份管理（ADMIN capability：需要 admin 会话，见 login(token, true)） ----------

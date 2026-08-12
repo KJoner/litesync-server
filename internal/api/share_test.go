@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,8 +59,17 @@ func TestShareLifecycle(t *testing.T) {
 		t.Fatalf("list shares = %d", lresp.StatusCode)
 	}
 	list := lbody["shares"].([]any)
-	if len(list) != 1 || list[0].(map[string]any)["name"] != "Notes/demo.md" {
+	if len(list) != 1 {
 		t.Fatalf("shares list = %v", list)
+	}
+	// v0.13.3 §7.4：服务器绝不保存客户端提供的显示名。
+	// 真实文件名随内容一起进了密文帧，服务器只留一个随机运维标签。
+	gotName, _ := list[0].(map[string]any)["name"].(string)
+	if strings.Contains(gotName, "Notes") || strings.Contains(gotName, "demo") {
+		t.Fatalf("服务器保存了真实路径，元数据泄露: %q", gotName)
+	}
+	if !strings.HasPrefix(gotName, "share-") {
+		t.Fatalf("服务器侧应当是随机标签，got %q", gotName)
 	}
 
 	// 撤销

@@ -238,8 +238,14 @@ func TestMaintenanceOrphanBlobsAndShares(t *testing.T) {
 	// 过期判断是秒级（now > expiresAt）：等待 >2s 才能保证跨过临界秒，避免 flaky
 	time.Sleep(2500 * time.Millisecond)
 
+	// v0.13.3 §7.3：孤儿 blob 要连续两轮被判定为无引用才真正删除。
+	// 一轮就删的话，任何一次瞬时误判（扫描与提交之间的窗口）都会直接丢数据。
 	e.svc.RunMaintenance()
+	if _, err := os.Stat(orphanPath); err != nil {
+		t.Fatal("第一轮只应把孤儿 blob 入册为候选，不得删除")
+	}
 
+	e.svc.RunMaintenance()
 	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
 		t.Fatal("orphan blob must be removed")
 	}

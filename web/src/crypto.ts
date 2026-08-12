@@ -93,6 +93,16 @@ export async function importVmk(raw: Uint8Array): Promise<CryptoKey> {
 	return crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, false, ["decrypt"]);
 }
 
+/** LSE3 信封头里的世代信息（解密前即可读；GCM 会在解密时认证它们）。 */
+export function lse3Header(payload: ArrayBuffer): { keyEpoch: number; generation: number } | null {
+	if (!hasMagic(payload, LSE3_MAGIC)) return null;
+	const view = new DataView(payload);
+	return {
+		keyEpoch: view.getUint32(4, false),
+		generation: Number(view.getBigUint64(4 + EPOCH_LEN, false)),
+	};
+}
+
 /**
  * 解密 LSE1/LSE2/LSE3 文件；失败返回 null。
  * LSE2 需要 binding（vaultId 来自 /info）；LSE3 还需要 fileId（snapshot 提供）。
@@ -215,6 +225,27 @@ export async function decryptMeta(
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * 分享内容的命名帧（v0.13.3 / 计划书 §7.4）：
+ *
+ *   "LSN1" | nameLen(2, BE) | name(UTF-8) | content
+ *
+ * 显示名在**加密之前**就打进了帧里，因此服务器既看不到也改不了它。
+ * 没有这个帧的是 v0.13.2 及更早创建的旧分享——那时真实路径是通过
+ * `X-Share-Name` 明文交给服务器的，这里按「无名字」处理即可。
+ */
+const SHARE_NAME_MAGIC = [0x4c, 0x53, 0x4e, 0x31];
+
+export function unframeShareContent(plain: ArrayBuffer): { name: string | null; content: ArrayBuffer } {
+	if (plain.byteLength < 6) return { name: null, content: plain };
+	const view = new Uint8Array(plain);
+	if (!SHARE_NAME_MAGIC.every((b, i) => view[i] === b)) return { name: null, content: plain };
+	const nameLen = (view[4] << 8) | view[5];
+	if (6 + nameLen > plain.byteLength) return { name: null, content: plain };
+	const name = new TextDecoder().decode(plain.slice(6, 6 + nameLen));
+	return { name, content: plain.slice(6 + nameLen) };
 }
 
 /** 解密 LSS1 分享（独立 Share Key）；失败返回 null。 */

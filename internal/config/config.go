@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -42,6 +43,23 @@ type Config struct {
 	// TrustedProxies（OBSYNC_TRUSTED_PROXIES，逗号分隔 IP/CIDR，默认 loopback）：
 	// 只有来自这些地址的请求，其 X-Forwarded-Proto 才被信任。
 	TrustedProxies []string
+
+	// StrictBlobVerify（OBSYNC_STRICT_BLOB_VERIFY，默认 false）：
+	// 去重命中时全量重算现有 blob 的 hash，能抓到位腐坏。
+	// 代价是每次命中都要完整读一遍文件——附件多的仓库上传会明显变慢，
+	// 因此默认关闭，由管理员按存储介质的可靠性决定。
+	StrictBlobVerify bool
+
+	// QuarantineRetentionDays（OBSYNC_QUARANTINE_DAYS，默认 0 = 永久保留）：
+	// 隔离区里的坏副本是取证材料，不参与普通 GC，有独立的保留期。
+	QuarantineRetentionDays int
+
+	// HTTPReadTimeout / HTTPWriteTimeout（OBSYNC_HTTP_READ_TIMEOUT /
+	// OBSYNC_HTTP_WRITE_TIMEOUT，秒，默认 1800 = 30 分钟）：§7.6。
+	// 必须覆盖「慢速链路传大附件」这种正常场景，因此默认给得很宽松；
+	// 设成 0 表示不限（不推荐：半开连接会一直占着 goroutine）。
+	HTTPReadTimeout  time.Duration
+	HTTPWriteTimeout time.Duration
 }
 
 func Load() (*Config, error) {
@@ -52,6 +70,9 @@ func Load() (*Config, error) {
 		MaxFileSize:   100 << 20,
 		LogLevel:      slog.LevelInfo,
 		BackupKeyFile: os.Getenv("OBSYNC_BACKUP_KEY_FILE"),
+		// §7.6：宽松但有限——要覆盖慢速链路上传大附件，又不能让半开连接常驻
+		HTTPReadTimeout:  30 * time.Minute,
+		HTTPWriteTimeout: 30 * time.Minute,
 	}
 
 	if cfg.Token == "" {
@@ -120,6 +141,35 @@ func Load() (*Config, error) {
 			}
 			*e.dst = n
 		}
+	}
+	for _, e := range []struct {
+		key string
+		dst *time.Duration
+	}{
+		{"OBSYNC_HTTP_READ_TIMEOUT", &cfg.HTTPReadTimeout},
+		{"OBSYNC_HTTP_WRITE_TIMEOUT", &cfg.HTTPWriteTimeout},
+	} {
+		if v := os.Getenv(e.key); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("invalid %s: %q", e.key, v)
+			}
+			*e.dst = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("OBSYNC_STRICT_BLOB_VERIFY"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid OBSYNC_STRICT_BLOB_VERIFY: %q", v)
+		}
+		cfg.StrictBlobVerify = b
+	}
+	if v := os.Getenv("OBSYNC_QUARANTINE_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid OBSYNC_QUARANTINE_DAYS: %q", v)
+		}
+		cfg.QuarantineRetentionDays = n
 	}
 	if v := os.Getenv("OBSYNC_HISTORY_MAX_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)

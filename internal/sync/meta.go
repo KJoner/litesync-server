@@ -66,6 +66,31 @@ func newMigrationID() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
+// ExpireStaleMigrationLease 释放已过期的迁移租约（v0.13.3 / §7.8 `migration resume`）。
+//
+// 服务器**不能**替客户端把迁移做完——迁移需要 vault key，服务器根本没有。
+// 这里能做的只有一件事：把一个已经过期、但记录仍挂着 owner 的租约清掉，
+// 让任一在线设备可以正常接管续做。返回释放的数量（0 表示没有过期租约）。
+//
+// 只清**已过期**的：强行踢掉一个还活着的 owner，会让两台设备同时写迁移。
+func (s *Service) ExpireStaleMigrationLease(now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return 0, err
+	}
+	if rs.MigrationOwnerDeviceID == "" || rs.MigrationLeaseExpiresAt > now.Unix() {
+		return 0, nil
+	}
+	if _, err := s.db.Exec(
+		`UPDATE repo_state SET migration_owner_device_id = '', migration_lease_expires_at = 0`); err != nil {
+		return 0, err
+	}
+	s.log.Info("migration lease released by operator", "previousOwner", truncateID(rs.MigrationOwnerDeviceID))
+	return 1, nil
+}
+
 // MigrationStatusOf 返回当前迁移状态与 journal 汇总。
 func (s *Service) MigrationStatusOf() (*MigrationStatus, error) {
 	s.mu.Lock()

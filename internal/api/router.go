@@ -76,6 +76,11 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/meta/complete", h.metaComplete)
 	mux.HandleFunc("POST /api/v1/meta/abort", h.metaAbort)
 	mux.HandleFunc("GET /api/v1/admin/migration/report", h.erasureReport)
+
+	// 完整性运维（v0.13.3 §7.2）：ADMIN capability
+	mux.HandleFunc("GET /api/v1/admin/integrity/scan", h.integrityScan)
+	mux.HandleFunc("GET /api/v1/admin/integrity/events", h.integrityEvents)
+	mux.HandleFunc("POST /api/v1/admin/integrity/purge-quarantine", h.integrityPurgeQuarantine)
 	mux.HandleFunc("POST /api/v1/share", h.createShare)
 	mux.HandleFunc("GET /api/v1/shares", h.listShares)
 	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
@@ -180,6 +185,10 @@ const (
 	CodeMetaStateInvalid    = "META_STATE_INVALID"
 	CodeStaleMetaGeneration = "STALE_META_GENERATION"
 	CodeCanonicalCollision  = "CANONICAL_COLLISION"
+	// CodeCorrupted（v0.13.3 / §7.2）：内容已被判定损坏并隔离，服务器拒绝返回。
+	// 客户端必须把它与 NOT_FOUND 区别对待——「坏了」不等于「被删了」，
+	// 绝不能因此触发本地的删除跟随。
+	CodeCorrupted = "CONTENT_CORRUPTED"
 	CodeFileIDConflict      = "FILE_ID_CONFLICT"
 	CodeTombstonePlaintext  = "TOMBSTONE_PLAINTEXT"
 	CodeHashMismatch        = "HASH_MISMATCH"

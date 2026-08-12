@@ -9,14 +9,14 @@ import (
 
 // MaintenanceStats 单次维护任务的结果统计。
 type MaintenanceStats struct {
-	VersionsPruned  int
-	BudgetPruned    int
-	OrphanBlobs     int
-	SharesCleaned   int
-	ChangesPruned   int64
-	Vacuumed        bool
-	HistoryBytes    int64
-	ChangesCount    int64
+	VersionsPruned int
+	BudgetPruned   int
+	OrphanBlobs    int
+	SharesCleaned  int
+	ChangesPruned  int64
+	Vacuumed       bool
+	HistoryBytes   int64
+	ChangesCount   int64
 	// IntegrityIssues：本轮完整性 scrub 发现的问题数（应始终为 0）
 	IntegrityIssues int
 	// TombstonesPurged：本轮清理的删除记录数（默认配置下恒为 0）
@@ -78,7 +78,7 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 		stats.Vacuumed = v
 	}
 
-	stats.HistoryBytes, _ = db.NonHeadHistoryBytes(s.db)          //nolint:errcheck
+	stats.HistoryBytes, _ = db.NonHeadHistoryBytes(s.db)                           //nolint:errcheck
 	s.db.QueryRow(`SELECT COUNT(*) FROM object_changes`).Scan(&stats.ChangesCount) //nolint:errcheck
 
 	s.log.Info("maintenance done",
@@ -262,12 +262,26 @@ func (s *Service) maintainHistoryBudget() (int, error) {
 	}
 }
 
-// maintainOrphanBlobs：清理数据库中无任何引用的 blob 文件。
-// v9 竞态修复：无锁扫描只收集候选；真正删除前在 s.mu 内二次确认引用——
-// 否则「GC 判定无引用 → 上传去重复用同一 blob 并提交 HEAD → GC 删文件」
-// 会留下指向不存在 blob 的已确认 HEAD（下载 404，历史不可恢复）。
+// maintainOrphanBlobs：清理数据库中无任何引用的 blob 文件（v0.13.3 / §7.3）。
+//
+// 这里同时满足计划书 §7.3 的五条要求：
+//
+//  1. **与写入一致的锁**：删除动作在 s.mu 内进行，与 Upload 的元数据提交互斥；
+//  2. **删除前锁内最终确认无引用**：无锁扫描只收集候选，删除前重查一次；
+//  3. **不与 migration / scrub / backup 竞态**：这三者进行中时整轮 GC 直接跳过；
+//  4. **保留两轮确认**：候选要连续两轮被判定为无引用才真正删除，状态落盘，
+//     因此重启不会让计数清零，也不会因为一次瞬时误判就删文件；
+//  5. **隔离区独立清理**：Walk 跳过隔离区，那里由 PurgeQuarantine 按独立保留期处理。
+//
 // 1 小时门槛只用来避开「blob 已写入、事务未提交」的上传窗口，不构成正确性保证。
 func (s *Service) maintainOrphanBlobs() (int, error) {
+	// §7.3 第 3 条：迁移进行中绝不 GC。迁移会重写寻址与引用关系，
+	// 此时的「无引用」判断根本不可信
+	if busy, why := s.gcBlockedReason(); busy {
+		s.log.Info("gc: skipped", "reason", why)
+		return 0, nil
+	}
+
 	cutoff := time.Now().Add(-1 * time.Hour)
 	var candidates []string
 	err := s.blobs.Walk(func(hash string, info os.FileInfo) error {
@@ -275,8 +289,14 @@ func (s *Service) maintainOrphanBlobs() (int, error) {
 			return nil
 		}
 		ref, err := db.BlobReferenced(s.db, hash)
-		if err != nil || ref {
+		if err != nil {
 			return nil //nolint:nilerr
+		}
+		if ref {
+			// 重新被引用（去重命中、restore）→ 撤销候选状态，
+			// 否则它会带着旧轮次计数在将来某轮被误删
+			db.ClearGCCandidate(s.db, hash) //nolint:errcheck
+			return nil
 		}
 		candidates = append(candidates, hash)
 		return nil
@@ -285,15 +305,47 @@ func (s *Service) maintainOrphanBlobs() (int, error) {
 	removed := 0
 	for _, hash := range candidates {
 		s.mu.Lock()
+		// 锁内最终确认：扫描到现在这段时间里可能刚有一次去重命中
 		ref, rerr := db.BlobReferenced(s.db, hash)
-		if rerr == nil && !ref {
-			if s.blobs.Remove(hash) == nil {
-				removed++
+		if rerr != nil || ref {
+			if rerr == nil {
+				db.ClearGCCandidate(s.db, hash) //nolint:errcheck
 			}
+			s.mu.Unlock()
+			continue
+		}
+		rounds, merr := db.MarkGCCandidate(s.db, hash, time.Now().Unix())
+		if merr != nil || rounds < 2 {
+			s.mu.Unlock()
+			continue // 第一轮只入册，不删
+		}
+		if s.blobs.Remove(hash) == nil {
+			db.ClearGCCandidate(s.db, hash) //nolint:errcheck
+			removed++
 		}
 		s.mu.Unlock()
 	}
 	return removed, err
+}
+
+// gcBlockedReason 报告本轮是否必须跳过 GC（§7.3 第 3 条）。
+//
+// 这三种情况下「无引用」的判断都不可信或不安全：
+//   - 元数据迁移：寻址与引用关系正在被重写；
+//   - scrub：正在逐个校验内容，此时删文件会让 scrub 报出一堆假的 missing；
+//   - backup：备份读取的是某一时刻的快照，中途删文件会让备份自身不一致。
+func (s *Service) gcBlockedReason() (bool, string) {
+	if n := s.busyOps.Load(); n > 0 {
+		return true, "scrub-or-backup-running"
+	}
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return true, "repo-state-unavailable" // 读不到状态就别动数据
+	}
+	if rs.MetaState != db.MetaPlain && rs.MetaState != db.MetaEncrypted {
+		return true, "migration-in-progress"
+	}
+	return false, ""
 }
 
 // maintainShares：删除已过期分享的密文；清理 30 天前失效（撤销/过期）的元数据。

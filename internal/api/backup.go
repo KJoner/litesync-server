@@ -114,6 +114,10 @@ func (h *handlers) backupRun(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	go func() {
+		// §7.3：备份读的是某一时刻的全量视图，期间 GC 必须停手——
+		// 中途删掉的文件会让这份备份自身不一致，而这要等到真正需要
+		// 恢复的那天才会被发现
+		defer h.svc.BeginExclusiveRead()()
 		if _, err := m.Backup(context.Background(), "manual"); err != nil {
 			h.opts.Logger.Warn("manual backup failed", "error", err)
 		}

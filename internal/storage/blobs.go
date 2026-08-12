@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -136,40 +137,179 @@ func (b *BlobStore) IngestVerify(r io.Reader) (tmpPath, hashHex string, size int
 	return tmpPath, hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
-// Commit 把 IngestVerify 的临时文件原子改名为 blob；blob 已存在则丢弃临时文件（去重）。
-// v9：去重命中时校验现有 blob 的大小——若已被截断/损坏，用刚校验过 hash 的
-// 临时文件原子替换，而不是沿用坏文件继续服务下载。
-func (b *BlobStore) Commit(tmpPath, hash string) error {
+// CommitResult 描述一次 Commit 到底做了什么（v0.13.3 / 计划书 §7.1）。
+// 调用方据此记录完整性事件——「悄悄修好」和「本来就没坏」必须区分得开。
+type CommitResult struct {
+	// Deduped：命中了内容一致的现有 blob，临时文件已丢弃
+	Deduped bool
+	// Repaired：现有 blob 已损坏，被隔离后用本次校验过的副本替换
+	Repaired bool
+	// QuarantinePath：Repaired 时坏副本的存放位置（供人工取证）
+	QuarantinePath string
+	// Reason：Repaired 的判定依据（size-mismatch / hash-mismatch / unreadable）
+	Reason string
+}
+
+// Commit 把 IngestVerify 的临时文件原子改名为 blob（v0.13.3 / §7.1）。
+//
+// 去重命中时**不能**因为「同名且同大小」就丢弃这次正确的重传：
+//
+//  1. 先比大小（廉价，能抓到截断）；
+//  2. strict 模式再算一遍现有 blob 的完整 hash（抓位腐坏）；
+//  3. 判定损坏 → 把坏副本移进 quarantine（不是删除：那可能是取证的唯一线索）；
+//  4. 用刚刚校验过 hash 的临时文件原子替换；
+//  5. 返回 Repaired，调用方记完整性事件并重新检查所有引用。
+//
+// strict 模式对每次去重命中都要全量读一遍 blob，大文件上传会明显变慢；
+// 因此它由配置开关控制，而不是默认全开。
+func (b *BlobStore) Commit(tmpPath, hash string, strict bool) (CommitResult, error) {
+	var res CommitResult
 	p, err := b.path(hash)
 	if err != nil {
 		os.Remove(tmpPath)
-		return err
+		return res, err
 	}
 	if cur, err := os.Stat(p); err == nil {
 		tmpInfo, terr := os.Stat(tmpPath)
-		if terr == nil && cur.Size() == tmpInfo.Size() {
-			os.Remove(tmpPath)
-			return nil
+		switch {
+		case terr != nil:
+			// 连自己刚写的临时文件都读不到 → 别动现有 blob
+			return res, terr
+		case cur.Size() != tmpInfo.Size():
+			res.Reason = "size-mismatch"
+		case strict:
+			ok, verr := b.VerifyHash(hash)
+			if verr != nil {
+				res.Reason = "unreadable"
+			} else if !ok {
+				res.Reason = "hash-mismatch"
+			}
 		}
-		// 现有 blob 尺寸异常 → 落到下方 rename 覆盖修复
+		if res.Reason == "" {
+			os.Remove(tmpPath)
+			res.Deduped = true
+			return res, nil
+		}
+		// 现有 blob 有问题 → 先隔离再替换
+		if q, qerr := b.quarantine(hash); qerr == nil {
+			res.QuarantinePath = q
+		}
+		res.Repaired = true
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		os.Remove(tmpPath)
-		return err
+		return res, err
 	}
 	if err := os.Rename(tmpPath, p); err != nil {
 		// Windows 的 rename 不能覆盖已存在文件（损坏修复路径）：先移除再试一次
 		if os.Remove(p) == nil {
 			if err2 := os.Rename(tmpPath, p); err2 == nil {
 				syncDir(filepath.Dir(p))
-				return nil
+				return res, nil
 			}
 		}
 		os.Remove(tmpPath)
-		return err
+		return res, err
 	}
 	syncDir(filepath.Dir(p))
-	return nil
+	return res, nil
+}
+
+// QuarantineDir 是隔离区的目录名。它以 "_" 开头，因此 Walk 的
+// 「文件名必须是 64 位十六进制」规则天然不会把隔离副本当成正常 blob。
+const QuarantineDir = "_quarantine"
+
+// quarantine 把一个已判定损坏的 blob 移进隔离区，返回新位置。
+//
+// 为什么不直接删：损坏的字节往往是查清「谁写坏的、什么时候坏的」的唯一线索。
+// 隔离区有独立的清理策略（§7.3），不参与普通 GC。
+func (b *BlobStore) quarantine(hash string) (string, error) {
+	src, err := b.path(hash)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(b.root, QuarantineDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	// 同一个 hash 可能被隔离多次；用递增序号避免互相覆盖
+	for i := 0; ; i++ {
+		dst := filepath.Join(dir, hash)
+		if i > 0 {
+			dst = filepath.Join(dir, hash+"."+strconv.Itoa(i))
+		}
+		if _, err := os.Stat(dst); err == nil {
+			if i > 64 {
+				return "", errors.New("quarantine slots exhausted")
+			}
+			continue
+		}
+		if err := os.Rename(src, dst); err != nil {
+			return "", err
+		}
+		syncDir(dir)
+		return dst, nil
+	}
+}
+
+// QuarantineEntry 是隔离区里的一份坏副本。
+type QuarantineEntry struct {
+	Path    string
+	Hash    string
+	Size    int64
+	ModTime int64
+}
+
+// ListQuarantine 列出隔离区内容（运维接口与独立清理策略用）。
+func (b *BlobStore) ListQuarantine() ([]QuarantineEntry, error) {
+	dir := filepath.Join(b.root, QuarantineDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]QuarantineEntry, 0, len(ents))
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		name := e.Name()
+		hash := name
+		if i := strings.IndexByte(name, '.'); i > 0 {
+			hash = name[:i]
+		}
+		out = append(out, QuarantineEntry{
+			Path:    filepath.Join(dir, name),
+			Hash:    hash,
+			Size:    info.Size(),
+			ModTime: info.ModTime().Unix(),
+		})
+	}
+	return out, nil
+}
+
+// PurgeQuarantine 删除隔离区中早于 before 的副本，返回删除数量。
+func (b *BlobStore) PurgeQuarantine(before int64) (int, error) {
+	ents, err := b.ListQuarantine()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range ents {
+		if e.ModTime >= before {
+			continue
+		}
+		if err := os.Remove(e.Path); err == nil {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // Discard 丢弃临时文件。
@@ -180,10 +320,21 @@ func (b *BlobStore) Discard(tmpPath string) {
 }
 
 // Walk 遍历所有 blob（孤儿 GC 用），回调收到 hash 与文件信息。
+//
+// 隔离区被整个跳过（v0.13.3 / §7.3）：那里面的文件名与正常 blob 完全一样，
+// 不跳过的话孤儿 GC 会把取证材料当成普通 blob 处理——而隔离区按定义就是
+// 「有独立清理策略、不参与普通 GC」的地方。
 func (b *BlobStore) Walk(fn func(hash string, info os.FileInfo) error) error {
-	return filepath.WalkDir(b.root, func(_ string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	quarantine := filepath.Join(b.root, QuarantineDir)
+	return filepath.WalkDir(b.root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
 			return nil //nolint:nilerr // 尽力而为
+		}
+		if d.IsDir() {
+			if p == quarantine {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		name := d.Name()
 		if len(name) != 64 || strings.HasPrefix(name, tmpPrefix) {

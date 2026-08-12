@@ -1,6 +1,6 @@
 /** 公开分享查看页：/share.html#<id>.<keyB64url>
  *  Share Key 在 URL fragment 中，浏览器不会把 fragment 发给服务器。 */
-import { b64urlDecode, decryptShare, subtleAvailable } from "./crypto";
+import { b64urlDecode, decryptShare, subtleAvailable, unframeShareContent } from "./crypto";
 import { md } from "./markdown";
 
 const app = document.getElementById("app")!;
@@ -42,13 +42,18 @@ async function boot(): Promise<void> {
 			show(`<div class="brand">◈ LiteSync</div><p class="muted">解密失败：链接可能不完整或已被篡改。</p>`);
 			return;
 		}
-		const text = new TextDecoder().decode(plain);
+		// §7.4：显示名从密文帧里取——它和内容一样受 GCM 保护，
+		// 服务器既不知道也改不了
+		const framed = unframeShareContent(plain);
+		const text = new TextDecoder().decode(framed.content);
+		if (framed.name !== null) document.title = `${framed.name} — LiteSync`;
 		app.innerHTML = "";
 		const wrap = document.createElement("div");
 		wrap.className = "share-page";
 		const head = document.createElement("div");
 		head.className = "share-head";
-		head.innerHTML = `<span class="brand-small">◈ LiteSync</span><span class="muted small">端到端加密分享 · 本地解密</span>`;
+		const title = framed.name === null ? "" : `<span class="share-name">${esc(framed.name)}</span>`;
+		head.innerHTML = `<span class="brand-small">◈ LiteSync</span>${title}<span class="muted small">端到端加密分享 · 本地解密</span>`;
 		const body = document.createElement("div");
 		body.className = "markdown-body note-wrap";
 		body.innerHTML = md.render(text.replace(/(!?)\[\[([^\][\n]+?)\]\]/g, (_w, _b, inner: string) => esc(inner.split("|").pop() ?? "")));

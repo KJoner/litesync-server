@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}

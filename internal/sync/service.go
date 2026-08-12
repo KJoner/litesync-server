@@ -25,6 +25,7 @@ import (
 	"os"
 	"strings"
 	gosync "sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
@@ -67,6 +68,10 @@ var (
 	ErrRepoEpoch = errors.New("repo epoch mismatch")
 	// ErrKeyEpoch：客户端携带的 keyEpoch 与仓库不符（密钥世代已轮换）
 	ErrKeyEpoch = errors.New("key epoch mismatch")
+	// ErrCorrupted（v0.13.3 / §7.2）：该内容已被判定损坏并隔离，不再对外返回。
+	// 与 NotFound 分开是有意的：客户端必须能区分「服务器上没有」和
+	// 「服务器上有但坏了」——后者绝不能触发本地的删除跟随
+	ErrCorrupted = errors.New("content failed integrity verification and is quarantined")
 	// ErrMigrationNotOwner：非 owner 设备试图推进迁移
 	ErrMigrationNotOwner = errors.New("only the migration owner may perform this action")
 	// ErrLeaseActive：租约仍然有效，不允许接管
@@ -218,18 +223,31 @@ type Options struct {
 	// TombstoneRetentionDays（ADR-002 §3.4）：0 = 永久保留（默认）。
 	// 即使设置了期限，清理仍需「所有未撤销设备都已确认越过删除点」这第二个条件。
 	TombstoneRetentionDays int
+
+	// StrictBlobVerify（v0.13.3 / §7.1）：去重命中时全量重算现有 blob 的 hash。
+	// 能抓到位腐坏，但每次命中都要完整读一遍文件——大附件仓库上会明显变慢，
+	// 因此默认关闭，由管理员按存储介质的可靠性决定。
+	StrictBlobVerify bool
+
+	// QuarantineRetentionDays（§7.3）：隔离区独立清理策略。0 = 永久保留。
+	// 隔离区里的东西不参与普通 GC——它们是取证材料，不是垃圾。
+	QuarantineRetentionDays int
 }
 
 type Service struct {
 	// 单用户场景：互斥锁串行化元数据写；收流与哈希在锁外完成，
 	// 大文件慢速上传不再阻塞其他请求。
-	mu     gosync.Mutex
-	db     *sql.DB
-	store  *storage.Storage // 旧版 vault 文件目录（仅读取回退用）
-	blobs  *storage.BlobStore
-	shares *storage.ShareStore
-	opts   Options
-	log    *slog.Logger
+	mu gosync.Mutex
+	// busyOps（v0.13.3 / §7.3）：正在进行的 scrub / backup 数量。
+	// 大于 0 时整轮 GC 跳过——这两者都在读一份「某一时刻的全量视图」，
+	// 中途删文件会让它们得出错误结论（假的 missing、不一致的备份）。
+	busyOps atomic.Int32
+	db      *sql.DB
+	store   *storage.Storage // 旧版 vault 文件目录（仅读取回退用）
+	blobs   *storage.BlobStore
+	shares  *storage.ShareStore
+	opts    Options
+	log     *slog.Logger
 }
 
 func New(database *sql.DB, store *storage.Storage, blobs *storage.BlobStore, shares *storage.ShareStore, opts Options, logger *slog.Logger) *Service {
@@ -278,7 +296,7 @@ func isMarkdownPath(path string) bool {
 // retentionFor 返回该对象适用的（保留天数, 版本数上限）。
 //
 // meta-encrypted 态下服务器只看得到伪名，**无法**再按后缀判断 Markdown 还是附件
-//（v10 计划 §4.6）。按伪名猜测会把笔记误判为附件、把三方合并需要的 base version
+// （v10 计划 §4.6）。按伪名猜测会把笔记误判为附件、把三方合并需要的 base version
 // 提前裁掉。因此统一使用两种策略中**最长**的那一组，宁可多留。
 func (s *Service) retentionFor(metaState, pseudonym string) (days, maxPerFile int) {
 	if metaState == db.MetaEncrypted || metaState == db.MetaVerifying {
@@ -305,7 +323,7 @@ func maxInt(a, b int) int {
 // ClientContext 是每个写请求都必须携带的协议/世代上下文（计划书 §5.3）。
 //
 // 逐请求校验而不是「会话首轮查一次」：服务器可能在两次请求之间从备份恢复
-//（repoEpoch 变）、完成元数据迁移（formatEpoch 变）或轮换密钥（keyEpoch 变），
+// （repoEpoch 变）、完成元数据迁移（formatEpoch 变）或轮换密钥（keyEpoch 变），
 // 而客户端此刻仍拿着旧判断在写入。
 type ClientContext struct {
 	ProtocolVersion int64
@@ -518,11 +536,16 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	head.KeyEpoch = lse3KeyEpochOfFile(tmp)
 	head.UpdatedAt = now
 
-	// blob 原子入库（同时充当 HEAD 与历史内容，单份存储）
-	if err := s.blobs.Commit(tmp, actualHash); err != nil {
+	// blob 原子入库（同时充当 HEAD 与历史内容，单份存储）。
+	// §7.1：去重命中时校验现有副本；损坏则隔离旧副本、用这次校验过的内容替换
+	commitRes, err := s.blobs.Commit(tmp, actualHash, s.opts.StrictBlobVerify)
+	if err != nil {
 		return nil, err
 	}
 	committed = true
+	if commitRes.Repaired {
+		s.recordBlobRepairLocked(actualHash, commitRes)
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -882,6 +905,12 @@ func (s *Service) OpenFile(pseudonym string) (*db.ObjectHead, io.ReadCloser, err
 		}
 		return nil, nil, ErrNotFound
 	}
+	// §7.2：已知损坏的内容绝不再对外返回。客户端拿到明确的错误会重试或报警；
+	// 拿到损坏字节则会把它当成真实内容写进用户的 Vault
+	if !s.blobServable(cur.BlobID) {
+		s.log.Error("refusing to serve quarantined blob", "fileId", truncateID(cur.FileID), "blob", cur.BlobID)
+		return nil, nil, ErrCorrupted
+	}
 	f, err := s.blobs.Open(cur.BlobID)
 	if err != nil {
 		s.log.Error("content missing in blob store", "fileId", truncateID(cur.FileID))
@@ -921,6 +950,10 @@ func (s *Service) OpenVersion(pseudonym string, revision int64) (*db.ObjectVersi
 	}
 	if v == nil || v.BlobID == "" {
 		return nil, nil, ErrNotFound
+	}
+	if !s.blobServable(v.BlobID) {
+		s.log.Error("refusing to serve quarantined version blob", "blob", v.BlobID, "revision", revision)
+		return nil, nil, ErrCorrupted
 	}
 	f, err := s.blobs.Open(v.BlobID)
 	if err != nil {

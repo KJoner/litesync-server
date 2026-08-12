@@ -185,7 +185,7 @@ func TestBlobDedupRepairsCorruption(t *testing.T) {
 	if err != nil || gotHash != hash {
 		t.Fatalf("ingest: %v (%s)", err, gotHash)
 	}
-	if err := blobs.Commit(tmp, hash); err != nil {
+	if _, err := blobs.Commit(tmp, hash, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -200,12 +200,24 @@ func TestBlobDedupRepairsCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := blobs.Commit(tmp2, hash); err != nil {
+	res, err := blobs.Commit(tmp2, hash, false)
+	if err != nil {
 		t.Fatal(err)
 	}
 	fixed, err := os.ReadFile(p)
 	if err != nil || !bytes.Equal(fixed, content) {
 		t.Fatalf("blob not repaired: %d bytes (%v)", len(fixed), err)
+	}
+	// v0.13.3 §7.1：修复必须是「可见的」——调用方要能据此记完整性事件，
+	// 而坏副本要进隔离区而不是被悄悄删掉
+	if !res.Repaired || res.Reason != "size-mismatch" {
+		t.Fatalf("expected a reported repair, got %+v", res)
+	}
+	if res.QuarantinePath == "" {
+		t.Fatal("corrupt copy must be quarantined for forensics, not deleted")
+	}
+	if _, err := os.Stat(res.QuarantinePath); err != nil {
+		t.Fatalf("quarantined copy missing: %v", err)
 	}
 }
 

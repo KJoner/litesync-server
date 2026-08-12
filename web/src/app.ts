@@ -10,12 +10,14 @@ import {
 	BackupConfigView,
 	BackupStatus,
 	FileEntry,
+	IntegrityError,
 	login,
 	logout,
 	VersionEntry,
 } from "./api";
 import {
 	decryptFile,
+	lse3Header,
 	decryptMeta,
 	deriveMetaKeys,
 	FileKeyBinding,
@@ -43,6 +45,13 @@ interface State {
 	binding?: FileKeyBinding;
 	/** 元数据解密密钥（v9.3 三期，meta 模式；解锁时派生） */
 	metaKeys?: MetaKeys;
+	/**
+	 * 各对象已见过的最大 contentGeneration（v0.13.3 / 计划书 §7.5）。
+	 *
+	 * 只在本次会话内有效——查看器没有本地持久状态，做不到跨会话的抗回退。
+	 * 但会话内的回退（同一次浏览中服务器先给新版本再给旧版本）必须挡住。
+	 */
+	seenGeneration: Map<string, number>;
 }
 
 let S: State | null = null;
@@ -90,11 +99,54 @@ function isVisible(path: string): boolean {
 	return !path.split("/").some((seg) => seg.startsWith("."));
 }
 
-async function decodeContent(path: string, data: ArrayBuffer): Promise<ArrayBuffer> {
+/**
+ * 解密并校验一份下载下来的内容（v0.13.3 / 计划书 §7.5）。
+ *
+ * 光能解开不等于可信。查看器和插件一样要做三项检查：
+ *
+ *  1. **fileId 匹配**：服务器返回的身份必须是我们请求的那个对象；
+ *  2. **keyEpoch 校验**：信封里的密钥世代必须等于仓库当前世代；
+ *  3. **generation 防回退**：同一会话里不接受比已见过的更旧的版本。
+ *
+ * `expectFileId` 传 null 表示「用快照里记的当前身份」（普通浏览）；
+ * 历史版本必须传**版本级** fileId，否则删除重建过的旧版本会被误判。
+ */
+async function decodeContent(
+	path: string,
+	data: ArrayBuffer,
+	identity?: { fileId: string | null; generation?: number | null; historical?: boolean },
+): Promise<ArrayBuffer> {
 	if (!isEncryptedFile(data)) return data;
 	if (!S?.vmk) throw new Error("已加密内容需要先解锁");
-	// LSE3 需要 fileId（快照提供）；历史版本用当前文件身份（删除重建过的旧版本会失败并提示）
-	const dec = await decryptFile(S.vmk, path, data, S.binding, S.byPath.get(path)?.fileId);
+
+	const expected = S.byPath.get(path)?.fileId;
+	const served = identity?.fileId ?? undefined;
+	// §7.5 第 1 项：服务器换掉身份 = 用另一份内容冒充这个文件
+	if (!identity?.historical && expected && served && served !== expected) {
+		throw new Error("服务器返回的文件身份与预期不符，已拒绝显示（可能被篡改）");
+	}
+	const useFileId = served ?? expected;
+
+	const head = lse3Header(data);
+	if (head !== null) {
+		// §7.5 第 2 项：keyEpoch 必须与仓库当前世代一致。
+		// GCM 会认证这个字段，但「认证过的旧世代」仍然是旧世代——
+		// 密钥轮换之后还接受它，等于轮换白做
+		const repoEpoch = S.binding?.keyEpoch;
+		if (repoEpoch !== undefined && repoEpoch > 0 && head.keyEpoch !== repoEpoch) {
+			throw new Error(`内容的密钥世代（${head.keyEpoch}）与仓库当前世代（${repoEpoch}）不符，已拒绝显示`);
+		}
+		// §7.5 第 3 项：HEAD 不得回退（历史版本本来就是旧的，豁免）
+		if (!identity?.historical && useFileId) {
+			const seen = S.seenGeneration.get(useFileId);
+			if (seen !== undefined && head.generation < seen) {
+				throw new Error(`检测到内容回退（generation ${head.generation} < 已见 ${seen}），已拒绝显示`);
+			}
+			S.seenGeneration.set(useFileId, Math.max(seen ?? 0, head.generation));
+		}
+	}
+
+	const dec = await decryptFile(S.vmk, path, data, S.binding, useFileId);
 	if (dec === null) throw new Error("解密失败（密钥不匹配或数据损坏）");
 	return dec;
 }
@@ -124,7 +176,10 @@ async function boot(): Promise<void> {
 			info.vaultId && (info.keyEpoch ?? 0) > 0
 				? { vaultId: info.vaultId, keyEpoch: info.keyEpoch! }
 				: undefined;
-		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null, binding };
+		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null, binding, seenGeneration: new Map() };
+		// §7.5：仓库处于迁移中等非常态时，必须让用户看到——
+		// 此时看到的内容可能是不完整或过渡态的，静默展示等于误导
+		showRepoStateBanner(info.metaState);
 		if (vaultDoc?.enabled) {
 			if (!subtleAvailable()) {
 				renderMessage("此 Vault 已启用端到端加密，浏览器解密需要 HTTPS（或 localhost）访问。");
@@ -489,8 +544,8 @@ async function showNote(path: string): Promise<void> {
 	body.textContent = "加载中…";
 
 	try {
-		const raw = await S!.api.file(serverPathFor(path));
-		const data = await decodeContent(path, raw);
+		const dl = await S!.api.fileWithIdentity(serverPathFor(path));
+		const data = await decodeContent(path, dl.data, { fileId: dl.fileId, generation: dl.generation });
 		if (path.toLowerCase().endsWith(".md")) {
 			renderMarkdownInto(body, path, new TextDecoder().decode(data));
 			const items = buildOutline(body);
@@ -510,6 +565,13 @@ async function showNote(path: string): Promise<void> {
 		}
 		updateStatus();
 	} catch (e) {
+		if (e instanceof IntegrityError) {
+			// §7.5：完整性错误要和「加载失败」区分开——前者需要管理员从备份恢复，
+			// 后者用户刷新一下可能就好了。混为一谈会让真正的数据损坏被当成网络抖动
+			showIntegrityBanner(path);
+			body.textContent = "这份内容在服务器上未通过完整性校验，已停止提供。请联系管理员从备份恢复。";
+			return;
+		}
 		body.textContent = `加载失败：${e instanceof Error ? e.message : String(e)}`;
 	}
 }
@@ -540,7 +602,11 @@ function renderMarkdownInto(container: HTMLElement, path: string, src: string): 
 		img.removeAttribute("src");
 		void (async () => {
 			try {
-				const data = await decodeContent(finalTarget, await S!.api.file(serverPathFor(finalTarget)));
+				const dlLink = await S!.api.fileWithIdentity(serverPathFor(finalTarget));
+				const data = await decodeContent(finalTarget, dlLink.data, {
+					fileId: dlLink.fileId,
+					generation: dlLink.generation,
+				});
 				img.src = trackBlob(new Blob([data]));
 			} catch {
 				img.alt = `⚠ 无法加载 ${finalTarget}`;
@@ -624,7 +690,9 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	body.textContent = "加载中…";
 
 	try {
-		const data = await decodeContent(path, await S!.api.version(serverPathFor(path), v.revision));
+		// §7.5：历史版本用**版本级** fileId（删除重建过的旧版本属于旧对象）
+		const dlVer = await S!.api.versionWithIdentity(serverPathFor(path), v.revision);
+		const data = await decodeContent(path, dlVer.data, { fileId: dlVer.fileId, historical: true });
 		if (!path.toLowerCase().endsWith(".md")) {
 			body.innerHTML = "";
 			const a = el("a", "primary-link", "下载此版本") as HTMLAnchorElement;
@@ -658,7 +726,11 @@ async function showDiff(path: string, v: VersionEntry, oldText: string): Promise
 	box.textContent = "对比中…";
 
 	try {
-		const curData = await decodeContent(path, await S!.api.file(serverPathFor(path)));
+		const dlCur = await S!.api.fileWithIdentity(serverPathFor(path));
+		const curData = await decodeContent(path, dlCur.data, {
+			fileId: dlCur.fileId,
+			generation: dlCur.generation,
+		});
 		const curText = new TextDecoder().decode(curData);
 		const lines: DiffLine[] | null = diffLines(oldText, curText);
 		box.innerHTML = "";
@@ -1071,3 +1143,36 @@ function renderSnapshotsSection(box: HTMLElement, st: BackupStatus): void {
 }
 
 void boot();
+
+/**
+ * 仓库状态横幅（v0.13.3 / 计划书 §7.5）。
+ *
+ * migrating / verifying 期间仓库正在被重写：此刻看到的目录与内容都可能是过渡态。
+ * 不说明就展示，用户会以为「文件不见了」而去做一些更糟的补救动作。
+ *
+ * 注意这里显示的是**服务器自报**的状态，只用于提示，不用来改变任何安全判断
+ * （§7.5 最后一条：Web 不使用服务器未认证值更新安全状态）。
+ * 真正的安全判断在 decodeContent 里，靠 GCM 认证过的字段做。
+ */
+function showRepoStateBanner(metaState: string | undefined): void {
+	const existing = document.getElementById("repo-state-banner");
+	if (existing) existing.remove();
+	if (metaState !== "migrating" && metaState !== "verifying") return;
+	const bar = el("div", "repo-banner");
+	bar.id = "repo-state-banner";
+	bar.textContent =
+		metaState === "migrating"
+			? "仓库正在进行元数据迁移：此时看到的目录可能不完整，请稍后再查看。"
+			: "仓库正在做迁移后校验：内容只读可看，校验完成前请勿在其他设备上做大量改动。";
+	document.body.prepend(bar);
+}
+
+/**
+ * 完整性错误横幅（§7.5）：服务器明确告知内容损坏时展示。
+ * 与「文件不存在」区分开——后者用户会去回收站找，前者需要管理员处理。
+ */
+function showIntegrityBanner(what: string): void {
+	const bar = el("div", "repo-banner repo-banner-error");
+	bar.textContent = `服务器上的内容未通过完整性校验：${what}`;
+	document.body.prepend(bar);
+}

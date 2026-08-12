@@ -1,10 +1,11 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"time"
 
@@ -62,14 +63,20 @@ func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
 
 // createShare 保存分享密文（内容为客户端用独立 Share Key 加密的 opaque bytes）。
 // POST /api/v1/share
-// Header：X-Share-Name（percent-encoded，可选）、X-Share-Expires（unix 秒，0=永不过期）
+// Header：X-Share-Expires（unix 秒，0=永不过期）
+//
+// v0.13.3 §7.4：服务器**不再接受**客户端提供的显示名。
+//
+// 以前这里读 `X-Share-Name` 并原样入库，而客户端填的是真实路径——于是
+// 「用户分享了哪个文件」同时出现在访问日志、数据库和管理界面里，
+// 把元数据加密辛苦藏起来的东西又交了出去。
+//
+// 现在显示名随内容一起进密文帧（LSN1），服务器只保留一个随机标签用于运维。
+// 注意这里是「忽略」而不是「校验」：校验总有绕过的余地，不读就没有。
 func (h *handlers) createShare(w http.ResponseWriter, r *http.Request) {
-	name, err := url.PathUnescape(r.Header.Get("X-Share-Name"))
-	if err != nil || len(name) > 512 {
-		writeErr(w, http.StatusBadRequest, "invalid X-Share-Name")
-		return
-	}
+	name := randomShareLabel()
 	var expiresAt int64
+	var err error
 	if v := r.Header.Get("X-Share-Expires"); v != "" {
 		expiresAt, err = strconv.ParseInt(v, 10, 64)
 		if err != nil || expiresAt < 0 {
@@ -156,4 +163,16 @@ func (h *handlers) getShare(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.FormatInt(share.Size, 10))
 	w.Header().Set("Cache-Control", "no-store")
 	io.Copy(w, rc) //nolint:errcheck
+}
+
+// randomShareLabel 生成服务器侧的分享标签。
+//
+// 它只用于运维辨识（日志、管理列表），与用户的真实文件名毫无关系——
+// 这正是重点：服务器根本不该知道那个名字。
+func randomShareLabel() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "share"
+	}
+	return "share-" + hex.EncodeToString(b[:])
 }

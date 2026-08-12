@@ -475,9 +475,20 @@ footer {
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
+	gap: 12px;
 	border-bottom: 1px solid var(--border);
 	padding-bottom: 10px;
 	margin-bottom: 20px;
+}
+/* 分享的显示名（v0.13.3 §7.4：来自密文，服务器不知道它） */
+.share-name {
+	flex: 1;
+	min-width: 0;
+	text-align: center;
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 /* 响应式 */
@@ -628,4 +639,19 @@ footer {
 }
 .snapshot-row:last-child {
 	border-bottom: none;
+}
+
+/* 仓库状态横幅（v0.13.3 §7.5）：迁移中 / 完整性异常时必须显式告知用户 */
+.repo-banner {
+	position: sticky;
+	top: 0;
+	z-index: 50;
+	padding: 10px 16px;
+	background: #7a5b00;
+	color: #fff;
+	font-size: 13px;
+	text-align: center;
+}
+.repo-banner-error {
+	background: #8a1f1f;
 }

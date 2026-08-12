@@ -34,6 +34,14 @@ func main() {
 		}
 		return
 	}
+	// 运维子命令（v0.13.3 / §7.8）：backup / integrity / migration
+	if handled, err := runOps(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "obsync:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "obsync:", err)
 		os.Exit(1)
@@ -111,6 +119,9 @@ func run() error {
 		HistoryMaxBytes:       cfg.HistoryMaxBytes,
 		ChangesDays:           cfg.ChangesDays,
 		ChangesMax:            cfg.ChangesMax,
+		// v0.13.3 §7.1 / §7.3
+		StrictBlobVerify:        cfg.StrictBlobVerify,
+		QuarantineRetentionDays: cfg.QuarantineRetentionDays,
 	}, logger)
 
 	// v5 → v6 数据迁移（ADR-001 §5 / ADR-003 §5）。
@@ -161,11 +172,23 @@ func run() error {
 		TrustedProxies: cfg.TrustedProxies,
 	}, svc)
 
+	// HTTP 超时与限额（v0.13.3 / 计划书 §7.6）。
+	//
+	// 取值上的权衡：ReadTimeout / WriteTimeout 必须覆盖「慢速链路上传大附件」
+	// 这种正常场景，否则同步会在弱网下莫名其妙地失败；但又不能不设，
+	// 否则一个半开连接可以无限期占着 goroutine 与文件句柄。
+	// 因此给一个宽松但有限的值（默认 30 分钟），并允许管理员按自己的网络调整。
 	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           handler,
+		Addr:    cfg.Listen,
+		Handler: handler,
+		// 请求头必须很快读完——慢速发送 Header 是最典型的耗尽攻击
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       120 * time.Second,
+		// Header 总长度上限：默认 1 MiB 对一个只用少量自定义 Header 的协议
+		// 来说远远够用，同时挡住「几万个 Header」这类请求
+		MaxHeaderBytes: 64 << 10,
 	}
 
 	errCh := make(chan error, 1)

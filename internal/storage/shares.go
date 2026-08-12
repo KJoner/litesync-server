@@ -78,6 +78,16 @@ func (s *ShareStore) Put(id string, r io.Reader) (int64, error) {
 	return size, nil
 }
 
+// Has 报告分享内容是否存在（完整性 scrub 用，§7.2）。
+func (s *ShareStore) Has(id string) bool {
+	p, err := s.path(id)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
+}
+
 func (s *ShareStore) Open(id string) (*os.File, error) {
 	p, err := s.path(id)
 	if err != nil {

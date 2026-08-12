@@ -276,6 +276,11 @@ func (h *handlers) getFile(w http.ResponseWriter, r *http.Request) {
 	meta, rc, err := h.svc.OpenFile(path)
 	if err != nil {
 		switch {
+		case errors.Is(err, syncsvc.ErrCorrupted):
+			// §7.2：宁可明确报错，也不返回可疑字节。
+			// 503 而不是 404——这是服务器侧的问题，内容并没有被删除
+			writeCoded(w, http.StatusServiceUnavailable, CodeCorrupted,
+				"content failed integrity verification", false)
 		case errors.Is(err, syncsvc.ErrNotFound):
 			if meta != nil {
 				// 告知客户端该对象已被删除、tombstone revision 与身份，
