@@ -171,8 +171,17 @@ type CommitResult struct {
 // strict 模式对每次去重命中都要全量读一遍 blob，大文件上传会明显变慢；
 // 因此它由配置开关控制，而不是默认全开。
 func (b *BlobStore) Commit(tmpPath, hash string, strict bool) (CommitResult, error) {
+	return b.CommitAs(tmpPath, hash, hash, strict)
+}
+
+// CommitAs 把临时文件落库到 blobID 这个名字下，用 contentHash 做完整性校验。
+//
+// v0.16.0 起两者不再相同：blobID = HMAC(vaultSecret, contentHash)（§10.3），
+// 因此「文件叫什么」和「内容应该哈希成什么」必须分开传——
+// 用文件名当期望哈希的老写法在域化之后会把每个 blob 都判成损坏。
+func (b *BlobStore) CommitAs(tmpPath, blobID, contentHash string, strict bool) (CommitResult, error) {
 	var res CommitResult
-	p, err := b.path(hash)
+	p, err := b.path(blobID)
 	if err != nil {
 		os.Remove(tmpPath)
 		return res, err
@@ -186,7 +195,7 @@ func (b *BlobStore) Commit(tmpPath, hash string, strict bool) (CommitResult, err
 		case cur.Size() != tmpInfo.Size():
 			res.Reason = "size-mismatch"
 		case strict:
-			ok, verr := b.VerifyHash(hash)
+			ok, verr := b.VerifyContent(blobID, contentHash)
 			if verr != nil {
 				res.Reason = "unreadable"
 			} else if !ok {
@@ -199,7 +208,7 @@ func (b *BlobStore) Commit(tmpPath, hash string, strict bool) (CommitResult, err
 			return res, nil
 		}
 		// 现有 blob 有问题 → 先隔离再替换
-		if q, qerr := b.quarantine(hash); qerr == nil {
+		if q, qerr := b.quarantine(blobID); qerr == nil {
 			res.QuarantinePath = q
 		}
 		res.Repaired = true
@@ -382,9 +391,18 @@ func (b *BlobStore) StatSize(hash string) (int64, bool) {
 	return info.Size(), true
 }
 
-// VerifyHash 全量读取 blob 并校验内容 SHA-256 与文件名一致（scrub 用）。
+// VerifyHash 全量读取 blob 并校验内容 SHA-256 与文件名一致。
+// 仅适用于未域化的 blob（blobID == contentHash）；scrub 请用 VerifyContent。
 func (b *BlobStore) VerifyHash(hash string) (bool, error) {
-	f, err := b.Open(hash)
+	return b.VerifyContent(hash, hash)
+}
+
+// VerifyContent 全量读取 blobID 指向的文件，校验其内容哈希等于 contentHash（scrub 用）。
+//
+// 域化之后文件名不再是内容哈希，期望值必须由调用方从数据库带过来——
+// 否则「校验」就退化成拿文件名和文件名比，永远为真。
+func (b *BlobStore) VerifyContent(blobID, contentHash string) (bool, error) {
+	f, err := b.Open(blobID)
 	if err != nil {
 		return false, err
 	}
@@ -393,7 +411,7 @@ func (b *BlobStore) VerifyHash(hash string) (bool, error) {
 	if _, err := io.Copy(h, f); err != nil {
 		return false, err
 	}
-	return hex.EncodeToString(h.Sum(nil)) == hash, nil
+	return hex.EncodeToString(h.Sum(nil)) == contentHash, nil
 }
 
 func (b *BlobStore) Open(hash string) (*os.File, error) {

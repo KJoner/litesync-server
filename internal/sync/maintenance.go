@@ -149,7 +149,7 @@ func (s *Service) maintainIntegrity() (int, error) {
 			continue
 		}
 		h := &heads[i]
-		ok, err := s.blobs.VerifyHash(h.BlobID)
+		ok, err := s.blobs.VerifyContent(h.BlobID, h.ContentHash)
 		if err != nil {
 			continue // 存在性问题已在上面报告
 		}

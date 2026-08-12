@@ -201,7 +201,11 @@ func TestScrubMarksCorruptBlobUnservable(t *testing.T) {
 
 	// 制造磁盘损坏
 	h := sha256HexT(content)
-	blobPath := filepath.Join(blobDir, h[:2], h)
+	blobID, err := s.BlobIDOf(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobPath := filepath.Join(blobDir, blobID[:2], blobID)
 	if err := os.WriteFile(blobPath, []byte("corrupted"), 0o600); err != nil {
 		t.Fatal(err)
 	}

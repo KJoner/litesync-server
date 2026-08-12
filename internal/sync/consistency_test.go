@@ -299,7 +299,11 @@ func TestIntegrityScrubDetectsCorruption(t *testing.T) {
 
 	// 截断 bad.md 的 blob（尺寸不符必被检出，不依赖抽样）
 	hash := sha256HexT(bad)
-	p := filepath.Join(dir, "blobs", hash[:2], hash)
+	blobID, err := s.BlobIDOf(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "blobs", blobID[:2], blobID)
 	if err := os.WriteFile(p, bad[:4], 0o600); err != nil {
 		t.Fatal(err)
 	}

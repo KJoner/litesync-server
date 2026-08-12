@@ -223,3 +223,132 @@ func repoRoot(t *testing.T) string {
 	}
 	return root
 }
+
+// blobID 域分隔的可执行约束（v0.16.0 / §10.3、ADR-010 §4）。
+//
+// 域化把「同一份内容在别的 Vault 里叫什么」变成一个只有服务端算得出的值。
+// 只要有一条路径能让请求方问出这个值，或者拿到 vaultSecret，
+// 被关掉的那个跨租户存在性预言机就原样回来了。
+
+// TestVaultSecretNeverLeavesTheServer 禁止 vaultSecret 流向 HTTP 层。
+//
+// 判据要精确：仓库里还有别的 "secret"（一次性注册凭据、S3 的 secretAccessKey），
+// 它们与本条无关。真正要盯的是 db.Vault.Secret 这一个字段——
+// 拿到它就能自行算出该 Vault 里任意内容的 blobID。
+func TestVaultSecretNeverLeavesTheServer(t *testing.T) {
+	root := repoRoot(t)
+
+	// 1) Vault 不是线格式类型：带上 json tag 就意味着有人打算把它整个发出去
+	def, err := os.ReadFile(filepath.Join(root, "internal", "db", "tenancy.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultDef := regexp.MustCompile(`(?s)type Vault struct \{.*?\n\}`).Find(def)
+	if vaultDef == nil {
+		t.Fatal("找不到 db.Vault 定义")
+	}
+	if regexp.MustCompile("`json:").Match(vaultDef) {
+		t.Fatal("db.Vault 带上了 json tag —— 它是服务端内部类型，不得被序列化发出")
+	}
+
+	// 2) HTTP 层不得触碰 secret：取 Vault、生成 secret 都不该在那里发生
+	reachRe := regexp.MustCompile(`db\.GetVault\(|db\.EnsureVaultSecret\(|vaultSecret`)
+	var offenders []string
+	err = filepath.Walk(filepath.Join(root, "internal", "api"),
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+				return nil //nolint:nilerr
+			}
+			if strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return nil //nolint:nilerr
+			}
+			if reachRe.Match(data) {
+				rel, _ := filepath.Rel(root, path)
+				offenders = append(offenders, rel)
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offenders) > 0 {
+		t.Fatalf("HTTP 层触碰了 vaultSecret：%v —— "+
+			"泄露它等于让攻击者能自行算出别的 Vault 的 blobID", offenders)
+	}
+}
+
+// TestBlobIDLookupIsNotReachableFromHTTP 禁止把「内容哈希 → blobID」接到处理器上。
+//
+// BlobIDOf 是给运维工具和测试用的。一旦它出现在 internal/api 里，
+// 请求方就能拿任意内容去问「这个 Vault 里有没有」——正是 §10.3 要消灭的能力。
+func TestBlobIDLookupIsNotReachableFromHTTP(t *testing.T) {
+	root := repoRoot(t)
+	apiDir := filepath.Join(root, "internal", "api")
+	callRe := regexp.MustCompile(`\.BlobIDOf\(|storage\.BlobIDFor\(`)
+
+	var offenders []string
+	err := filepath.Walk(apiDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil //nolint:nilerr
+		}
+		if strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil //nolint:nilerr
+		}
+		if callRe.Match(data) {
+			rel, _ := filepath.Rel(root, path)
+			offenders = append(offenders, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offenders) > 0 {
+		t.Fatalf("HTTP 层出现了 blobID 查询：%v —— "+
+			"这会让请求方能探测「本 Vault 是否已有某份内容」，存在性预言机就回来了", offenders)
+	}
+}
+
+// TestBlobStorageIDIsAlwaysDomainSeparated 禁止业务代码再拿裸 contentHash 当存储 id。
+func TestBlobStorageIDIsAlwaysDomainSeparated(t *testing.T) {
+	root := repoRoot(t)
+	// 老写法：Commit(tmp, hash, ...) 用同一个值既当文件名又当期望哈希
+	legacyRe := regexp.MustCompile(`blobs\.Commit\(|\.VerifyHash\(`)
+
+	var offenders []string
+	for _, pkg := range []string{"internal/sync", "internal/api"} {
+		err := filepath.Walk(filepath.Join(root, filepath.FromSlash(pkg)),
+			func(path string, info os.FileInfo, err error) error {
+				if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+					return nil //nolint:nilerr
+				}
+				if strings.HasSuffix(path, "_test.go") {
+					return nil
+				}
+				data, rerr := os.ReadFile(path)
+				if rerr != nil {
+					return nil //nolint:nilerr
+				}
+				if legacyRe.Match(data) {
+					rel, _ := filepath.Rel(root, path)
+					offenders = append(offenders, rel)
+				}
+				return nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(offenders) > 0 {
+		t.Fatalf("仍在用「文件名即内容哈希」的老接口：%v —— "+
+			"请改用 CommitAs / VerifyContent，把存储 id 与期望哈希分开传", offenders)
+	}
+}

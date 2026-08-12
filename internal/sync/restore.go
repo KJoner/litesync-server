@@ -136,6 +136,13 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 	now := time.Now().Unix()
 	newRevision := tomb.DeletionRevision + 1
 
+	// 域化 blobID 必须在事务外算：vaultSecret 的惰性加载会读数据库，
+	// 单连接下在事务里读会死锁
+	priorBlobID, err := s.blobIDOf(tomb.PriorContentHash)
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -148,7 +155,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		FileID:            p.FileID,
 		Revision:          newRevision,
 		ContentGeneration: p.ContentGeneration,
-		BlobID:            tomb.PriorContentHash,
+		BlobID:            priorBlobID,
 		ContentHash:       tomb.PriorContentHash,
 		Size:              0,
 		Mtime:             now * 1000,
@@ -157,7 +164,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		EncryptedMetadata: p.MetaEnc,
 		CanonicalPathHmac: canonicalKey,
 		KeyEpoch:          tomb.KeyEpoch,
-		EnvelopeVersion:   s.envelopeVersionOfBlob(tomb.PriorContentHash),
+		EnvelopeVersion:   s.envelopeVersionOfBlob(priorBlobID),
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}

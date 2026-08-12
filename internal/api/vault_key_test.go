@@ -152,7 +152,7 @@ func TestHistoryPurge(t *testing.T) {
 		t.Fatal("HEAD must be unaffected by purge")
 	}
 	// 明文 blob 已被 GC
-	if _, err := os.Stat(blobPath(e.blobDir, sha256Hex(v1))); !os.IsNotExist(err) {
+	if _, err := os.Stat(e.blobPath(t, sha256Hex(v1))); !os.IsNotExist(err) {
 		t.Fatal("plaintext blob v1 must be garbage collected")
 	}
 

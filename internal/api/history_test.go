@@ -33,8 +33,18 @@ func (e *testEnv) version(t *testing.T, path string, revision int64) (*http.Resp
 	return resp, raw
 }
 
-func blobPath(dir, hash string) string {
-	return filepath.Join(dir, hash[:2], hash)
+// blobPath 返回某份内容在磁盘上的实际位置。
+//
+// v0.16.0 起存储 id 是 HMAC(vaultSecret, contentHash)（§10.3），
+// 不能再拿内容哈希直接拼路径——测试必须和服务端算出同一个 id，
+// 否则「blob 在不在」这类断言会永远为假。
+func (e *testEnv) blobPath(t *testing.T, contentHash string) string {
+	t.Helper()
+	id, err := e.svc.BlobIDOf(contentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(e.blobDir, id[:2], id)
 }
 
 // 每次上传/删除都应产生不可变版本；旧版本内容可按 revision 取回。
@@ -153,10 +163,11 @@ func TestBlobDedup(t *testing.T) {
 	e.upload(t, "one.md", 0, content)
 	e.upload(t, "two.md", 0, content)
 
-	if _, err := os.Stat(blobPath(e.blobDir, hash)); err != nil {
+	p := e.blobPath(t, hash)
+	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("blob missing: %v", err)
 	}
-	entries, _ := os.ReadDir(filepath.Join(e.blobDir, hash[:2]))
+	entries, _ := os.ReadDir(filepath.Dir(p))
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 blob, got %d", len(entries))
 	}
@@ -192,7 +203,7 @@ func TestHistoryRetention(t *testing.T) {
 		t.Fatalf("pruned version = %d, want 404", resp.StatusCode)
 	}
 	// c1 blob 仍被 keeper.md 引用 → 保留；c2/c3 blob 仍被引用 → 保留
-	if _, err := os.Stat(blobPath(e.blobDir, sha256Hex(c1))); err != nil {
+	if _, err := os.Stat(e.blobPath(t, sha256Hex(c1))); err != nil {
 		t.Fatal("shared blob must survive pruning")
 	}
 
@@ -200,7 +211,7 @@ func TestHistoryRetention(t *testing.T) {
 	e.upload(t, "keeper.md", 1, []byte("k2"))
 	e.upload(t, "keeper.md", 2, []byte("k3"))
 	e.upload(t, "keeper.md", 3, []byte("k4"))
-	if _, err := os.Stat(blobPath(e.blobDir, sha256Hex(c1))); !os.IsNotExist(err) {
+	if _, err := os.Stat(e.blobPath(t, sha256Hex(c1))); !os.IsNotExist(err) {
 		t.Fatal("unreferenced blob must be garbage collected")
 	}
 }
@@ -220,7 +231,7 @@ func TestHistoryDisabled(t *testing.T) {
 		t.Fatal("version must 404 when disabled")
 	}
 	// HEAD blob 存在（唯一内容存储），且下载正常
-	if _, err := os.Stat(blobPath(e.blobDir, sha256Hex(content))); err != nil {
+	if _, err := os.Stat(e.blobPath(t, sha256Hex(content))); err != nil {
 		t.Fatal("HEAD blob must exist (single storage)")
 	}
 	dresp, data := e.download(t, "n.md")

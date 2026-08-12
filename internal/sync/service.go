@@ -249,6 +249,42 @@ type Service struct {
 	shares  *storage.ShareStore
 	opts    Options
 	log     *slog.Logger
+	// blobID 域分隔密钥（§10.3）。只加载一次并缓存：换掉它会让去重失效。
+	secretOnce gosync.Once
+	secret     []byte
+	secretErr  error
+}
+
+// vaultSecret 惰性加载本 Vault 的 blobID 域分隔密钥。
+//
+// 注意：它会读/写数据库，因此**不能在事务里调用**（单连接下会死锁）。
+// 正常路径上 InitVaultSecret 已经在启动时把它填好了。
+func (s *Service) vaultSecret() ([]byte, error) {
+	s.secretOnce.Do(func() {
+		s.secret, s.secretErr = db.EnsureVaultSecret(s.db, s.scope(), db.DefaultVaultID)
+	})
+	return s.secret, s.secretErr
+}
+
+// InitVaultSecret 在启动时预热密钥，让请求路径上永远走不到惰性加载。
+func (s *Service) InitVaultSecret() error {
+	_, err := s.vaultSecret()
+	return err
+}
+
+// blobIDOf 把内容哈希映射成本 Vault 的存储 id（§10.3）。
+//
+// 空哈希返回空——「没有内容」和「内容的 id」是两回事，
+// 对空串做 HMAC 会得到一个指向不存在文件的合法 id。
+func (s *Service) blobIDOf(contentHash string) (string, error) {
+	if contentHash == "" {
+		return "", nil
+	}
+	secret, err := s.vaultSecret()
+	if err != nil {
+		return "", err
+	}
+	return storage.BlobIDFor(secret, contentHash), nil
 }
 
 func New(database *sql.DB, store *storage.Storage, blobs *storage.BlobStore, shares *storage.ShareStore, opts Options, logger *slog.Logger) *Service {
@@ -524,7 +560,11 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	} else if hasGen {
 		head.ContentGeneration = newGen
 	}
-	head.BlobID = actualHash
+	blobID, err := s.blobIDOf(actualHash)
+	if err != nil {
+		return nil, err
+	}
+	head.BlobID = blobID
 	head.ContentHash = actualHash
 	head.Size = size
 	head.Mtime = p.Mtime
@@ -539,13 +579,13 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 
 	// blob 原子入库（同时充当 HEAD 与历史内容，单份存储）。
 	// §7.1：去重命中时校验现有副本；损坏则隔离旧副本、用这次校验过的内容替换
-	commitRes, err := s.blobs.Commit(tmp, actualHash, s.opts.StrictBlobVerify)
+	commitRes, err := s.blobs.CommitAs(tmp, blobID, actualHash, s.opts.StrictBlobVerify)
 	if err != nil {
 		return nil, err
 	}
 	committed = true
 	if commitRes.Repaired {
-		s.recordBlobRepairLocked(actualHash, commitRes)
+		s.recordBlobRepairLocked(blobID, commitRes)
 	}
 
 	tx, err := s.db.Begin()
@@ -573,7 +613,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	if s.opts.HistoryEnabled {
 		if err := db.InsertVersion(tx, &db.ObjectVersion{
 			FileID: head.FileID, Revision: head.Revision, ContentGeneration: head.ContentGeneration,
-			BlobID: actualHash, ContentHash: actualHash, Size: size, Mtime: head.Mtime,
+			BlobID: blobID, ContentHash: actualHash, Size: size, Mtime: head.Mtime,
 			Action: action, DeviceID: p.DeviceID, KeyEpoch: head.KeyEpoch,
 			OperationID: p.Client.OperationID, CreatedAt: now,
 		}); err != nil {

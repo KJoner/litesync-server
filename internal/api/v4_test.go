@@ -226,7 +226,7 @@ func TestMaintenanceOrphanBlobsAndShares(t *testing.T) {
 	// 被引用的 blob 不能删
 	content := []byte("kept content")
 	e.upload(t, "keep.md", 0, content)
-	keptPath := blobPath(e.blobDir, sha256Hex(content))
+	keptPath := e.blobPath(t, sha256Hex(content))
 	os.Chtimes(keptPath, old, old)
 
 	// 过期分享（已过期但没人访问过）→ 密文被清

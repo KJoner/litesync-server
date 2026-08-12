@@ -128,6 +128,9 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 		hash string
 		size int64
 		kind string
+		// contentHash 是期望值。域化之后文件名不再是内容哈希，
+		// 校验必须拿数据库里记的这个值来比（§10.3）
+		contentHash string
 	}
 	seen := map[string]bool{}
 	var refs []ref
@@ -142,7 +145,7 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 			continue
 		}
 		seen[h.BlobID] = true
-		refs = append(refs, ref{h.BlobID, h.Size, "head"})
+		refs = append(refs, ref{h.BlobID, h.Size, "head", h.ContentHash})
 		rep.HeadsChecked++
 	}
 
@@ -161,7 +164,7 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 				continue
 			}
 			seen[v.BlobID] = true
-			refs = append(refs, ref{v.BlobID, v.Size, "version"})
+			refs = append(refs, ref{v.BlobID, v.Size, "version", v.ContentHash})
 			rep.VersionsChecked++
 		}
 	}
@@ -185,7 +188,7 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 		if !full {
 			continue
 		}
-		okHash, verr := s.blobs.VerifyHash(r.hash)
+		okHash, verr := s.blobs.VerifyContent(r.hash, r.contentHash)
 		if verr != nil {
 			rep.Issues++
 			rep.Unservable++

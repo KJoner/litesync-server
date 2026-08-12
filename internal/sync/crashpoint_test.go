@@ -166,7 +166,7 @@ func TestServerCrashAfterCommitBeforeResponse(t *testing.T) {
 func TestServerCrashBetweenGCDecisionAndDelete(t *testing.T) {
 	defer failpoint.Reset()
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
-	_, orphanPath := plantOrphan(t, blobDir, []byte("orphan for gc crash test"))
+	_, orphanPath := plantOrphan(t, s, blobDir, []byte("orphan for gc crash test"))
 
 	s.RunMaintenance() // 第一轮：入册
 	cancel := failpoint.EnableError(failpoint.GCBeforeDelete, -1)

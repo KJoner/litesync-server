@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS migration_journal (
     migration_id TEXT NOT NULL,
     vault_id TEXT NOT NULL DEFAULT 'default',
     file_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('object','tombstone','version')),
+    kind TEXT NOT NULL CHECK (kind IN ('object','tombstone','version','blob')),
     source_format TEXT NOT NULL DEFAULT '',
     target_format TEXT NOT NULL DEFAULT '',
     stage TEXT NOT NULL DEFAULT 'pending'

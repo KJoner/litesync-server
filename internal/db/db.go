@@ -54,6 +54,10 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		d.Close()
 		return nil, fmt.Errorf("migrate columns: %w", err)
 	}
+	if err := migrateJournalKindCheck(d); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("migrate journal kind: %w", err)
+	}
 	if err := initRepoState(d); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init repo state: %w", err)

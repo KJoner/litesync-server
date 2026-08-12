@@ -221,7 +221,7 @@ func TestUploadDownloadFlow(t *testing.T) {
 	}
 
 	// v4 单份存储：内容落在 blob store（vault 目录不再保存 HEAD 物理文件）
-	if _, err := os.Stat(filepath.Join(e.blobDir, sha256Hex(content)[:2], sha256Hex(content))); err != nil {
+	if _, err := os.Stat(e.blobPath(t, sha256Hex(content))); err != nil {
 		t.Fatalf("blob not on disk: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(e.vaultDir, "Notes", "hello.md")); !os.IsNotExist(err) {

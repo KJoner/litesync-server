@@ -145,6 +145,21 @@ func run() error {
 				"missingBlobs", report.MissingBlobs)
 		}
 	}
+	// blobID 域分隔密钥（v0.16.0 / §10.3）：首次启动生成并落库，之后固定不变。
+	// 必须在开始服务之前就绪——上传路径要用它算存储 id。
+	if err := svc.InitVaultSecret(); err != nil {
+		return fmt.Errorf("init vault secret: %w", err)
+	}
+	// 存量数据的域化迁移是**告警**而不是硬门槛：混合状态读写都正确
+	// （每一行的 blob_id 自带「文件在哪」），只是老数据上还存在跨租户
+	// 存在性预言机。拒绝启动只会逼运维在没备份的情况下跑一个不可逆迁移。
+	if need, err := svc.NeedsBlobIDMigration(); err != nil {
+		logger.Warn("check blobid migration failed", "error", err)
+	} else if need {
+		logger.Warn("存量 blob 仍使用裸 contentHash 命名：跨租户存在性隔离（§10.3）对老数据尚未生效。" +
+			"先 `obsync backup create`，再 `obsync blobid migrate --confirm`")
+	}
+
 	// 资源治理：启动执行一次，之后每 N 小时一次
 	svc.RunMaintenance()
 	if cfg.MaintenanceHours > 0 {

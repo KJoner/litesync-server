@@ -17,14 +17,23 @@ import (
 // HEAD 或历史版本永久不可读，而用户直到打开那个文件的那天才会发现。
 
 // 造一个够老的孤儿 blob（磁盘上有、DB 无引用）。
-func plantOrphan(t *testing.T, blobDir string, content []byte) (hash, path string) {
+// plantOrphan 在磁盘上放一个无引用的 blob。
+//
+// 位置必须用服务端算出的域化 id（§10.3）：种在裸 contentHash 上的话，
+// 后续那次「同内容上传」会落到另一个名字，本测试要验证的
+// 「候选被重新引用后必须撤销」就根本触发不到。
+func plantOrphan(t *testing.T, s *syncsvc.Service, blobDir string, content []byte) (hash, path string) {
 	t.Helper()
 	hash = sha256HexT(content)
-	dir := filepath.Join(blobDir, hash[:2])
+	id, err := s.BlobIDOf(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(blobDir, id[:2])
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path = filepath.Join(dir, hash)
+	path = filepath.Join(dir, id)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +47,7 @@ func plantOrphan(t *testing.T, blobDir string, content []byte) (hash, path strin
 // 第一轮只入册、第二轮才删——而且候选状态是落盘的，重启不会清零。
 func TestGCRequiresTwoRounds(t *testing.T) {
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
-	_, orphanPath := plantOrphan(t, blobDir, []byte("orphan for two-round test"))
+	_, orphanPath := plantOrphan(t, s, blobDir, []byte("orphan for two-round test"))
 
 	s.RunMaintenance()
 	if _, err := os.Stat(orphanPath); err != nil {
@@ -54,7 +63,7 @@ func TestGCRequiresTwoRounds(t *testing.T) {
 func TestGCCandidateClearedWhenReferencedAgain(t *testing.T) {
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
 	content := []byte("content that comes back")
-	hash, orphanPath := plantOrphan(t, blobDir, content)
+	hash, orphanPath := plantOrphan(t, s, blobDir, content)
 
 	// 第一轮：入册为候选
 	s.RunMaintenance()
@@ -89,7 +98,7 @@ func TestGCCandidateClearedWhenReferencedAgain(t *testing.T) {
 // scrub / backup 进行中：整轮 GC 跳过。
 func TestGCSkippedWhileExclusiveReadInProgress(t *testing.T) {
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
-	_, orphanPath := plantOrphan(t, blobDir, []byte("orphan during backup"))
+	_, orphanPath := plantOrphan(t, s, blobDir, []byte("orphan during backup"))
 
 	release := s.BeginExclusiveRead()
 	s.RunMaintenance()
@@ -110,7 +119,7 @@ func TestGCSkippedWhileExclusiveReadInProgress(t *testing.T) {
 // 元数据迁移进行中：整轮 GC 跳过（寻址与引用关系正在被重写）。
 func TestGCSkippedDuringMigration(t *testing.T) {
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
-	_, orphanPath := plantOrphan(t, blobDir, []byte("orphan during migration"))
+	_, orphanPath := plantOrphan(t, s, blobDir, []byte("orphan during migration"))
 
 	if _, err := s.DB().Exec(`UPDATE repo_state SET meta_state = ?`, db.MetaMigrating); err != nil {
 		t.Fatal(err)
