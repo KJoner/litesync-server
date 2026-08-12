@@ -55,6 +55,11 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("PUT /api/v1/vault-key", h.putVaultKey)
 	mux.HandleFunc("GET /api/v1/snapshot", h.snapshot)
 
+	// 多租户治理（v0.16 / §10.4、§10.5）
+	mux.HandleFunc("POST /api/v1/token", h.issueAccessToken)
+	mux.HandleFunc("DELETE /api/v1/members/{userId}", h.removeMember)
+	mux.HandleFunc("GET /api/v1/audit", h.auditTrail)
+
 	// E2EE 状态机（v9）：迁移期间冻结明文写，完成时验证全部 HEAD 均为密文
 	mux.HandleFunc("POST /api/v1/e2ee/begin", h.e2eeBegin)
 	mux.HandleFunc("POST /api/v1/e2ee/complete", h.e2eeComplete)

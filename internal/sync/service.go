@@ -253,6 +253,11 @@ type Service struct {
 	secretOnce gosync.Once
 	secret     []byte
 	secretErr  error
+	// access token 的签名密钥（§10.5）。与上面的 blobID 密钥刻意分开：
+	// 共用一把会让「轮换签名密钥」这种日常运维动作顺带把所有 blob 的名字算错。
+	tokenSecretOnce gosync.Once
+	tokenSecret     []byte
+	tokenSecretErr  error
 }
 
 // vaultSecret 惰性加载本 Vault 的 blobID 域分隔密钥。

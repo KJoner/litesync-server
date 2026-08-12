@@ -75,7 +75,7 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 // clientContext 抽取逐请求协议/世代上下文（计划书 §5.3）。
 //
 // 服务器可能在两次请求之间从备份恢复（repoEpoch 变）、完成元数据迁移
-//（formatEpoch 变）或轮换密钥（keyEpoch 变），而客户端此刻仍拿着旧判断在写。
+// （formatEpoch 变）或轮换密钥（keyEpoch 变），而客户端此刻仍拿着旧判断在写。
 // 因此这些必须**逐请求**校验，而不是「会话首轮查一次」。
 func clientContext(r *http.Request) syncsvc.ClientContext {
 	return syncsvc.ClientContext{

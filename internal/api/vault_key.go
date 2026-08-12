@@ -63,7 +63,26 @@ func (h *handlers) putVaultKey(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
+	// 重新封装完成（§10.4）：客户端用 X-Key-Epoch 声明这份文档属于哪个 epoch。
+	// 只有与待办 epoch 一致才算完成轮换——上传一份仍属于旧 epoch 的文档不算。
+	rewrapped := false
+	if v := r.Header.Get("X-Key-Epoch"); v != "" {
+		epoch, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil || epoch <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid X-Key-Epoch")
+			return
+		}
+		if cerr := h.svc.ClearPendingRewrap(epoch); cerr != nil {
+			if errors.Is(cerr, syncsvc.ErrRewrapRequired) {
+				writeErr(w, http.StatusConflict, cerr.Error())
+				return
+			}
+			h.internalError(w, "clear pending rewrap", cerr)
+			return
+		}
+		rewrapped = true
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": true, "rewrapped": rewrapped})
 }
 
 // purgeHistory 删除某路径 beforeRevision 之前的历史版本。

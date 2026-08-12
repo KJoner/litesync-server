@@ -21,6 +21,16 @@ const (
 	ScopeShare    = "share"     // 分享创建/列表/撤销
 	ScopeKeyAdmin = "key-admin" // vault-key 写、E2EE 状态机、历史清理
 	ScopePairing  = "pairing"   // 创建配对包与注册凭据（添加新设备）
+	// ScopeBackupAdmin（v0.16 / §10.5）：备份与灾难恢复。
+	//
+	// 它被**显式命名**出来，是为了让「不授予」变成一条可测试的规则而不是
+	// 一句注释。备份能读到整个仓库的密文与全部元数据——一台普通同步设备
+	// 被攻破，不应该顺带把它交出去。因此：不在 DefaultDeviceScopes 里，
+	// 签发 access token 时会被剥掉，只属于根 Token 与 admin 会话。
+	ScopeBackupAdmin = "backup-admin"
+	// ScopeMigration（v0.16 / §10.5）：元数据迁移状态机。
+	// 迁移会改写整个仓库的寻址格式，是仓库级不可逆动作，与日常同步分开。
+	ScopeMigration = "migration"
 )
 
 // DefaultDeviceScopes：同步客户端设备的默认权限集合。

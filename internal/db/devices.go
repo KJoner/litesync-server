@@ -18,6 +18,39 @@ type Device struct {
 	//（base64 SPKI，ECDSA P-256）。服务器只存不用——它没有私钥，
 	// 也不验证签名；验证在客户端做，「服务器说签名是对的」毫无价值。
 	SigningPublicKey string
+	// VaultID / UserID（v0.16 / §10.4）：设备属于哪个租户的哪个人。
+	// 没有这条绑定，「移除成员时撤销他的设备」无从谈起。
+	VaultID string
+	UserID  string
+}
+
+const deviceColumns = `id, name, token_hash, scopes, created_at, last_seen_at, revoked,
+	signing_public_key, vault_id, user_id`
+
+func scanDevice(sc interface{ Scan(...any) error }) (*Device, error) {
+	d := &Device{}
+	var revoked int64
+	if err := sc.Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt,
+		&d.LastSeenAt, &revoked, &d.SigningPublicKey, &d.VaultID, &d.UserID); err != nil {
+		return nil, err
+	}
+	d.Revoked = revoked != 0
+	return d, nil
+}
+
+// GetDeviceByID 按设备 id 查找；不存在返回 (nil, nil)。
+//
+// access token 校验每次都会走这里：票是自包含的，但撤销必须即时生效，
+// 因此每次用票都要回查设备是否还在、是否已被撤销。
+func GetDeviceByID(q dbtx, deviceID string) (*Device, error) {
+	d, err := scanDevice(q.QueryRow(`SELECT `+deviceColumns+` FROM devices WHERE id = ?`, deviceID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
 }
 
 func InsertDevice(q dbtx, d *Device) error {
@@ -26,49 +59,40 @@ func InsertDevice(q dbtx, d *Device) error {
 		revoked = 1
 	}
 	_, err := q.Exec(
-		`INSERT INTO devices (id, name, token_hash, scopes, created_at, last_seen_at, revoked)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO devices (id, name, token_hash, scopes, created_at, last_seen_at, revoked, vault_id, user_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.DeviceID, d.Name, d.TokenHash, d.Scopes, d.CreatedAt, d.LastSeenAt, revoked,
+		defaultIfEmpty(d.VaultID, DefaultVaultID), d.UserID,
 	)
 	return err
 }
 
 // GetDeviceByTokenHash 按 token hash 查找未撤销的设备；不存在返回 (nil, nil)。
 func GetDeviceByTokenHash(q dbtx, tokenHash string) (*Device, error) {
-	d := &Device{}
-	var revoked int64
-	err := q.QueryRow(
-		`SELECT id, name, token_hash, scopes, created_at, last_seen_at, revoked, signing_public_key
-		 FROM devices WHERE token_hash = ?`, tokenHash,
-	).Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt, &d.LastSeenAt, &revoked, &d.SigningPublicKey)
+	d, err := scanDevice(q.QueryRow(
+		`SELECT `+deviceColumns+` FROM devices WHERE token_hash = ?`, tokenHash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	d.Revoked = revoked != 0
 	return d, nil
 }
 
 func ListDevices(q dbtx) ([]Device, error) {
-	rows, err := q.Query(
-		`SELECT id, name, token_hash, scopes, created_at, last_seen_at, revoked, signing_public_key
-		 FROM devices ORDER BY created_at ASC`)
+	rows, err := q.Query(`SELECT ` + deviceColumns + ` FROM devices ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Device
 	for rows.Next() {
-		var d Device
-		var revoked int64
-		if err := rows.Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes,
-			&d.CreatedAt, &d.LastSeenAt, &revoked, &d.SigningPublicKey); err != nil {
+		d, err := scanDevice(rows)
+		if err != nil {
 			return nil, err
 		}
-		d.Revoked = revoked != 0
-		out = append(out, d)
+		out = append(out, *d)
 	}
 	return out, rows.Err()
 }
@@ -139,4 +163,11 @@ func SetDeviceSigningKey(q dbtx, deviceID, spkiB64 string) error {
 		`UPDATE devices SET signing_public_key = ? WHERE id = ? AND signing_public_key = ''`,
 		spkiB64, deviceID)
 	return err
+}
+
+func defaultIfEmpty(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }

@@ -348,7 +348,7 @@ func ListTombstones(q dbtx) ([]Tombstone, error) {
 }
 
 // PlaintextTombstoneCount 返回仍带明文寻址名的 tombstone 数量
-//（`last_pseudonym != file_id` 即尚未转换为隐私格式）。
+// （`last_pseudonym != file_id` 即尚未转换为隐私格式）。
 func PlaintextTombstoneCount(q dbtx) (int64, error) {
 	var n int64
 	err := q.QueryRow(
@@ -406,7 +406,7 @@ const versionSelect = `SELECT id, vault_id, file_id, revision, content_generatio
 	COALESCE(operation_id,''), created_at FROM object_versions`
 
 // InsertVersion 追加历史版本。同 (file_id, revision) 重复插入是幂等的
-//（重试与响应丢失后的重放不会产生重复历史，ADR-001 §4）。
+// （重试与响应丢失后的重放不会产生重复历史，ADR-001 §4）。
 func InsertVersion(q dbtx, v *ObjectVersion) error {
 	if v.VaultID == "" {
 		v.VaultID = DefaultVaultID

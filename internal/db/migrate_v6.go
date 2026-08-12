@@ -53,10 +53,10 @@ type BlobProbe interface {
 // noProbe 在没有 blob 存储时使用（dry-run 的最小模式）。
 type noProbe struct{}
 
-func (noProbe) Has(string) bool                     { return true }
-func (noProbe) EnvelopeVersion(string) int64        { return 0 }
+func (noProbe) Has(string) bool                        { return true }
+func (noProbe) EnvelopeVersion(string) int64           { return 0 }
 func (noProbe) ContentGeneration(string) (int64, bool) { return 0, false }
-func (noProbe) KeyEpoch(string) (int64, bool)       { return 0, false }
+func (noProbe) KeyEpoch(string) (int64, bool)          { return 0, false }
 
 // NeedsV6Migration 判断是否需要执行 v5 → v6 迁移。
 func NeedsV6Migration(d *sql.DB) (bool, error) {

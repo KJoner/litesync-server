@@ -56,6 +56,12 @@ func LegacyDefaultScope() VaultScope { return VaultScope{vaultID: DefaultVaultID
 // 「退化为默认租户」——后者会把一个漏洞变成静默的跨租户访问。
 var ErrVaultScopeMissing = errors.New("vault scope is missing; it must come from the authenticated context")
 
+// RootActorID 是根 Token 在审计记录里的身份。
+//
+// 它刻意不是一个合法的 user_id：memberships 里永远不会有这一行，
+// 因此「根 Token 有管理权」这件事必须走显式分支，而不是靠一条伪造的成员关系。
+const RootActorID = "root:server-admin"
+
 // Role 是成员在某个 Vault 里的角色（§10.4）。
 type Role string
 
@@ -133,7 +139,9 @@ CREATE TABLE IF NOT EXISTS vaults (
 	name       TEXT NOT NULL DEFAULT '',
 	-- blobID 的域分隔密钥（ADR-010 §4）。绝不出现在任何 API 响应里
 	secret     BLOB NOT NULL,
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	-- 移除成员后 Vault Key 待重新封装的 epoch（§10.4）；0 表示没有待办
+	pending_rewrap_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS memberships (

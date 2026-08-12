@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -104,6 +104,14 @@ func migrateColumns(d *sql.DB) error {
 
 		// --- v0.15 新增列（§9.2 设备签名密钥） ---
 		{"devices", "signing_public_key", `ALTER TABLE devices ADD COLUMN signing_public_key TEXT NOT NULL DEFAULT ''`, false},
+
+		// --- v0.16 新增列（§10.4 成员权限与密钥轮换） ---
+		// 设备必须知道自己属于哪个 (vault, user)，否则「移除成员时撤销他的设备」
+		// 无从谈起。存量设备默认落在 default vault 的 owner 名下。
+		{"devices", "vault_id", `ALTER TABLE devices ADD COLUMN vault_id TEXT NOT NULL DEFAULT 'default'`, false},
+		{"devices", "user_id", `ALTER TABLE devices ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`, false},
+		// 移除成员后 Vault Key 必须由管理员设备重新封装；在那之前这里记着待办的 epoch
+		{"vaults", "pending_rewrap_epoch", `ALTER TABLE vaults ADD COLUMN pending_rewrap_epoch INTEGER NOT NULL DEFAULT 0`, false},
 	}
 
 	for _, m := range migrations {

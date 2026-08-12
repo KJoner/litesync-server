@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"net/http"
 	"strings"
 
+	"github.com/KJoner/litesync-server/internal/db"
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
@@ -18,6 +20,12 @@ type authIdentity struct {
 	DeviceID string
 	Name     string
 	Scopes   string
+	// VaultID：这次请求被授权访问的租户（§10.1）。业务代码不得从请求体里取。
+	VaultID string
+	// ViaAccessToken：本次身份来自一张分钟级 access token 而非长期设备凭据（§10.5）。
+	// 换票接口本身不接受短期票——否则一张泄露的票可以无限续期，
+	// 「被动泄露后自动过期」这条性质就没了。
+	ViaAccessToken bool
 }
 
 type ctxKey int
@@ -93,6 +101,12 @@ func routeScope(method, path string) (scope string, rootOnly bool) {
 		return syncsvc.ScopeSync, false
 	case strings.HasPrefix(path, "/api/v1/files/") && strings.HasSuffix(path, "/restore"):
 		return syncsvc.ScopeSync, false
+	case path == "/api/v1/token":
+		return "", false // 换票：任何有效的**长期**设备凭据均可（短期票另行拒绝）
+	case path == "/api/v1/members" || strings.HasPrefix(path, "/api/v1/members/"):
+		return syncsvc.ScopeKeyAdmin, false // 成员变更会触发密钥轮换（§10.4）
+	case path == "/api/v1/audit":
+		return syncsvc.ScopeKeyAdmin, false
 	case path == "/api/v1/whoami":
 		return "", false // 任何有效凭据均可
 	case syncRoutes[path]:
@@ -120,25 +134,46 @@ func authGate(token string, web *sessionStore, svc *syncsvc.Service, next http.H
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
-			// 设备 Token：按 scope 校验（撤销后立即失效）
-			if d, err := svc.AuthDevice(bearer); err == nil && d != nil {
-				scope, rootOnly := routeScope(r.Method, r.URL.Path)
-				if scope == scopeDeny {
-					// §7.6：这条路径没有被显式授权过。拒绝而不是猜一个 scope——
-					// 猜错的方向永远是「放得太开」
-					writeErr(w, http.StatusForbidden, "route not authorized for device tokens")
+			// 短期 access token（§10.5）：验签 + 未过期 + 设备仍有效
+			if strings.HasPrefix(bearer, "lst1.") {
+				claims, err := svc.VerifyAccessToken(bearer)
+				if err != nil {
+					// 过期与伪造分开告知：过期是客户端可以自行处理的正常状态
+					//（拿长期凭据再换一张），伪造则没什么可解释的
+					if errors.Is(err, syncsvc.ErrAccessTokenExpired) {
+						writeErr(w, http.StatusUnauthorized, "access token expired; exchange a new one")
+					} else {
+						writeErr(w, http.StatusUnauthorized, "unauthorized")
+					}
 					return
 				}
-				if rootOnly {
-					writeErr(w, http.StatusForbidden, "root token required")
+				if ok := enforceRouteScope(w, r, claims.Scopes); !ok {
 					return
 				}
-				if scope != "" && !syncsvc.HasScope(d.Scopes, scope) {
-					writeErr(w, http.StatusForbidden, "insufficient scope: "+scope+" required")
+				// 换票接口不接受短期票：允许用票换票 = 无限续期
+				if r.URL.Path == "/api/v1/token" {
+					writeErr(w, http.StatusForbidden,
+						"access tokens cannot be exchanged for new ones; use the device credential")
 					return
 				}
 				ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
-					DeviceID: d.DeviceID, Name: d.Name, Scopes: d.Scopes,
+					DeviceID: claims.DeviceID, Scopes: claims.Scopes,
+					VaultID: claims.VaultID, ViaAccessToken: true,
+				})
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			// 设备 Token：按 scope 校验（撤销后立即失效）
+			if d, err := svc.AuthDevice(bearer); err == nil && d != nil {
+				if ok := enforceRouteScope(w, r, d.Scopes); !ok {
+					return
+				}
+				vaultID := d.VaultID
+				if vaultID == "" {
+					vaultID = db.DefaultVaultID
+				}
+				ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
+					DeviceID: d.DeviceID, Name: d.Name, Scopes: d.Scopes, VaultID: vaultID,
 				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
@@ -183,4 +218,24 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// enforceRouteScope 用同一套路由表判定一组 scope 是否够用；不够时已写好响应。
+//
+// 设备 token 与 access token 必须走**同一份**判定逻辑。两套实现意味着
+// 迟早有一条路径只在其中一套里被收紧，而那条缝隙不会有人注意到。
+func enforceRouteScope(w http.ResponseWriter, r *http.Request, scopes string) bool {
+	need, rootOnly := routeScope(r.Method, r.URL.Path)
+	switch {
+	case need == scopeDeny:
+		writeErr(w, http.StatusForbidden, "route not authorized for device tokens")
+		return false
+	case rootOnly:
+		writeErr(w, http.StatusForbidden, "root token required")
+		return false
+	case need != "" && !syncsvc.HasScope(scopes, need):
+		writeErr(w, http.StatusForbidden, "insufficient scope: "+need+" required")
+		return false
+	}
+	return true
 }

@@ -19,12 +19,12 @@ import (
 
 // Checkpoint 是一份已签名的仓库状态快照。
 type Checkpoint struct {
-	Hash             string
-	VaultID          string
-	RepoEpoch        string
-	HeadSequence     int64
-	PreviousHash     string
-	SigningDeviceID  string
+	Hash            string
+	VaultID         string
+	RepoEpoch       string
+	HeadSequence    int64
+	PreviousHash    string
+	SigningDeviceID string
 	// Body 是 canonical 序列化后的原文；服务器不解析它，原样转发
 	Body      string
 	Signature string
