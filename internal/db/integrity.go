@@ -115,11 +115,28 @@ func ListIntegrityEvents(q dbtx, onlyUnresolved bool) ([]IntegrityEvent, error) 
 // CountBlobReferences 统计某个 blob 被多少个 live HEAD 与历史版本引用。
 // §7.1 第 6 步「重新检查所有引用」用它来说明这次损坏影响了多大范围。
 func CountBlobReferences(q dbtx, blobID string) (int, error) {
+	return CountBlobReferencesIn(q, LegacyDefaultScope(), blobID)
+}
+
+// CountBlobReferencesIn 统计**某个租户内**引用该 blob 的 HEAD 与历史版本数量。
+//
+// 必须带范围。不带的话，「这个 blob 被引用了几次」会跨租户求和——
+// 那不只是数字不准：它把「别的租户有没有这份内容」变成一个可观测量，
+// 正是 §10.3 花力气关掉的那个存在性预言机。
+//
+// 域化之后跨租户撞上同一个 blobID 在密码学上不可能，所以今天这里返回的
+// 结果不会变；带上范围是为了让这条查询**在结构上**就问不出别人的事。
+func CountBlobReferencesIn(q dbtx, s VaultScope, blobID string) (int, error) {
+	if !s.Valid() {
+		return 0, ErrVaultScopeMissing
+	}
 	var heads, versions int
-	if err := q.QueryRow(`SELECT COUNT(*) FROM file_heads WHERE blob_id = ?`, blobID).Scan(&heads); err != nil {
+	if err := q.QueryRow(`SELECT COUNT(*) FROM file_heads WHERE vault_id = ? AND blob_id = ?`,
+		s.ID(), blobID).Scan(&heads); err != nil {
 		return 0, err
 	}
-	if err := q.QueryRow(`SELECT COUNT(*) FROM object_versions WHERE blob_id = ?`, blobID).Scan(&versions); err != nil {
+	if err := q.QueryRow(`SELECT COUNT(*) FROM object_versions WHERE vault_id = ? AND blob_id = ?`,
+		s.ID(), blobID).Scan(&versions); err != nil {
 		return 0, err
 	}
 	return heads + versions, nil

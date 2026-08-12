@@ -196,3 +196,13 @@ func (s *Service) ClearPendingRewrap(epoch int64) error {
 func (s *Service) AuditTrail(limit int) ([]db.AuditEvent, error) {
 	return db.ListAudit(s.db, s.scope(), limit)
 }
+
+// ServedVaultID 返回这个实例所服务的租户标识（vaults.vault_id）。
+//
+// 与 pairing 里的 VaultID 是**两回事**：那个是配对包里用的仓库身份字符串，
+// 这个是多租户的范围键。名字刻意分开——把两者混为一谈，
+// 「凭据属于哪个租户」的判断就会拿错值去比。
+//
+// 认证层用它拒绝指向别的 Vault 的凭据（§10.6）。返回的是**服务端**认定的
+// 范围，不是请求里声称的——后者永远不作数。
+func (s *Service) ServedVaultID() string { return s.scope().ID() }

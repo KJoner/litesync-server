@@ -150,6 +150,9 @@ func authGate(token string, web *sessionStore, svc *syncsvc.Service, next http.H
 				if ok := enforceRouteScope(w, r, claims.Scopes); !ok {
 					return
 				}
+				if ok := enforceVault(w, svc, claims.VaultID); !ok {
+					return
+				}
 				// 换票接口不接受短期票：允许用票换票 = 无限续期
 				if r.URL.Path == "/api/v1/token" {
 					writeErr(w, http.StatusForbidden,
@@ -171,6 +174,9 @@ func authGate(token string, web *sessionStore, svc *syncsvc.Service, next http.H
 				vaultID := d.VaultID
 				if vaultID == "" {
 					vaultID = db.DefaultVaultID
+				}
+				if ok := enforceVault(w, svc, vaultID); !ok {
+					return
 				}
 				ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
 					DeviceID: d.DeviceID, Name: d.Name, Scopes: d.Scopes, VaultID: vaultID,
@@ -235,6 +241,23 @@ func enforceRouteScope(w http.ResponseWriter, r *http.Request, scopes string) bo
 		return false
 	case need != "" && !syncsvc.HasScope(scopes, need):
 		writeErr(w, http.StatusForbidden, "insufficient scope: "+need+" required")
+		return false
+	}
+	return true
+}
+
+// enforceVault 拒绝一个指向**别的 Vault** 的认证身份（§10.6）。
+//
+// 单实例目前只服务一个 Vault，所以这条检查在今天等价于「vaultID 必须是
+// 本仓库的」。它现在就存在，是因为多 Vault 路由落地时的失败方向必须是
+// **拒绝**而不是「沿用默认 Vault」——后者会把一次漏配置变成静默的跨租户读取，
+// 而且不会有任何信号。
+//
+// 换句话说：这不是为今天写的，是为了让明天那个忘了带 scope 的新接口
+// 一上来就 403，而不是安静地返回别人的数据。
+func enforceVault(w http.ResponseWriter, svc *syncsvc.Service, vaultID string) bool {
+	if vaultID == "" || vaultID != svc.ServedVaultID() {
+		writeErr(w, http.StatusForbidden, "credential belongs to a different vault")
 		return false
 	}
 	return true
