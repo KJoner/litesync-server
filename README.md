@@ -110,9 +110,38 @@ docker compose up -d
 | `OBSYNC_BACKUP_KEY_FILE` | （空 = 备份不可用） | 备份配置加密密钥文件；Docker 镜像内默认 `/etc/litesync/backup-config.key` |
 | `OBSYNC_DURABILITY` | `strict` | `strict` = SQLite `synchronous=FULL`（掉电后已确认事务绝不回滚）；`normal` 更快但掉电可能丢最近事务 |
 | `OBSYNC_TRUSTED_PROXIES` | `127.0.0.1,::1` | 允许信任其 `X-Forwarded-Proto` 的反向代理（IP/CIDR，逗号分隔）；其余来源的该 Header 一律忽略 |
+| `OBSYNC_STRICT_BLOB_VERIFY` | `false` | 去重命中时全量重算现有 blob 的 hash（能抓位腐坏，代价是每次命中都完整读一遍文件） |
+| `OBSYNC_QUARANTINE_DAYS` | `0`（永久） | 隔离区保留期。隔离区放的是被判定损坏的副本，属于取证材料，默认不自动删 |
+| `OBSYNC_HTTP_READ_TIMEOUT` | `1800`（秒） | 请求读取超时。必须覆盖「慢速链路上传大附件」这种正常场景 |
+| `OBSYNC_HTTP_WRITE_TIMEOUT` | `1800`（秒） | 响应写出超时，同上 |
 
 Compose 额外变量：`LITESYNC_ETC_DIR`（宿主机密钥目录，默认 `./etc-litesync`，
 只读挂载为容器内 `/etc/litesync`；一键部署脚本自动生成密钥）。
+
+## 正式支持规模
+
+以下是**正式声明并按此测试**的上限（计划书 §8.7）。超出这些数字不代表一定不能用，
+但意味着没有被验证过——出问题时请先回到声明范围内再判断。
+
+| 项目 | 声明上限 | 说明 |
+|---|---|---|
+| 单仓库文件数 | 20 000 | snapshot / changes 分页 / scrub / GC 均按此规模验证 |
+| 单文件历史版本数 | 100（Markdown）、10（附件） | 由 `OBSYNC_HISTORY_MAX_PER_FILE` 等配置约束并强制生效 |
+| 单文件大小 | 100 MB | `OBSYNC_MAX_FILE_SIZE`；移动端超过 50 MB 会有内存告警 |
+| 客户端待推送变更数 | 10 000 | 超过时同步仍然正确，但单轮耗时会明显变长 |
+| 设备数 | 10 | 单用户阶段的实际使用形态；多人协作见 v0.16 路线 |
+| 最长离线时间 | 90 天 | 由 `OBSYNC_CHANGES_DAYS` 决定；超过后客户端自动走 snapshot 全量对账，不会漏变更 |
+
+在 2 000 文件的仓库上，一台普通 SSD 机器的实测：
+snapshot 约 6 ms、changes 全量分页约 6 ms、`scrub --full` 约 0.3 s、
+一轮资源治理约 0.4 s。这些数字随磁盘差异很大，仅供量级参考。
+
+规模测试随代码一起提供：
+
+```bash
+go test ./internal/sync/ -run TestScale          # 默认 2 000 文件
+LITESYNC_SCALE=20000 go test ./internal/sync/ -run TestScale -timeout 1800s
+```
 
 ## HTTPS（生产环境必须）
 
@@ -408,6 +437,33 @@ curl http://127.0.0.1:8080/health
 恢复后各设备下次连接会检测到 repoEpoch 变化，自动暂停增量同步并提示
 重新走接入向导的「安全合并」：本地在备份点之后产生的新内容全部保留，
 与服务器恢复版本的差异走正常冲突流程，不会被静默覆盖或丢弃。
+
+## 运维命令（v0.13.3）
+
+服务停止时对着同一个数据目录运行（`OBSYNC_DATA_DIR` 指向它）：
+
+```bash
+obsync backup create                         # 立即创建一次备份
+obsync backup verify                         # restic check
+obsync backup restore --new-epoch <snapshot> # 恢复 + 旋转 repoEpoch（见下）
+obsync integrity scan [--full]               # 完整性巡检；--full 重算每个 blob 的 hash
+obsync migration status                      # 元数据迁移状态与 journal 进度
+obsync migration resume                      # 释放已过期的迁移租约
+obsync migration abort                       # 中止迁移并回到 plain
+```
+
+`restore` **强制要求 `--new-epoch`**：不旋转 repoEpoch 的话，客户端会带着
+恢复点之前的旧游标继续增量同步，从而静默跳过「恢复点之后曾经存在」的那段变更。
+恢复流程本身也刻意保守——恢复内容先落临时目录，旧数据目录被**挪到**
+`restore-backup-<时间戳>` 而不是删除（恢复错快照时那是唯一的退路）。
+
+`integrity scan` 发现问题时以非零码退出，可以直接接进 cron 告警。
+被判定损坏的内容会停止对外提供（返回 `503 CONTENT_CORRUPTED` 而不是 404），
+坏副本移入 `blobs/_quarantine/` 保留取证。
+
+同样的能力也有 HTTP 接口（需 root Token 或 admin 会话）：
+`GET /api/v1/admin/integrity/scan`、`/events`、
+`POST /api/v1/admin/integrity/purge-quarantine`。
 
 ## 开发与源码构建
 

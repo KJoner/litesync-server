@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/failpoint"
 	"github.com/KJoner/litesync-server/internal/storage"
 )
 
@@ -584,7 +585,18 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 			return nil, err
 		}
 	}
+	// §8.1 注入点：事务提交之前。此刻崩溃 → 事务回滚，blob 变成无引用孤儿，
+	// 客户端拿到失败可以安全重试（同一个 operationId 与 fileId）
+	if err := failpoint.Eval(failpoint.DBBeforeCommit); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	// §8.1 注入点：事务已提交、响应尚未返回。这是最难处理的窗口——
+	// 服务器上数据已经生效，但客户端会看到失败并重试。
+	// 重试必须靠 operationId 幂等收敛，而不是产生第二个 revision
+	if err := failpoint.Eval(failpoint.DBAfterCommit); err != nil {
 		return nil, err
 	}
 	s.gcBlobs(prunedBlobs)

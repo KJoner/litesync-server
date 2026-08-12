@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 // syncDir 在 rename 后 fsync 父目录，保证目录项本身落盘（掉电后 rename 不丢失）。
@@ -134,6 +136,12 @@ func (b *BlobStore) IngestVerify(r io.Reader) (tmpPath, hashHex string, size int
 		os.Remove(tmpPath)
 		return "", "", 0, err
 	}
+	// §8.1 注入点：临时文件已 fsync、尚未入库。此刻崩溃只应留下一个孤儿临时文件，
+	// 绝不能让任何已确认的 HEAD 指向它
+	if err := failpoint.Eval(failpoint.BlobAfterTempFsync); err != nil {
+		os.Remove(tmpPath)
+		return "", "", 0, err
+	}
 	return tmpPath, hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
@@ -200,6 +208,11 @@ func (b *BlobStore) Commit(tmpPath, hash string, strict bool) (CommitResult, err
 		os.Remove(tmpPath)
 		return res, err
 	}
+	// §8.1 注入点：rename 之前。此刻崩溃 → blob 不在库里，上传必须整体失败并可重试
+	if err := failpoint.Eval(failpoint.BlobBeforeRename); err != nil {
+		os.Remove(tmpPath)
+		return res, err
+	}
 	if err := os.Rename(tmpPath, p); err != nil {
 		// Windows 的 rename 不能覆盖已存在文件（损坏修复路径）：先移除再试一次
 		if os.Remove(p) == nil {
@@ -212,6 +225,11 @@ func (b *BlobStore) Commit(tmpPath, hash string, strict bool) (CommitResult, err
 		return res, err
 	}
 	syncDir(filepath.Dir(p))
+	// §8.1 注入点：blob 已经在库里，但数据库事务还没提交。
+	// 此刻崩溃留下的是一个「无引用的 blob」——GC 会回收它，不会有任何数据损坏
+	if err := failpoint.Eval(failpoint.BlobAfterRename); err != nil {
+		return res, err
+	}
 	return res, nil
 }
 

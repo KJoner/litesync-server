@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 // MaintenanceStats 单次维护任务的结果统计。
@@ -318,6 +319,12 @@ func (s *Service) maintainOrphanBlobs() (int, error) {
 		if merr != nil || rounds < 2 {
 			s.mu.Unlock()
 			continue // 第一轮只入册，不删
+		}
+		// §8.1 注入点：已判定可删、尚未删除。此刻崩溃只是少删一个 blob，
+		// 下一轮会重新走完整的两轮确认——绝不会变成「删了但记录还在」
+		if err := failpoint.Eval(failpoint.GCBeforeDelete); err != nil {
+			s.mu.Unlock()
+			continue
 		}
 		if s.blobs.Remove(hash) == nil {
 			db.ClearGCCandidate(s.db, hash) //nolint:errcheck
