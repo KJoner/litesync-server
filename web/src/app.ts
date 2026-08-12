@@ -5,12 +5,17 @@
  * - VMK：解锁后只存在于内存 CryptoKey；刷新/关闭页面即需重新输入密码
  */
 import {
+	AdminDevice,
+	AdminMigrationStatus,
+	AdminShare,
 	Api,
 	AuthError,
 	BackupConfigView,
+	BackupSnapshot,
 	BackupStatus,
 	FileEntry,
 	IntegrityError,
+	IntegrityEvent,
 	login,
 	logout,
 	VersionEntry,
@@ -331,6 +336,13 @@ function renderMain(): void {
 	settingsBtn.onclick = () => {
 		location.hash = "#/settings/backup";
 	};
+	// 运维入口（§11.3）：设备撤销、迁移进度、完整性告警、分享与灾备恢复。
+	// 单独一个入口而不是塞进备份页——出事时要能一眼找到
+	const opsBtn = el("button", "icon-btn", "🛠");
+	opsBtn.title = "运维（设备 / 迁移 / 完整性 / 恢复）";
+	opsBtn.onclick = () => {
+		location.hash = "#/settings/ops";
+	};
 	const themeBtn = el("button", "icon-btn", "☀");
 	themeBtn.title = "切换主题";
 	themeBtn.onclick = toggleTheme;
@@ -350,7 +362,7 @@ function renderMain(): void {
 			location.reload();
 		});
 	};
-	header.append(menuBtn, brand, searchWrap, spacer, settingsBtn, themeBtn, lockBtn, outBtn);
+	header.append(menuBtn, brand, searchWrap, spacer, opsBtn, settingsBtn, themeBtn, lockBtn, outBtn);
 
 	// 三栏
 	treeEl = el("aside", "tree");
@@ -471,6 +483,8 @@ function onRoute(): void {
 		void showNote(path);
 	} else if (hash === "#/settings/backup") {
 		void showBackupSettings();
+	} else if (hash === "#/settings/ops") {
+		void showOpsSettings();
 	} else {
 		showHome();
 	}
@@ -1175,4 +1189,331 @@ function showIntegrityBanner(what: string): void {
 	const bar = el("div", "repo-banner repo-banner-error");
 	bar.textContent = `服务器上的内容未通过完整性校验：${what}`;
 	document.body.prepend(bar);
+}
+
+// ---------- 运维页（v0.17 / 计划书 §11.3） ----------
+//
+// 设备撤销、迁移状态、完整性告警、备份恢复、分享恢复——这五件事的共同点是
+// **出事的时候才会用到**。它们最常见的失败不是写错了，而是「只能 SSH 上服务器
+// 敲命令」。事故当天，能不能在手机上撤销一台丢失的设备，和这个功能写得优不优雅
+// 相比，是完全不同量级的问题。
+//
+// 与备份页共用 admin 会话（30 分钟）。
+
+function fmtTs(sec: number): string {
+	return sec > 0 ? fmtTime(sec * 1000) : "—";
+}
+
+async function showOpsSettings(): Promise<void> {
+	revokeAllBlobs();
+	markActive(null);
+	outlineEl.innerHTML = "";
+	contentEl.innerHTML = "";
+	const wrap = el("div", "note-wrap settings-wrap");
+	contentEl.append(wrap);
+	const head = el("div", "note-head");
+	head.append(el("h1", "note-title", "Operations"));
+	const backBtn = el("button", "ghost", "← 返回");
+	backBtn.onclick = () => {
+		location.hash = "#/";
+	};
+	head.append(backBtn);
+	wrap.append(head);
+	wrap.append(
+		el("p", "muted small", "出事时会用到的几件事：设备撤销、迁移进度、完整性告警、分享恢复、灾备恢复预检。"),
+	);
+	const box = el("div", "settings-box");
+	wrap.append(box);
+	await renderOpsInto(box);
+}
+
+async function renderOpsInto(box: HTMLElement): Promise<void> {
+	box.textContent = "加载中…";
+	let devices: AdminDevice[];
+	let migration: AdminMigrationStatus;
+	let events: IntegrityEvent[];
+	let shares: AdminShare[];
+	try {
+		[devices, migration, events, shares] = await Promise.all([
+			S!.api.adminDevices().then((r) => r.devices ?? []),
+			S!.api.adminMigrationStatus(),
+			S!.api.adminIntegrityEvents().then((r) => r.events ?? []),
+			S!.api.adminShares().then((r) => r.shares ?? []),
+		]);
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		// 401/403 一律当作「需要 admin 会话」：只读会话在这里不够
+		if (/40[13]|unauthorized|admin/i.test(msg)) {
+			renderOpsUnlock(box);
+			return;
+		}
+		box.textContent = `加载失败：${msg}`;
+		return;
+	}
+	box.innerHTML = "";
+	renderIntegrityCard(box, events);
+	renderMigrationCard(box, migration);
+	renderDeviceCard(box, devices);
+	renderShareCard(box, shares);
+	void renderRestoreCard(box);
+}
+
+function renderOpsUnlock(box: HTMLElement): void {
+	box.innerHTML = "";
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Admin unlock"));
+	card.append(el("p", "muted small", "运维操作需要管理员权限：请输入 API Token 换取短期 admin 会话（30 分钟）。"));
+	const input = el("input") as HTMLInputElement;
+	input.type = "password";
+	input.placeholder = "API Token";
+	const btn = el("button", "primary", "解锁");
+	const errEl = el("p", "error", "");
+	const submit = async (): Promise<void> => {
+		btn.disabled = true;
+		if (await login(input.value.trim(), true)) {
+			await renderOpsInto(box);
+			return;
+		}
+		errEl.textContent = "Token 错误";
+		btn.disabled = false;
+	};
+	btn.onclick = () => void submit();
+	input.onkeydown = (e) => {
+		if (e.key === "Enter") void submit();
+	};
+	const row = el("div", "settings-row");
+	row.append(input, btn);
+	card.append(row, errEl);
+	box.append(card);
+	input.focus();
+}
+
+// 完整性告警放在最上面：它是唯一一类「已经有内容读不出来了」的信号。
+function renderIntegrityCard(box: HTMLElement, events: IntegrityEvent[]): void {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Integrity"));
+	if (events.length === 0) {
+		card.append(el("p", "muted small", "没有完整性事件。"));
+		box.append(card);
+		return;
+	}
+	const unresolved = events.filter((e) => !e.resolved);
+	const unservable = events.filter((e) => !e.serving);
+	if (unservable.length > 0) {
+		card.append(
+			el(
+				"p",
+				"error",
+				`${unservable.length} 份内容已停止对外提供（确认损坏且无法自愈）。` +
+					"这些文件在客户端会读取失败——请从备份恢复，不要试图忽略。",
+			),
+		);
+	}
+	card.append(el("p", "muted small", `共 ${events.length} 条事件，其中 ${unresolved.length} 条未处理。`));
+	const list = el("div", "settings-grid");
+	for (const ev of events.slice(0, 20)) {
+		list.append(
+			el("div", "muted small", fmtTs(ev.detectedAt)),
+			el(
+				"div",
+				ev.serving ? "" : "error",
+				`${ev.kind}（${ev.detail}）· 影响 ${ev.affectedRefs} 处引用 · ` +
+					(ev.serving ? "仍在服务" : "已停止服务") +
+					(ev.resolved ? " · 已修复" : ""),
+			),
+		);
+	}
+	card.append(list);
+	box.append(card);
+}
+
+function renderMigrationCard(box: HTMLElement, st: AdminMigrationStatus): void {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Migration"));
+	const grid = el("div", "settings-grid");
+	const item = (label: string, value: string, cls = ""): void => {
+		grid.append(el("div", "muted small", label), el("div", cls, value));
+	};
+	const meta = (st.meta ?? {}) as Record<string, unknown>;
+	item("Metadata state", String(meta.metaState ?? meta.state ?? "—"));
+	if (meta.ownerDeviceId) item("Lease holder", String(meta.ownerDeviceId));
+	if (meta.leaseExpiresAt) item("Lease expires", fmtTs(Number(meta.leaseExpiresAt)));
+	if (meta.cutoffSequence) item("Cutoff sequence", String(meta.cutoffSequence));
+	item("blobID domain", st.needsBlobIdMigration ? "待迁移" : "已完成", st.needsBlobIdMigration ? "error" : "");
+	item(
+		"Vault key rewrap",
+		st.pendingRewrapEpoch > 0 ? `待重新封装（epoch ${st.pendingRewrapEpoch}）` : "无待办",
+		st.pendingRewrapEpoch > 0 ? "error" : "",
+	);
+	card.append(grid);
+	if (st.needsBlobIdMigration) {
+		card.append(
+			el(
+				"p",
+				"muted small",
+				"存量 blob 仍按裸内容哈希命名：跨租户存在性隔离对老数据尚未生效。" +
+					"先执行 obsync backup create，再执行 obsync blobid migrate --confirm（不可逆）。",
+			),
+		);
+	}
+	if (st.pendingRewrapEpoch > 0) {
+		card.append(
+			el(
+				"p",
+				"muted small",
+				"有成员被移除后密钥已轮换，但 Vault Key 还没为新世代重新封装。" +
+					"在一台管理员设备上重新封装并上传，剩余设备才能继续写入。",
+			),
+		);
+	}
+	box.append(card);
+}
+
+function renderDeviceCard(box: HTMLElement, devices: AdminDevice[]): void {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Devices"));
+	card.append(
+		el(
+			"p",
+			"muted small",
+			"撤销立刻生效：长期凭据作废，它换出去的短期 access token 也一起失效。丢设备时争的就是这几分钟。",
+		),
+	);
+	const list = el("div", "device-list");
+	for (const d of devices) {
+		const row = el("div", "settings-row");
+		const info = el("div");
+		info.append(el("div", d.revoked ? "muted" : "", `${d.name || "（未命名）"}${d.revoked ? "（已撤销）" : ""}`));
+		info.append(
+			el(
+				"div",
+				"muted small",
+				`最后活动 ${fmtTs(d.lastSeenAt)} · 接入于 ${fmtTs(d.createdAt)} · ${d.scopes.join(", ") || "无权限"}`,
+			),
+		);
+		row.append(info);
+		if (!d.revoked) {
+			const btn = el("button", "danger", "撤销");
+			btn.onclick = () => {
+				// 撤销不可逆，值得一次确认——但只要一次：事故当天多一层弹窗就是多一分钟
+				if (!confirm(`撤销「${d.name || d.id}」？该设备将立刻无法同步。`)) return;
+				btn.disabled = true;
+				void S!.api
+					.adminRevokeDevice(d.id)
+					.then(() => renderOpsInto(box))
+					.catch((e: unknown) => {
+						btn.disabled = false;
+						alert(`撤销失败：${e instanceof Error ? e.message : String(e)}`);
+					});
+			};
+			row.append(btn);
+		}
+		list.append(row);
+	}
+	if (devices.length === 0) list.append(el("p", "muted small", "还没有设备接入。"));
+	card.append(list);
+	box.append(card);
+}
+
+function renderShareCard(box: HTMLElement, shares: AdminShare[]): void {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Shares"));
+	card.append(
+		el(
+			"p",
+			"muted small",
+			"「恢复」只能把一个有效期设短了的分享往后延。密文一旦被过期回收就真的没了——" +
+				"分享密钥从不上传，服务器手上没有任何能重建它的材料，只能重新分享。",
+		),
+	);
+	const list = el("div", "share-list");
+	for (const s of shares) {
+		const row = el("div", "settings-row");
+		const state = s.revoked ? "已撤销" : s.expired ? "已过期" : "有效";
+		const info = el("div");
+		info.append(el("div", s.revoked ? "muted" : "", `${s.id.slice(0, 12)}… · ${fmtBytes(s.size)} · ${state}`));
+		info.append(
+			el(
+				"div",
+				"muted small",
+				`创建于 ${fmtTs(s.createdAt)} · 到期 ${s.expiresAt > 0 ? fmtTs(s.expiresAt) : "永不"}`,
+			),
+		);
+		row.append(info);
+		if (s.recoverable && !s.revoked) {
+			const btn = el("button", "ghost", "延长 7 天");
+			btn.onclick = () => {
+				btn.disabled = true;
+				const until = Math.floor(Date.now() / 1000) + 7 * 86400;
+				void S!.api
+					.adminRecoverShare(s.id, until)
+					.then(() => renderOpsInto(box))
+					.catch((e: unknown) => {
+						btn.disabled = false;
+						alert(`恢复失败：${e instanceof Error ? e.message : String(e)}`);
+					});
+			};
+			row.append(btn);
+		} else if (!s.revoked) {
+			row.append(el("span", "muted small", "密文已回收，无法恢复"));
+		}
+		list.append(row);
+	}
+	if (shares.length === 0) list.append(el("p", "muted small", "没有分享记录。"));
+	card.append(list);
+	box.append(card);
+}
+
+// 灾备恢复：只做能安全做的部分——列快照、算后果、给出可粘贴的命令。
+// 真正的切换必须停机后由 CLI 执行，原因见服务端 adminRestorePlan 的注释。
+async function renderRestoreCard(box: HTMLElement): Promise<void> {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Disaster recovery"));
+	box.append(card);
+
+	let snapshots: BackupSnapshot[] = [];
+	try {
+		snapshots = (await S!.api.backupSnapshots()).snapshots ?? [];
+	} catch {
+		card.append(el("p", "muted small", "快照列表不可用（备份尚未配置或 restic 不可用）。"));
+		return;
+	}
+	if (snapshots.length === 0) {
+		card.append(el("p", "error", "仓库里没有任何快照。没有演练过恢复的备份，等于没有备份。"));
+		return;
+	}
+	const select = el("select") as HTMLSelectElement;
+	for (const s of snapshots) {
+		const opt = el("option") as HTMLOptionElement;
+		opt.value = s.id;
+		opt.textContent = `${s.id.slice(0, 8)} · ${fmtTime(Date.parse(s.time))}`;
+		select.append(opt);
+	}
+	const planBox = el("div", "restore-plan");
+	const btn = el("button", "primary", "生成恢复预检");
+	btn.onclick = () => {
+		planBox.textContent = "计算中…";
+		void S!.api
+			.adminRestorePlan(select.value)
+			.then((plan) => {
+				planBox.innerHTML = "";
+				planBox.append(
+					el("p", "", `当前 sequence ${plan.currentSequence} · 在用设备 ${plan.activeDevices} 台`),
+				);
+				const ul = el("ul", "muted small");
+				for (const c of plan.consequences) ul.append(el("li", "", c));
+				planBox.append(ul);
+				planBox.append(el("pre", "cmd", plan.command));
+				const copy = el("button", "ghost", "复制命令");
+				copy.onclick = () => void navigator.clipboard?.writeText(plan.command);
+				planBox.append(copy);
+				planBox.append(el("p", "muted small", plan.whyNotAButton));
+			})
+			.catch((e: unknown) => {
+				planBox.textContent = `预检失败：${e instanceof Error ? e.message : String(e)}`;
+			});
+	};
+	const row = el("div", "settings-row");
+	row.append(select, btn);
+	card.append(row, planBox);
 }

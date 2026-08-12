@@ -69,3 +69,21 @@ func MarkShareRevoked(q dbtx, id string) error {
 	_, err := q.Exec(`UPDATE shares SET revoked = 1 WHERE id = ?`, id)
 	return err
 }
+
+// UpdateShareExpiry 延长分享的有效期（§11.3 分享恢复）。
+//
+// 只允许往**后**延：把有效期改早等于撤销，而撤销有它自己的入口
+// （MarkShareRevoked），两条路径混在一起会让审计记录说不清发生了什么。
+func UpdateShareExpiry(q dbtx, id string, expiresAt int64) error {
+	res, err := q.Exec(
+		`UPDATE shares SET expires_at = ?
+		 WHERE id = ? AND revoked = 0 AND (expires_at = 0 OR expires_at < ?)`,
+		expiresAt, id, expiresAt)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 { //nolint:errcheck
+		return errors.New("分享不存在、已撤销，或新的有效期并不比原来更晚")
+	}
+	return nil
+}

@@ -655,3 +655,54 @@ footer {
 .repo-banner-error {
 	background: #8a1f1f;
 }
+
+/* 运维页（v0.17 / §11.3） */
+.device-list,
+.share-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 10px;
+}
+.device-list .settings-row,
+.share-list .settings-row {
+	align-items: center;
+	justify-content: space-between;
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+}
+button.danger {
+	background: transparent;
+	color: #e5534b;
+	border: 1px solid #e5534b;
+	border-radius: 6px;
+	padding: 4px 12px;
+	cursor: pointer;
+}
+button.danger:hover:not(:disabled) {
+	background: #e5534b;
+	color: #fff;
+}
+button.danger:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+.restore-plan {
+	margin-top: 12px;
+}
+.restore-plan ul {
+	margin: 8px 0;
+	padding-left: 20px;
+}
+/* 恢复命令要能一眼看清、一键复制：出事那天没人想手打一串 id */
+pre.cmd {
+	background: var(--bg-alt, rgba(127, 127, 127, 0.12));
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	padding: 10px 12px;
+	overflow-x: auto;
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 13px;
+	user-select: all;
+}

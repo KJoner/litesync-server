@@ -104,6 +104,15 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/backup/run", h.backupRun)
 	mux.HandleFunc("POST /api/v1/admin/backup/check", h.backupCheck)
 	mux.HandleFunc("GET /api/v1/admin/backup/snapshots", h.backupSnapshots)
+	mux.HandleFunc("GET /api/v1/admin/backup/restore-plan", h.adminRestorePlan)
+
+	// 管理 UI（v0.17 / §11.3）：出事时才会用到的那几件事，
+	// 不该只能 SSH 上服务器敲命令
+	mux.HandleFunc("GET /api/v1/admin/devices", h.adminDevices)
+	mux.HandleFunc("DELETE /api/v1/admin/devices/{id}", h.adminRevokeDevice)
+	mux.HandleFunc("GET /api/v1/admin/migration/status", h.adminMigrationStatus)
+	mux.HandleFunc("GET /api/v1/admin/shares", h.adminShares)
+	mux.HandleFunc("POST /api/v1/admin/shares/{id}/recover", h.adminRecoverShare)
 
 	// 配对（v8 新设备接入）：创建/撤销需 Token；消费与落地页公开（一次性 + 5 分钟过期）
 	mux.HandleFunc("POST /api/v1/pairing", h.createPairing)

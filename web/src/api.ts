@@ -151,7 +151,15 @@ export class Api {
 	// ---------- 备份管理（ADMIN capability：需要 admin 会话，见 login(token, true)） ----------
 
 	private async adminReq(path: string, init?: RequestInit): Promise<unknown> {
-		const res = await this.req(`/api/v1/admin/backup/${path}`, init);
+		return this.adminPath(`/api/v1/admin/backup/${path}`, init);
+	}
+
+	/** 管理接口的统一请求：错误消息取服务端给的那一句，而不是裸 HTTP 码。 */
+	private async adminPath(path: string, init?: RequestInit): Promise<unknown> {
+		const res = await this.req(path, {
+			...init,
+			headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+		});
 		const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
 		if (!res.ok && res.status !== 202) {
 			throw new Error(typeof body.error === "string" ? body.error : `HTTP ${res.status}`);
@@ -193,6 +201,43 @@ export class Api {
 
 	backupCheck(): Promise<void> {
 		return this.adminReq("check", { method: "POST" }).then(() => undefined);
+	}
+
+	// ---------- 管理 UI（v0.17 / §11.3）：出事那天才用得到的那几件事 ----------
+
+	adminDevices(): Promise<{ devices: AdminDevice[] }> {
+		return this.adminPath("/api/v1/admin/devices") as Promise<{ devices: AdminDevice[] }>;
+	}
+
+	adminRevokeDevice(id: string): Promise<void> {
+		return this.adminPath(`/api/v1/admin/devices/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+		}).then(() => undefined);
+	}
+
+	adminMigrationStatus(): Promise<AdminMigrationStatus> {
+		return this.adminPath("/api/v1/admin/migration/status") as Promise<AdminMigrationStatus>;
+	}
+
+	adminIntegrityEvents(): Promise<{ events: IntegrityEvent[] }> {
+		return this.adminPath("/api/v1/admin/integrity/events") as Promise<{ events: IntegrityEvent[] }>;
+	}
+
+	adminShares(): Promise<{ shares: AdminShare[] }> {
+		return this.adminPath("/api/v1/admin/shares") as Promise<{ shares: AdminShare[] }>;
+	}
+
+	adminRecoverShare(id: string, expiresAt: number): Promise<void> {
+		return this.adminPath(`/api/v1/admin/shares/${encodeURIComponent(id)}/recover`, {
+			method: "POST",
+			body: JSON.stringify({ expiresAt }),
+		}).then(() => undefined);
+	}
+
+	adminRestorePlan(snapshot: string): Promise<RestorePlan> {
+		return this.adminPath(
+			`/api/v1/admin/backup/restore-plan?snapshot=${encodeURIComponent(snapshot)}`,
+		) as Promise<RestorePlan>;
 	}
 
 	backupSnapshots(): Promise<{ snapshots: BackupSnapshot[]; initialized: boolean }> {
@@ -239,4 +284,52 @@ export interface BackupSnapshot {
 	time: string;
 	paths?: string[];
 	tags?: string[];
+}
+
+// ---------- 管理 UI 的数据形状（§11.3） ----------
+
+export interface AdminDevice {
+	id: string;
+	name: string;
+	scopes: string[];
+	createdAt: number;
+	lastSeenAt: number;
+	revoked: boolean;
+	hasSigningKey: boolean;
+}
+
+export interface AdminMigrationStatus {
+	meta: Record<string, unknown>;
+	needsBlobIdMigration: boolean;
+	pendingRewrapEpoch: number;
+}
+
+export interface IntegrityEvent {
+	blobId: string;
+	kind: string;
+	detail: string;
+	detectedAt: number;
+	serving: boolean;
+	resolved: boolean;
+	affectedRefs: number;
+}
+
+export interface AdminShare {
+	id: string;
+	size: number;
+	createdAt: number;
+	expiresAt: number;
+	revoked: boolean;
+	expired: boolean;
+	/** 密文是否还在盘上；false 表示已被回收，延长有效期也救不回来 */
+	recoverable: boolean;
+}
+
+export interface RestorePlan {
+	snapshot: string;
+	currentSequence: number;
+	activeDevices: number;
+	command: string;
+	consequences: string[];
+	whyNotAButton: string;
 }
