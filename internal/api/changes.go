@@ -6,7 +6,7 @@ import (
 )
 
 type apiChange struct {
-	Sequence int64  `json:"sequence"`
+	Sequence int64 `json:"sequence"`
 	// Path 是服务器可见的寻址名（plain=真实路径，encrypted=fileId）
 	Path string `json:"path"`
 	// FileID 是稳定身份（协议 v6）：客户端据此对账，不再依赖 path

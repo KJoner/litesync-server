@@ -84,6 +84,11 @@ func routeScope(method, path string) (scope string, rootOnly bool) {
 		return syncsvc.ScopeKeyAdmin, false // 信封下限提升：仓库级不可逆动作
 	case path == "/api/v1/file/meta":
 		return syncsvc.ScopeSync, false
+	case path == "/api/v1/checkpoint" || path == "/api/v1/checkpoints":
+		// 发布与读取 checkpoint 是普通同步动作：每台设备都要做
+		return syncsvc.ScopeSync, false
+	case path == "/api/v1/device/signing-key":
+		return syncsvc.ScopeSync, false
 	case path == "/api/v1/file/rename":
 		return syncsvc.ScopeSync, false
 	case strings.HasPrefix(path, "/api/v1/files/") && strings.HasSuffix(path, "/restore"):

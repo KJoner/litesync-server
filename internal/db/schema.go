@@ -47,7 +47,11 @@ CREATE TABLE IF NOT EXISTS devices (
     revoked INTEGER NOT NULL DEFAULT 0,
     -- v6：该设备已确认（ACK）到的 sequence。tombstone 清理必须确认所有
     -- 未撤销设备都越过了删除点，绝不只按时间清理（ADR-002 §3.4）
-    last_acked_sequence INTEGER NOT NULL DEFAULT 0
+    last_acked_sequence INTEGER NOT NULL DEFAULT 0,
+    -- v0.15：该设备的 checkpoint 签名公钥（base64 SPKI，ECDSA P-256）。
+    -- 服务器只存不用——它没有任何私钥，也不验证签名；验证在客户端做，
+    -- 因为「服务器说这个签名是对的」本身就毫无价值（§9.2）
+    signing_public_key TEXT NOT NULL DEFAULT ''
 );
 
 -- 一次性注册凭据（配对包 v2 携带的是它，不再是根 Token）：

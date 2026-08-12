@@ -46,10 +46,10 @@ func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 	out := make([]apiVersion, 0, len(versions))
 	for _, v := range versions {
 		out = append(out, apiVersion{
-			Revision:  v.Revision,
-			Action:    v.Action,
-			Size:      v.Size,
-			Mtime:     v.Mtime,
+			Revision:          v.Revision,
+			Action:            v.Action,
+			Size:              v.Size,
+			Mtime:             v.Mtime,
 			Hash:              v.ContentHash,
 			DeviceID:          v.DeviceID,
 			CreatedAt:         v.CreatedAt,

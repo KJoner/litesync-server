@@ -14,6 +14,10 @@ type Device struct {
 	CreatedAt  int64
 	LastSeenAt int64
 	Revoked    bool
+	// SigningPublicKey（v0.15 / §9.2）：该设备的 checkpoint 签名公钥
+	//（base64 SPKI，ECDSA P-256）。服务器只存不用——它没有私钥，
+	// 也不验证签名；验证在客户端做，「服务器说签名是对的」毫无价值。
+	SigningPublicKey string
 }
 
 func InsertDevice(q dbtx, d *Device) error {
@@ -34,9 +38,9 @@ func GetDeviceByTokenHash(q dbtx, tokenHash string) (*Device, error) {
 	d := &Device{}
 	var revoked int64
 	err := q.QueryRow(
-		`SELECT id, name, token_hash, scopes, created_at, last_seen_at, revoked
+		`SELECT id, name, token_hash, scopes, created_at, last_seen_at, revoked, signing_public_key
 		 FROM devices WHERE token_hash = ?`, tokenHash,
-	).Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt, &d.LastSeenAt, &revoked)
+	).Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt, &d.LastSeenAt, &revoked, &d.SigningPublicKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -49,7 +53,7 @@ func GetDeviceByTokenHash(q dbtx, tokenHash string) (*Device, error) {
 
 func ListDevices(q dbtx) ([]Device, error) {
 	rows, err := q.Query(
-		`SELECT id, name, token_hash, scopes, created_at, last_seen_at, revoked
+		`SELECT id, name, token_hash, scopes, created_at, last_seen_at, revoked, signing_public_key
 		 FROM devices ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -60,7 +64,7 @@ func ListDevices(q dbtx) ([]Device, error) {
 		var d Device
 		var revoked int64
 		if err := rows.Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes,
-			&d.CreatedAt, &d.LastSeenAt, &revoked); err != nil {
+			&d.CreatedAt, &d.LastSeenAt, &revoked, &d.SigningPublicKey); err != nil {
 			return nil, err
 		}
 		d.Revoked = revoked != 0
@@ -123,4 +127,16 @@ func PruneEnrollments(q dbtx, now int64) (int64, error) {
 	}
 	n, _ := res.RowsAffected() //nolint:errcheck
 	return n, nil
+}
+
+// SetDeviceSigningKey 登记设备的 checkpoint 签名公钥（§9.2）。
+//
+// 只允许**首次**设置：公钥一旦发布，其他设备就可能已经据此验证过 checkpoint。
+// 允许改写等于允许「换一把钥匙，然后重新解释历史」——那正是这套机制要防的事。
+// 需要换密钥时的正确做法是撤销该设备再重新接入。
+func SetDeviceSigningKey(q dbtx, deviceID, spkiB64 string) error {
+	_, err := q.Exec(
+		`UPDATE devices SET signing_public_key = ? WHERE id = ? AND signing_public_key = ''`,
+		spkiB64, deviceID)
+	return err
 }

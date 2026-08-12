@@ -19,7 +19,7 @@ import (
 )
 
 // newBackupTestServer 构建带真实 backup.Manager 的测试服务器
-//（restic 二进制不存在，但 status/config 接口不依赖它）。
+// （restic 二进制不存在，但 status/config 接口不依赖它）。
 func newBackupTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	dir := t.TempDir()

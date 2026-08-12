@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -97,6 +97,9 @@ func migrateColumns(d *sql.DB) error {
 		{"repo_state", "migration_target_format_epoch", `ALTER TABLE repo_state ADD COLUMN migration_target_format_epoch INTEGER NOT NULL DEFAULT 0`, false},
 		{"repo_state", "migration_key_epoch", `ALTER TABLE repo_state ADD COLUMN migration_key_epoch INTEGER NOT NULL DEFAULT 0`, false},
 		{"devices", "last_acked_sequence", `ALTER TABLE devices ADD COLUMN last_acked_sequence INTEGER NOT NULL DEFAULT 0`, false},
+
+		// --- v0.15 新增列（§9.2 设备签名密钥） ---
+		{"devices", "signing_public_key", `ALTER TABLE devices ADD COLUMN signing_public_key TEXT NOT NULL DEFAULT ''`, false},
 	}
 
 	for _, m := range migrations {

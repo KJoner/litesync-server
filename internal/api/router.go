@@ -46,7 +46,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/file", h.getFile)
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
-	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile) // v6：改名 = 元数据更新，不产生 tombstone
+	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)             // v6：改名 = 元数据更新，不产生 tombstone
 	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile) // v6：显式恢复已删除对象
 	mux.HandleFunc("GET /api/v1/history", h.history)
 	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
@@ -81,6 +81,11 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/integrity/scan", h.integrityScan)
 	mux.HandleFunc("GET /api/v1/admin/integrity/events", h.integrityEvents)
 	mux.HandleFunc("POST /api/v1/admin/integrity/purge-quarantine", h.integrityPurgeQuarantine)
+	// 签名 checkpoint（v0.15 / §9）：服务器只存与转发，不验证签名、不裁决分叉
+	mux.HandleFunc("POST /api/v1/checkpoint", h.publishCheckpoint)
+	mux.HandleFunc("GET /api/v1/checkpoints", h.getCheckpoints)
+	mux.HandleFunc("PUT /api/v1/device/signing-key", h.registerSigningKey)
+
 	mux.HandleFunc("POST /api/v1/share", h.createShare)
 	mux.HandleFunc("GET /api/v1/shares", h.listShares)
 	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
@@ -189,9 +194,12 @@ const (
 	// 客户端必须把它与 NOT_FOUND 区别对待——「坏了」不等于「被删了」，
 	// 绝不能因此触发本地的删除跟随。
 	CodeCorrupted = "CONTENT_CORRUPTED"
-	CodeFileIDConflict      = "FILE_ID_CONFLICT"
-	CodeTombstonePlaintext  = "TOMBSTONE_PLAINTEXT"
-	CodeHashMismatch        = "HASH_MISMATCH"
+	// CodeCheckpointRejected（v0.15 / §9.2）：checkpoint 发布被拒
+	//（设备已撤销、未登记签名公钥等）
+	CodeCheckpointRejected = "CHECKPOINT_REJECTED"
+	CodeFileIDConflict     = "FILE_ID_CONFLICT"
+	CodeTombstonePlaintext = "TOMBSTONE_PLAINTEXT"
+	CodeHashMismatch       = "HASH_MISMATCH"
 	// --- 协议 v6 新增（ADR-003 / ADR-006） ---
 	CodeFormatEpochMismatch = "FORMAT_EPOCH_MISMATCH"
 	CodeRepoEpochMismatch   = "REPO_EPOCH_MISMATCH"
