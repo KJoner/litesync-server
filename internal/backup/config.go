@@ -3,6 +3,7 @@ package backup
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -10,7 +11,19 @@ import (
 // （key = backup-config），明文永不落盘。
 type Config struct {
 	Enabled  bool   `json:"enabled"`  // 自动备份开关
-	Provider string `json:"provider"` // 目前仅 "r2"（S3 兼容）
+	Provider string `json:"provider"` // "r2"（S3 兼容）或 "local"（本地/挂载盘）
+
+	// LocalPath（Provider = "local"）：restic 仓库所在目录。
+	//
+	// 为什么支持本地仓库：不是所有自建用户都愿意（或能够）用对象存储。
+	// 备份到挂载的 NAS 或外接盘是完全正当的生产配置，而且它让**灾备恢复
+	// 演练**成为一件随时可做的事——一个只能备份到付费云的系统，
+	// 实际上等于没人会去演练恢复。
+	//
+	// 注意：本地仓库与数据目录放在同一块盘上时，同一次硬件故障会同时带走
+	// 两者。这一点在 README 里明确警告，但不在代码里强制——挂载点是否
+	// 独立，只有管理员知道。
+	LocalPath string `json:"localPath"`
 
 	AccountID string `json:"accountId"` // Cloudflare Account ID
 	Bucket    string `json:"bucket"`
@@ -33,6 +46,7 @@ type View struct {
 	Bucket    string `json:"bucket"`
 	Prefix    string `json:"prefix"`
 	Endpoint  string `json:"endpoint"`
+	LocalPath string `json:"localPath"`
 
 	AccessKeyConfigured      bool `json:"accessKeyConfigured"`
 	SecretKeyConfigured      bool `json:"secretKeyConfigured"`
@@ -53,6 +67,7 @@ func (c Config) view() View {
 		Bucket:                   c.Bucket,
 		Prefix:                   c.Prefix,
 		Endpoint:                 c.Endpoint,
+		LocalPath:                c.LocalPath,
 		AccessKeyConfigured:      c.AccessKeyID != "",
 		SecretKeyConfigured:      c.SecretAccessKey != "",
 		ResticPasswordConfigured: c.ResticPassword != "",
@@ -60,14 +75,27 @@ func (c Config) view() View {
 	}
 }
 
+// isLocal 报告是否使用本地仓库后端。
+func (c Config) isLocal() bool { return c.Provider == "local" }
+
 // configured 判断是否具备执行 restic 的全部条件。
 func (c Config) configured() bool {
+	if c.ResticPassword == "" {
+		return false
+	}
+	if c.isLocal() {
+		// 本地仓库不需要任何云凭据
+		return c.LocalPath != ""
+	}
 	return c.Bucket != "" && c.AccessKeyID != "" && c.SecretAccessKey != "" &&
-		c.ResticPassword != "" && (c.AccountID != "" || c.Endpoint != "")
+		(c.AccountID != "" || c.Endpoint != "")
 }
 
-// repository 返回 restic 的 -r 值（s3 兼容）。
+// repository 返回 restic 的 -r 值。
 func (c Config) repository() string {
+	if c.isLocal() {
+		return c.LocalPath
+	}
 	endpoint := c.Endpoint
 	if endpoint == "" {
 		endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", c.AccountID)
@@ -93,6 +121,8 @@ type Update struct {
 	SecretAccessKey *string `json:"secretAccessKey"`
 	ResticPassword  *string `json:"resticPassword"`
 
+	LocalPath *string `json:"localPath"`
+
 	BudgetGB *int `json:"budgetGb"`
 }
 
@@ -103,10 +133,19 @@ func (c Config) apply(u Update) (Config, error) {
 		out.Enabled = *u.Enabled
 	}
 	if u.Provider != nil && *u.Provider != "" {
-		if *u.Provider != "r2" {
-			return c, fmt.Errorf("unsupported provider %q", *u.Provider)
+		if *u.Provider != "r2" && *u.Provider != "local" {
+			return c, fmt.Errorf("unsupported provider %q (use r2 or local)", *u.Provider)
 		}
 		out.Provider = *u.Provider
+	}
+	if u.LocalPath != nil {
+		p := strings.TrimSpace(*u.LocalPath)
+		// 必须是绝对路径：相对路径会随服务的工作目录漂移，
+		// 而备份仓库找不到这件事往往要到需要恢复的那天才被发现
+		if p != "" && !filepath.IsAbs(p) {
+			return c, fmt.Errorf("localPath must be an absolute path")
+		}
+		out.LocalPath = p
 	}
 	if u.AccountID != nil {
 		out.AccountID = strings.TrimSpace(*u.AccountID)

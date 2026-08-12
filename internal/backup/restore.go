@@ -61,15 +61,32 @@ func (m *Manager) Restore(ctx context.Context, snapshotID string) (*RestoreResul
 
 	ctx, cancel := context.WithTimeout(ctx, longTimeout)
 	defer cancel()
+
+	// 用 `snapshotID:subfolder` 语法只还原数据目录**这一棵子树**，
+	// 让它直接落在 staging 根上。
+	//
+	// 为什么不能用朴素的 `restore <id> --target <staging>`：restic 会把快照里的
+	// 完整绝对路径结构一起重建出来。在 Windows 上那意味着先造出
+	// `<staging>\C\Users\...` 这一串合成父目录，而 restic 随后要给每一层
+	// 设置时间戳——对 `C\Users` 这种目录会得到 Access denied，restic 于是
+	// 以 exit 1 结束整个恢复。
+	//
+	// 这个 bug 是灾备恢复实机演练发现的：用 fake runner 的单元测试永远看不到它，
+	// 而它会让 Windows 上的恢复**完全不可用**——偏偏恢复正是最不能出问题的操作。
+	// 快照里存的是 staging 目录（<dataDir>/.backup-staging/current），
+	// 不是数据目录本身——buildStaging 先把一致的 sync.db 与 blob 硬链接
+	// 汇到那里，再交给 restic。因此子树路径要指向 staging。
+	snapshotRef := snapshotID + ":" + toSnapshotPath(
+		filepath.Join(m.dataDir, ".backup-staging", "current"))
 	if _, err := m.runner.Run(ctx,
-		[]string{"restore", snapshotID, "--target", staging}, cfg.env(m.dataDir)); err != nil {
+		[]string{"restore", snapshotRef, "--target", staging}, cfg.env(m.dataDir)); err != nil {
 		return nil, fmt.Errorf("restic restore: %w", err)
 	}
 
-	// restic 会把原路径结构一起还原出来；找到里面的数据目录
-	restored, err := locateRestoredDataDir(staging, filepath.Base(m.dataDir))
-	if err != nil {
-		return nil, err
+	// 子树语法下，staging 本身就是还原出来的数据目录
+	restored := staging
+	if _, err := os.Stat(filepath.Join(restored, "sync.db")); err != nil {
+		return nil, fmt.Errorf("恢复出的内容里没有 sync.db（快照 %s 可能不是一份完整的数据目录）", snapshotID)
 	}
 
 	// 旧数据目录挪开而不是删除——恢复错快照时这是唯一的退路
@@ -110,31 +127,20 @@ func (m *Manager) Restore(ctx context.Context, snapshotID string) (*RestoreResul
 	return res, nil
 }
 
-// locateRestoredDataDir 在 restic 还原出来的目录树里找到数据目录。
+// toSnapshotPath 把本机的数据目录路径转成 restic 快照里的路径形式。
 //
-// restic 保留绝对路径结构（例如 <staging>/data 或 <staging>/srv/litesync/data），
-// 所以不能假设它就在第一层。这里按目录名逐层找，找不到就报错——
-// 猜一个目录然后把它当数据目录换上去，是不能接受的赌博。
-func locateRestoredDataDir(staging, want string) (string, error) {
-	var found string
-	err := filepath.WalkDir(staging, func(p string, d os.DirEntry, err error) error {
-		if err != nil || !d.IsDir() || found != "" {
-			return nil //nolint:nilerr
-		}
-		if d.Name() != want {
-			return nil
-		}
-		// 认准「里面有 sync.db」才算数：同名目录未必是数据目录
-		if _, serr := os.Stat(filepath.Join(p, "sync.db")); serr == nil {
-			found = p
-		}
-		return nil
-	})
+// restic 在快照里统一用正斜杠，并且把 Windows 盘符表示成 `/C/Users/...`
+//（去掉冒号）。不做这个转换的话，`snapshotID:subfolder` 会匹配不到任何东西，
+// 恢复会以「快照里没有这个子目录」失败。
+func toSnapshotPath(dataDir string) string {
+	abs, err := filepath.Abs(dataDir)
 	if err != nil {
-		return "", err
+		abs = dataDir
 	}
-	if found == "" {
-		return "", fmt.Errorf("在恢复出的内容里找不到数据目录（期望名为 %q 且含 sync.db）", want)
+	p := filepath.ToSlash(abs)
+	// "C:/Users/x" → "/C/Users/x"
+	if len(p) > 1 && p[1] == ':' {
+		p = "/" + p[:1] + p[2:]
 	}
-	return found, nil
+	return p
 }
