@@ -298,7 +298,7 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 	}
 
 	// ---- 仓库状态：信封下限与 schema 版本已就位 ----
-	rs, err := db.GetRepoState(d)
+	rs, err := db.GetRepoState(d, db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestV6MigrationResumable(t *testing.T) {
 	if _, err := d.Exec(`ALTER TABLE v5_changes RENAME TO changes`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetSchemaVersion(d, 5); err != nil {
+	if err := db.SetSchemaVersion(d, db.LegacyDefaultScope(), 5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -391,7 +391,7 @@ func TestV6MigrationSkippedOnFreshDB(t *testing.T) {
 	if need, err := db.NeedsV6Migration(d); err != nil || need {
 		t.Fatalf("fresh db needs migration = %v %v", need, err)
 	}
-	rs, err := db.GetRepoState(d)
+	rs, err := db.GetRepoState(d, db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}

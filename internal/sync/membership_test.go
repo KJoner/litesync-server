@@ -66,7 +66,7 @@ func TestRemoveMemberRevokesDevicesAndRotatesKey(t *testing.T) {
 		"alice": db.RoleOwner,
 		"bob":   db.RoleEditor,
 	})
-	before, err := db.CurrentKeyEpoch(s.DB())
+	before, err := db.CurrentKeyEpoch(s.DB(), db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}

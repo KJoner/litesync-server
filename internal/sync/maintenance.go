@@ -173,7 +173,7 @@ func (s *Service) maintainHistoryRetention(now int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return 0, err
 	}
@@ -192,7 +192,7 @@ func (s *Service) maintainHistoryRetention(now int64) (int, error) {
 		if h, herr := db.GetHead(tx, fileID); herr == nil && h != nil {
 			pseudonym = h.Pseudonym
 		}
-		days, maxPerFile := s.retentionFor(rs.MetaState, pseudonym)
+		days, maxPerFile := s.retentionFor(tx, rs.MetaState, pseudonym)
 		blobs, err := s.pruneVersionsTx(tx, fileID, now, days, maxPerFile)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck
@@ -345,7 +345,7 @@ func (s *Service) gcBlockedReason() (bool, string) {
 	if n := s.busyOps.Load(); n > 0 {
 		return true, "scrub-or-backup-running"
 	}
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return true, "repo-state-unavailable" // 读不到状态就别动数据
 	}
@@ -439,7 +439,7 @@ func (s *Service) maintainChanges(now int64) (int64, error) {
 		return 0, err
 	}
 	// 水位线记录在 repo_state（v9），与删除同一事务提交，且只增不减
-	if err := db.SetMinRetainedSequence(tx, deleteUpTo); err != nil {
+	if err := db.SetMinRetainedSequence(tx, s.scope(), deleteUpTo); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

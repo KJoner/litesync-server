@@ -77,7 +77,7 @@ func newMigrationID() (string, error) {
 func (s *Service) ExpireStaleMigrationLease(now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return 0, err
 	}
@@ -96,7 +96,7 @@ func (s *Service) ExpireStaleMigrationLease(now time.Time) (int, error) {
 func (s *Service) MigrationStatusOf() (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +125,7 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -149,13 +149,13 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 			return nil, ErrMigrationLocked
 		}
 		// 同一 owner → 续租并继续
-		if err := db.RenewMigrationLease(s.db, rs.MigrationID,
+		if err := db.RenewMigrationLease(s.db, s.scope(), rs.MigrationID,
 			time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
 			return nil, err
 		}
 		if rs.MetaState == db.MetaVerifying {
 			// 回到 migrating 以便补迁移遗漏项
-			if err := db.SetMetaState(s.db, db.MetaMigrating); err != nil {
+			if err := db.SetMetaState(s.db, s.scope(), db.MetaMigrating); err != nil {
 				return nil, err
 			}
 		}
@@ -174,10 +174,10 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetMetaState(tx, db.MetaMigrating); err != nil {
+	if err := db.SetMetaState(tx, s.scope(), db.MetaMigrating); err != nil {
 		return nil, err
 	}
-	if err := db.BeginMigrationRecord(tx, migrationID, deviceID,
+	if err := db.BeginMigrationRecord(tx, s.scope(), migrationID, deviceID,
 		time.Now().Add(migrationLeaseDuration).Unix(), rs.HeadSequence,
 		rs.FormatEpoch+1, rs.KeyEpoch); err != nil {
 		return nil, err
@@ -223,7 +223,7 @@ func (s *Service) enqueueMigrationJournalLocked(migrationID string) error {
 }
 
 func (s *Service) statusLocked() (*MigrationStatus, error) {
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +253,7 @@ func (s *Service) statusLocked() (*MigrationStatus, error) {
 func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +263,7 @@ func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error)
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
 		return nil, ErrMigrationNotOwner
 	}
-	if err := db.RenewMigrationLease(s.db, rs.MigrationID,
+	if err := db.RenewMigrationLease(s.db, s.scope(), rs.MigrationID,
 		time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
 		return nil, err
 	}
@@ -278,7 +278,7 @@ func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error)
 func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +294,7 @@ func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationSta
 	if rs.MigrationLeaseExpiresAt > time.Now().Unix() {
 		return nil, ErrLeaseActive
 	}
-	if err := db.BeginMigrationRecord(s.db, rs.MigrationID, deviceID,
+	if err := db.BeginMigrationRecord(s.db, s.scope(), rs.MigrationID, deviceID,
 		time.Now().Add(migrationLeaseDuration).Unix(), rs.MigrationCutoffSequence,
 		rs.MigrationTargetFormatEpoch, rs.MigrationKeyEpoch); err != nil {
 		return nil, err
@@ -322,7 +322,7 @@ func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +408,7 @@ type PlaintextTombstone struct {
 func (s *Service) ListPlaintextTombstones(deviceID string) ([]PlaintextTombstone, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +444,7 @@ func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return err
 	}
@@ -482,7 +482,7 @@ func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error
 func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -502,7 +502,7 @@ func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error)
 	if unfinished > 0 {
 		return nil, ErrMigrationIncomplete
 	}
-	if err := db.SetMetaState(s.db, db.MetaVerifying); err != nil {
+	if err := db.SetMetaState(s.db, s.scope(), db.MetaVerifying); err != nil {
 		return nil, err
 	}
 	s.log.Info("meta migration verifying", "migrationId", rs.MigrationID)
@@ -514,7 +514,7 @@ func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error)
 func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -526,10 +526,10 @@ func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetMetaState(tx, db.MetaPlain); err != nil {
+	if err := db.SetMetaState(tx, s.scope(), db.MetaPlain); err != nil {
 		return nil, err
 	}
-	if err := db.ClearMigrationRecord(tx); err != nil {
+	if err := db.ClearMigrationRecord(tx, s.scope()); err != nil {
 		return nil, err
 	}
 	if err := db.ClearJournal(tx, rs.MigrationID); err != nil {
@@ -554,7 +554,7 @@ func (s *Service) scope() db.VaultScope { return db.LegacyDefaultScope() }
 
 func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 	scope := s.scope()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -686,7 +686,7 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -729,10 +729,10 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetMetaState(tx, db.MetaEncrypted); err != nil {
+	if err := db.SetMetaState(tx, s.scope(), db.MetaEncrypted); err != nil {
 		return nil, err
 	}
-	if err := db.SetFormatEpoch(tx, rs.MigrationTargetFormatEpoch); err != nil {
+	if err := db.SetFormatEpoch(tx, s.scope(), rs.MigrationTargetFormatEpoch); err != nil {
 		return nil, err
 	}
 	// 全量裁剪 changes：旧记录里还带着迁移前的明文寻址名，
@@ -740,10 +740,10 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 	if err := db.DeleteAllChanges(tx, s.scope()); err != nil {
 		return nil, err
 	}
-	if err := db.SetMinRetainedSequence(tx, rs.HeadSequence); err != nil {
+	if err := db.SetMinRetainedSequence(tx, s.scope(), rs.HeadSequence); err != nil {
 		return nil, err
 	}
-	if err := db.ClearMigrationRecord(tx); err != nil {
+	if err := db.ClearMigrationRecord(tx, s.scope()); err != nil {
 		return nil, err
 	}
 	if err := db.ClearJournal(tx, rs.MigrationID); err != nil {

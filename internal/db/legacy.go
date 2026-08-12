@@ -14,6 +14,13 @@ type dbtx interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
+// Queryer 是 dbtx 的导出别名，供其他包命名「*sql.DB 或 *sql.Tx」这个类型。
+//
+// 存在的理由很具体：连接池上限是 1，事务开着时任何走 *sql.DB 的查询都会
+// 永远等那条被占用的连接。调用方必须**能够**把手上的 tx 传下去，
+// 而不是只能传 s.db——后者是一个悄无声息的死锁。
+type Queryer = dbtx
+
 // LegacyFile 是 v5 `files` 表的一行。
 type LegacyFile struct {
 	Path           string

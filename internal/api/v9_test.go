@@ -69,7 +69,7 @@ func TestRepoEpochAndHeadSequence(t *testing.T) {
 	}
 
 	// 灾备恢复：旋转 epoch 后 info 立即反映新值（head 不变）
-	newEpoch, err := db.RotateEpoch(e.db)
+	newEpoch, err := db.RotateEpoch(e.db, db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -54,7 +54,7 @@ func (s *Service) PublishCheckpoint(p PublishCheckpointParams) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func (s *Service) Checkpoints(sinceSequence int64, limit int) (*CheckpointBundle
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}

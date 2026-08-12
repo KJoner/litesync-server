@@ -230,7 +230,7 @@ func TestServerCrashBetweenMigrationObjects(t *testing.T) {
 func TestServerCrashBeforeMigrationComplete(t *testing.T) {
 	defer failpoint.Reset()
 	s, _ := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
-	before, err := db.GetRepoState(s.DB())
+	before, err := db.GetRepoState(s.DB(), db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestServerCrashBeforeMigrationComplete(t *testing.T) {
 		t.Fatal("注入点没有生效")
 	}
 
-	after, err := db.GetRepoState(s.DB())
+	after, err := db.GetRepoState(s.DB(), db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}

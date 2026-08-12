@@ -525,7 +525,7 @@ func OldestNonHeadVersions(q dbtx, limit int) ([]ObjectVersion, error) {
 // InsertChange 追加一条变更并返回其 sequence。
 // sequence 由 repo_state.head_sequence 在同一事务内分配（全局时钟，INV-02）。
 func InsertChange(q dbtx, c *ObjectChange) (int64, error) {
-	seq, err := NextSequence(q)
+	seq, err := NextSequence(q, LegacyDefaultScope())
 	if err != nil {
 		return 0, err
 	}

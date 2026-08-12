@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -58,7 +58,13 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		d.Close()
 		return nil, fmt.Errorf("migrate journal kind: %w", err)
 	}
-	if err := initRepoState(d); err != nil {
+	// §10.2：repo_state 从单行实例级表改为按 Vault 划分。
+	// 必须在 initRepoState 之前——后者要按 vault_id 查询。
+	if err := migrateRepoStatePerVault(d); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("migrate repo state: %w", err)
+	}
+	if err := initRepoState(d, LegacyDefaultScope()); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init repo state: %w", err)
 	}

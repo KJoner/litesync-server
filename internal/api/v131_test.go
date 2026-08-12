@@ -225,7 +225,7 @@ func (e *testEnv) doJSONAs(t *testing.T, method, path, deviceID string, body any
 // setLeaseExpiry 直接改写租约到期时间（模拟 owner 失联；无需真的等 30 分钟）。
 func (e *testEnv) setLeaseExpiry(t *testing.T, at int64) {
 	t.Helper()
-	if _, err := e.db.Exec(`UPDATE repo_state SET migration_lease_expires_at = ? WHERE id = 1`, at); err != nil {
+	if _, err := e.db.Exec(`UPDATE repo_state SET migration_lease_expires_at = ? WHERE vault_id = 'default'`, at); err != nil {
 		t.Fatal(err)
 	}
 }

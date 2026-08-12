@@ -41,35 +41,18 @@ func TestChangesAreScopedPerVault(t *testing.T) {
 	}
 }
 
-// head_sequence 目前存在单行的 repo_state 里，也就是**实例级**的。
+// head_sequence 曾经存在单行的 repo_state 里，也就是实例级的。
 //
-// 单实例服务一个租户时这没问题。但一旦同一个库里出现第二个租户，
-// 「最新 sequence」就必须变成按租户的——否则 A 的写入会推高 B 看到的 head，
-// B 的客户端会一直追一个永远追不上的游标，同时也从这个数字里读出
-// 「别人今天写了多少」。
+// 那意味着一个租户的写入会推高另一个租户看到的 head：B 的客户端会一直追一个
+// 永远追不上的游标，同时从这个数字里读出「A 今天写了多少」。v0.16 §10.2 把
+// repo_state 改成了按 vault_id 划分。
 //
-// 这条测试不修问题，它只保证问题**暴露的那一刻**会有人知道：
-// 谁第一个往 object_changes 里写入第二个 vault_id，谁就会看到这条测试变红。
-func TestHeadSequenceMustBecomePerVaultBeforeMultiTenantWrites(t *testing.T) {
+// 这条测试守住那次修改：谁把 vault_id 去掉，或者又加了一张单行的全局状态表，
+// 谁就会看到它变红。
+func TestRepoStateIsPartitionedByVault(t *testing.T) {
 	d := openTestDB(t)
 
-	var vaults int
-	if err := d.QueryRow(`SELECT COUNT(DISTINCT vault_id) FROM object_changes`).Scan(&vaults); err != nil {
-		t.Fatal(err)
-	}
-	if vaults > 1 {
-		t.Skip("已经是多租户写入，下面的前提检查交给真实实现")
-	}
-
-	// repo_state 是单行表：确认这一点，好让「head 是实例级的」这个事实是可见的
-	var rows int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM repo_state`).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 1 {
-		t.Fatalf("repo_state 应当是单行表，实际 %d 行", rows)
-	}
-	hasVaultCol := false
+	var hasVaultCol bool
 	cols, err := d.Query(`SELECT name FROM pragma_table_info('repo_state')`)
 	if err != nil {
 		t.Fatal(err)
@@ -83,16 +66,27 @@ func TestHeadSequenceMustBecomePerVaultBeforeMultiTenantWrites(t *testing.T) {
 		if name == "vault_id" {
 			hasVaultCol = true
 		}
+		if name == "id" {
+			cols.Close()
+			t.Fatal("repo_state 又出现了单行主键 id —— 状态回到了实例级")
+		}
 	}
 	cols.Close()
-	if hasVaultCol {
-		t.Skip("repo_state 已经按租户划分，本前提检查不再适用")
+	if !hasVaultCol {
+		t.Fatal("repo_state 必须按 vault_id 划分（§10.2）")
 	}
-	// 走到这里说明：repo_state 单行、没有 vault_id、object_changes 只有一个租户。
-	// 这是当前架构的真实状态——一实例一租户。把它写下来，
-	// 是为了让「加第二个租户」这件事无法悄悄发生。
-	t.Log("当前为一实例一租户：head_sequence 是实例级的；" +
-		"引入同库多租户前必须先把 repo_state 按 vault 划分")
+
+	// 而且它真的能装下多行：单行 CHECK 会让第二个租户插不进去
+	if err := db.InitVaultState(d, db.ScopeFromAuth("second-tenant")); err != nil {
+		t.Fatalf("repo_state 装不下第二个租户：%v", err)
+	}
+	var n int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM repo_state`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("应当有两行状态，实际 %d 行", n)
+	}
 }
 
 // blob 的存在性不得被跨租户探测（§10.3 的性质，在 db 层再钉一次）。

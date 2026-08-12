@@ -345,7 +345,7 @@ func TestDrillEpochRotationBlocksStaleClients(t *testing.T) {
 	oldEpoch := info["repoEpoch"].(string)
 
 	// 模拟恢复后的 epoch 旋转
-	if _, err := db.RotateEpoch(e.svc.DB()); err != nil {
+	if _, err := db.RotateEpoch(e.svc.DB(), db.LegacyDefaultScope()); err != nil {
 		t.Fatalf("rotate epoch: %v", err)
 	}
 	_, info2 := e.doJSON(t, http.MethodGet, "/api/v1/info", testToken, nil)

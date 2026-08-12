@@ -42,6 +42,12 @@ func TestScopeConstructorIsNotCalledFromBusinessCode(t *testing.T) {
 		if rerr != nil {
 			return nil //nolint:nilerr
 		}
+		// 测试文件豁免：测跨租户隔离**必须**能造出两个不同的范围，
+		// 否则「A 看不到 B」这类断言根本写不出来。测试里的 ScopeFromAuth
+		// 授予不了任何真实访问权，它只是在构造被测场景。
+		if strings.HasSuffix(rel, "_test.go") {
+			return nil
+		}
 		for _, allowed := range scopeConstructorAllowlist {
 			if strings.HasPrefix(rel, allowed) {
 				return nil

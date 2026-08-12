@@ -72,10 +72,16 @@ func RevokeDevicesOfUser(q dbtx, s VaultScope, userID string) (int, error) {
 	return int(n), nil
 }
 
-// CurrentKeyEpoch 返回仓库当前的 keyEpoch。
-func CurrentKeyEpoch(q dbtx) (int64, error) {
+// CurrentKeyEpoch 返回该 Vault 当前的 keyEpoch。
+//
+// §10.2 之后 key_epoch 是**按 Vault** 的：不带范围会读到别人的世代，
+// 而 keyEpoch 决定了哪些内容还能写入——读错等于把别人的密钥轮换算到自己头上。
+func CurrentKeyEpoch(q dbtx, s VaultScope) (int64, error) {
+	if !s.Valid() {
+		return 0, ErrVaultScopeMissing
+	}
 	var e int64
-	err := q.QueryRow(`SELECT key_epoch FROM repo_state WHERE id = 1`).Scan(&e)
+	err := q.QueryRow(`SELECT key_epoch FROM repo_state WHERE vault_id = ?`, s.ID()).Scan(&e)
 	return e, err
 }
 
@@ -88,7 +94,8 @@ func RotateKeyEpoch(q dbtx, s VaultScope, reason string) (int64, error) {
 	}
 	var epoch int64
 	if err := q.QueryRow(
-		`UPDATE repo_state SET key_epoch = key_epoch + 1 WHERE id = 1 RETURNING key_epoch`).Scan(&epoch); err != nil {
+		`UPDATE repo_state SET key_epoch = key_epoch + 1 WHERE vault_id = ? RETURNING key_epoch`,
+		s.ID()).Scan(&epoch); err != nil {
 		return 0, err
 	}
 	if err := RecordKeyEpoch(q, s, epoch, reason); err != nil {

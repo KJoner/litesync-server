@@ -67,7 +67,7 @@ func NeedsV6Migration(d *sql.DB) (bool, error) {
 	if !hasLegacy {
 		return false, nil
 	}
-	rs, err := GetRepoState(d)
+	rs, err := GetRepoState(d, LegacyDefaultScope())
 	if err != nil {
 		return false, err
 	}
@@ -79,7 +79,7 @@ func DryRunV6Migration(d *sql.DB, probe BlobProbe) (*V6MigrationReport, error) {
 	if probe == nil {
 		probe = noProbe{}
 	}
-	rs, err := GetRepoState(d)
+	rs, err := GetRepoState(d, LegacyDefaultScope())
 	if err != nil {
 		return nil, err
 	}
@@ -395,20 +395,20 @@ func MigrateToV6(d *sql.DB, probe BlobProbe, log *slog.Logger) (*V6MigrationRepo
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	rs, err := GetRepoState(tx)
+	rs, err := GetRepoState(tx, LegacyDefaultScope())
 	if err != nil {
 		return nil, err
 	}
-	if err := SetMinRetainedSequence(tx, rs.HeadSequence); err != nil {
+	if err := SetMinRetainedSequence(tx, LegacyDefaultScope(), rs.HeadSequence); err != nil {
 		return nil, err
 	}
-	if err := RaiseMinimumEnvelopeVersion(tx, plan.inferredEnvelope); err != nil {
+	if err := RaiseMinimumEnvelopeVersion(tx, LegacyDefaultScope(), plan.inferredEnvelope); err != nil {
 		return nil, err
 	}
-	if err := SetFormatEpoch(tx, inferFormatEpoch(rs)); err != nil {
+	if err := SetFormatEpoch(tx, LegacyDefaultScope(), inferFormatEpoch(rs)); err != nil {
 		return nil, err
 	}
-	if err := SetSchemaVersion(tx, SchemaVersion); err != nil {
+	if err := SetSchemaVersion(tx, LegacyDefaultScope(), SchemaVersion); err != nil {
 		return nil, err
 	}
 	for _, rename := range []struct{ from, to string }{

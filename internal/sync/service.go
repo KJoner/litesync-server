@@ -268,6 +268,10 @@ type Service struct {
 	tokenSecretOnce gosync.Once
 	tokenSecret     []byte
 	tokenSecretErr  error
+	// vaultLocks（§10.2）：每个 Vault 一把写锁。共用一把的话，
+	// 一个租户的慢速上传会把所有租户的写入一起挡住——
+	// 那不只是慢，它让一个租户的负载变成另一个租户可观测的信号。
+	vaultLocks gosync.Map
 }
 
 // vaultSecret 惰性加载本 Vault 的 blobID 域分隔密钥。
@@ -350,15 +354,17 @@ func isMarkdownPath(path string) bool {
 // meta-encrypted 态下服务器只看得到伪名，**无法**再按后缀判断 Markdown 还是附件
 // （v10 计划 §4.6）。按伪名猜测会把笔记误判为附件、把三方合并需要的 base version
 // 提前裁掉。因此统一使用两种策略中**最长**的那一组，宁可多留。
-func (s *Service) retentionFor(metaState, pseudonym string) (days, maxPerFile int) {
+func (s *Service) retentionFor(q db.Queryer, metaState, pseudonym string) (days, maxPerFile int) {
+	// §10.2：保留策略按 Vault 取，允许每个租户覆盖实例默认值。
+	// q 必须是调用方的事务——这两处调用都在事务里，走 s.db 会死锁
+	r := s.retentionOf(q, s.scope())
 	if metaState == db.MetaEncrypted || metaState == db.MetaVerifying {
-		return maxInt(s.opts.HistoryDays, s.opts.HistoryAttachmentDays),
-			maxInt(s.opts.HistoryMaxPerFile, s.opts.HistoryAttachmentMax)
+		return maxInt(r.HistoryDays, r.AttachmentDays), maxInt(r.HistoryMaxPerFile, r.AttachmentMax)
 	}
 	if isMarkdownPath(pseudonym) {
-		return s.opts.HistoryDays, s.opts.HistoryMaxPerFile
+		return r.HistoryDays, r.HistoryMaxPerFile
 	}
-	return s.opts.HistoryAttachmentDays, s.opts.HistoryAttachmentMax
+	return r.AttachmentDays, r.AttachmentMax
 }
 
 // maxInt：0 表示「不限」，因此 0 永远胜出。
@@ -440,7 +446,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -634,7 +640,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 		}); err != nil {
 			return nil, err
 		}
-		days, maxPerFile := s.retentionFor(rs.MetaState, head.Pseudonym)
+		days, maxPerFile := s.retentionFor(tx, rs.MetaState, head.Pseudonym)
 		prunedBlobs, err = s.pruneVersionsTx(tx, head.FileID, now, days, maxPerFile)
 		if err != nil {
 			return nil, err
@@ -862,7 +868,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1085,7 +1091,7 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1110,7 +1116,7 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 func (s *Service) LatestSequence() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return 0, err
 	}
@@ -1125,7 +1131,7 @@ func (s *Service) RepoInfo() (*RepoInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1160,7 +1166,7 @@ func (s *Service) Snapshot() (*SnapshotResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1176,7 +1182,7 @@ func (s *Service) Snapshot() (*SnapshotResult, error) {
 func (s *Service) BeginE2eeMigration() (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1186,10 +1192,10 @@ func (s *Service) BeginE2eeMigration() (*db.RepoState, error) {
 	case db.EncryptionEncrypted:
 		return nil, ErrEncryptionState
 	}
-	if err := db.SetEncryptionState(s.db, db.EncryptionMigrating, true); err != nil {
+	if err := db.SetEncryptionState(s.db, s.scope(), db.EncryptionMigrating, true); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db)
+	return db.GetRepoState(s.db, s.scope())
 }
 
 // CompleteE2eeMigration 验证所有 HEAD 均为 LSE 密文后切换到 encrypted，
@@ -1197,7 +1203,7 @@ func (s *Service) BeginE2eeMigration() (*db.RepoState, error) {
 func (s *Service) CompleteE2eeMigration() (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1218,33 +1224,33 @@ func (s *Service) CompleteE2eeMigration() (*db.RepoState, error) {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetEncryptionState(tx, db.EncryptionEncrypted, false); err != nil {
+	if err := db.SetEncryptionState(tx, s.scope(), db.EncryptionEncrypted, false); err != nil {
 		return nil, err
 	}
-	if err := db.RaiseMinimumEnvelopeVersion(tx, db.EnvelopeLSE1); err != nil {
+	if err := db.RaiseMinimumEnvelopeVersion(tx, s.scope(), db.EnvelopeLSE1); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db)
+	return db.GetRepoState(s.db, s.scope())
 }
 
 // AbortE2eeMigration 放弃迁移，回到 plaintext（仅 migrating 状态下允许）。
 func (s *Service) AbortE2eeMigration() (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
 	if rs.EncryptionState != db.EncryptionMigrating {
 		return nil, ErrEncryptionState
 	}
-	if err := db.SetEncryptionState(s.db, db.EncryptionPlaintext, false); err != nil {
+	if err := db.SetEncryptionState(s.db, s.scope(), db.EncryptionPlaintext, false); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db)
+	return db.GetRepoState(s.db, s.scope())
 }
 
 // CompleteEnvelopeUpgrade 验证全部 live HEAD 均为 LSE3 后把信封下限提升到 3。
@@ -1252,7 +1258,7 @@ func (s *Service) AbortE2eeMigration() (*db.RepoState, error) {
 func (s *Service) CompleteEnvelopeUpgrade() (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
+	rs, err := db.GetRepoState(s.db, s.scope())
 	if err != nil {
 		return nil, err
 	}
@@ -1268,10 +1274,10 @@ func (s *Service) CompleteEnvelopeUpgrade() (*db.RepoState, error) {
 			return nil, ErrEnvelopeTooOld
 		}
 	}
-	if err := db.RaiseMinimumEnvelopeVersion(s.db, db.EnvelopeLSE3); err != nil {
+	if err := db.RaiseMinimumEnvelopeVersion(s.db, s.scope(), db.EnvelopeLSE3); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db)
+	return db.GetRepoState(s.db, s.scope())
 }
 
 func sha256Hex(b []byte) string {

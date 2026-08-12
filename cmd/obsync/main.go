@@ -62,7 +62,9 @@ func rotateEpoch() error {
 		return err
 	}
 	defer database.Close()
-	epoch, err := db.RotateEpoch(database)
+	// rotate-epoch 是运维命令，没有 HTTP 认证上下文：显式作用于默认 Vault。
+	// 多 Vault 部署下它需要接受一个 --vault 参数，届时这里会硬失败而不是猜。
+	epoch, err := db.RotateEpoch(database, db.LegacyDefaultScope())
 	if err != nil {
 		return err
 	}

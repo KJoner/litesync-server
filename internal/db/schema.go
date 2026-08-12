@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS enrollments (
 --   minimum_envelope_version  仓库级信封下限（ADR-006）：单调不减，落库前校验
 --   schema_version            数据模型版本（6 = 本 schema）
 CREATE TABLE IF NOT EXISTS repo_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+    -- v0.16 §10.2：每个 Vault 一行。v0.16 之前这里是 id INTEGER CHECK (id = 1)，
+    -- 也就是实例级的单行表；升级由 migrateRepoStatePerVault 整表重建完成。
+    vault_id TEXT PRIMARY KEY DEFAULT 'default',
     repo_epoch TEXT NOT NULL,
     head_sequence INTEGER NOT NULL,
     min_retained_sequence INTEGER NOT NULL DEFAULT 0,
