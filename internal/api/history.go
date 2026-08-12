@@ -18,6 +18,9 @@ type apiVersion struct {
 	Hash      string `json:"hash,omitempty"`
 	DeviceID  string `json:"deviceId,omitempty"`
 	CreatedAt int64  `json:"createdAt"`
+	// FileID / ContentGeneration（协议 v6）：LSE3 历史版本解密与抗回退比较需要
+	FileID            string `json:"fileId,omitempty"`
+	ContentGeneration int64  `json:"contentGeneration,omitempty"`
 }
 
 // history 返回某路径的历史版本列表（revision 降序）。
@@ -25,16 +28,19 @@ type apiVersion struct {
 func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		writeErr(w, http.StatusBadRequest, "missing path")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
 	versions, err := h.svc.History(path)
 	if err != nil {
-		if errors.Is(err, storage.ErrInvalidPath) {
-			writeErr(w, http.StatusBadRequest, "invalid path")
-			return
+		switch {
+		case errors.Is(err, storage.ErrInvalidPath):
+			writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
+		case errors.Is(err, syncsvc.ErrNotFound):
+			writeCoded(w, http.StatusNotFound, CodeNotFound, "not found", false)
+		default:
+			h.internalError(w, "history", err)
 		}
-		h.internalError(w, "history", err)
 		return
 	}
 	out := make([]apiVersion, 0, len(versions))
@@ -44,9 +50,11 @@ func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 			Action:    v.Action,
 			Size:      v.Size,
 			Mtime:     v.Mtime,
-			Hash:      v.ContentHash,
-			DeviceID:  v.DeviceID,
-			CreatedAt: v.CreatedAt,
+			Hash:              v.ContentHash,
+			DeviceID:          v.DeviceID,
+			CreatedAt:         v.CreatedAt,
+			FileID:            v.FileID,
+			ContentGeneration: v.ContentGeneration,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "versions": out})
@@ -57,7 +65,7 @@ func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		writeErr(w, http.StatusBadRequest, "missing path")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
 	revision, err := strconv.ParseInt(r.URL.Query().Get("revision"), 10, 64)
@@ -88,5 +96,6 @@ func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Action", meta.Action)
 	// 写入该版本时的稳定身份（v9.3）：LSE3 历史版本解密需要；旧行为空
 	w.Header().Set("X-File-Id", meta.FileID)
+	w.Header().Set("X-Content-Generation", strconv.FormatInt(meta.ContentGeneration, 10))
 	io.Copy(w, rc) //nolint:errcheck // 传输中断由客户端 hash 校验兜底
 }

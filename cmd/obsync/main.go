@@ -21,7 +21,7 @@ import (
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.12.1"
+const version = "0.13.0"
 
 func main() {
 	// rotate-epoch：灾备恢复后的必要步骤（服务停止时执行）。
@@ -112,17 +112,27 @@ func run() error {
 		ChangesDays:           cfg.ChangesDays,
 		ChangesMax:            cfg.ChangesMax,
 	}, logger)
-	// 为 v1 升级上来的旧文件补记当前版本（幂等；需在 HEAD 迁移前，因为要读 vault 文件）
-	if err := svc.BackfillVersions(); err != nil {
-		logger.Warn("backfill versions", "error", err)
-	}
-	// v9：为旧库补跨平台归一化 key，并对已存在的路径碰撞告警
-	if err := svc.BackfillCanonicalKeys(); err != nil {
-		logger.Warn("backfill canonical keys", "error", err)
-	}
-	// v4：HEAD 收编进 blob store，消除双份存储（幂等）
-	if err := svc.MigrateHeadToBlobs(); err != nil {
-		logger.Warn("head migration", "error", err)
+
+	// v5 → v6 数据迁移（ADR-001 §5 / ADR-003 §5）。
+	//
+	// 放在这里而不是 db.Open 里：迁移要读 blob 的 LSE3 信封头才能推断
+	// contentGeneration、keyEpoch 与信封版本，因此必须等 blob store 就绪。
+	// 由 migration_journal 驱动，逐对象提交——中途崩溃重启后续跑，重复执行幂等。
+	// 旧表迁移后重命名为 v5_* 只读保留（回滚窗口），由 `obsync migration finalize` 删除。
+	if need, err := db.NeedsV6Migration(database); err != nil {
+		return fmt.Errorf("check v6 migration: %w", err)
+	} else if need {
+		report, err := db.MigrateToV6(database, svc.BlobProbe(), logger)
+		if err != nil {
+			// 迁移失败绝不带病启动：旧表原样保留，换回上一版二进制即可继续服务
+			return fmt.Errorf("v5→v6 migration failed (old tables are intact, you can roll back): %w", err)
+		}
+		if report != nil && (report.OrphanVersions > 0 || report.NeedsReview > 0 || report.MissingBlobs > 0) {
+			logger.Warn("v6 migration needs attention",
+				"orphanVersions", report.OrphanVersions,
+				"tombstonesNeedingReview", report.NeedsReview,
+				"missingBlobs", report.MissingBlobs)
+		}
 	}
 	// 资源治理：启动执行一次，之后每 N 小时一次
 	svc.RunMaintenance()

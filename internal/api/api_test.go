@@ -134,6 +134,12 @@ func (e *testEnv) delete(t *testing.T, path string, baseRevision int64) (*http.R
 	return e.do(t, req)
 }
 
+// restore 显式恢复已删除对象（协议 v6 / ADR-002 §3.6）。
+func (e *testEnv) restore(t *testing.T, fileID string, body map[string]any) (*http.Response, map[string]any) {
+	t.Helper()
+	return e.doJSON(t, http.MethodPost, "/api/v1/files/"+fileID+"/restore", testToken, body)
+}
+
 func (e *testEnv) changes(t *testing.T, query string) (*http.Response, map[string]any) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/api/v1/changes"+query, nil)
@@ -300,7 +306,8 @@ func TestUnicodePath(t *testing.T) {
 func TestDeleteFlow(t *testing.T) {
 	e := newTestEnv(t, 1<<20)
 	content := []byte("to be deleted")
-	e.upload(t, "Notes/del.md", 0, content)
+	_, created := e.upload(t, "Notes/del.md", 0, content)
+	fileID := created["fileId"].(string)
 
 	// 旧 revision 删除 → 409
 	resp, _ := e.delete(t, "Notes/del.md", 99)
@@ -340,23 +347,51 @@ func TestDeleteFlow(t *testing.T) {
 		t.Fatalf("delete missing = %d, want 404", resp4.StatusCode)
 	}
 
-	// v9 tombstone 防复活：baseRevision=0 不再穿透墓碑 → 409，
-	// 响应携带 deleted=true + tombstone revision + priorHash（删除前内容）
-	resp5, body5 := e.upload(t, "Notes/del.md", 0, []byte("recreated"))
-	if resp5.StatusCode != http.StatusConflict {
-		t.Fatalf("recreate with base 0 = %d, want 409", resp5.StatusCode)
-	}
-	if body5["deleted"] != true || body5["revision"].(float64) != 2 {
-		t.Fatalf("tombstone conflict body = %v", body5)
-	}
-	if body5["priorHash"] != sha256Hex(content) {
-		t.Fatalf("priorHash = %v, want hash of pre-delete content", body5["priorHash"])
+	// tombstone 防复活（ADR-002）：任何普通上传都无法穿透墓碑 → 409，
+	// 响应携带 deleted=true + tombstone revision + priorHash + fileId
+	for _, base := range []int64{0, 2} {
+		resp5, body5 := e.upload(t, "Notes/del.md", base, []byte("recreated"))
+		if resp5.StatusCode != http.StatusConflict {
+			t.Fatalf("plain upsert over tombstone (base %d) = %d, want 409", base, resp5.StatusCode)
+		}
+		if body5["deleted"] != true || body5["revision"].(float64) != 2 {
+			t.Fatalf("tombstone conflict body = %v", body5)
+		}
+		if body5["priorHash"] != sha256Hex(content) {
+			t.Fatalf("priorHash = %v, want hash of pre-delete content", body5["priorHash"])
+		}
+		if body5["fileId"] != fileID {
+			t.Fatalf("tombstone conflict must carry the original fileId: %v", body5["fileId"])
+		}
 	}
 
-	// 基于 tombstone revision 的显式重建 → 允许
-	resp6, body6 := e.upload(t, "Notes/del.md", 2, []byte("recreated"))
-	if resp6.StatusCode != http.StatusOK || body6["revision"].(float64) != 3 {
-		t.Fatalf("recreate with tombstone revision = %d, revision %v", resp6.StatusCode, body6["revision"])
+	// v6：重建必须走**显式恢复**（ADR-002 §3.6）。
+	// 恢复锚点不符 → 412，绝不放行（先测失败路径，此时 tombstone 还在）
+	if r, b := e.restore(t, fileID, map[string]any{
+		"expectedTombstoneRevision": 99, "contentGeneration": 0, "pseudonym": "Notes/del.md",
+	}); r.StatusCode != http.StatusPreconditionFailed || b["code"] != "STALE_REVISION" {
+		t.Fatalf("restore with wrong anchor = %d %v, want 412 STALE_REVISION", r.StatusCode, b)
+	}
+	// 恢复后 revision 连续（2 → 3）、fileId 不变、历史全部仍可达
+	rresp, rbody := e.restore(t, fileID, map[string]any{
+		"expectedTombstoneRevision": 2,
+		"contentGeneration":         0,
+		"pseudonym":                 "Notes/del.md",
+	})
+	if rresp.StatusCode != http.StatusOK || rbody["revision"].(float64) != 3 {
+		t.Fatalf("restore = %d %v", rresp.StatusCode, rbody)
+	}
+	if rbody["fileId"] != fileID {
+		t.Fatalf("restore must keep the object identity: %v", rbody["fileId"])
+	}
+
+	// 恢复后写入新内容：revision 继续 +1
+	resp6, body6 := e.upload(t, "Notes/del.md", 3, []byte("recreated"))
+	if resp6.StatusCode != http.StatusOK || body6["revision"].(float64) != 4 {
+		t.Fatalf("upload after restore = %d, revision %v", resp6.StatusCode, body6["revision"])
+	}
+	if body6["fileId"] != fileID {
+		t.Fatalf("fileId must survive delete → restore → edit: %v", body6["fileId"])
 	}
 }
 

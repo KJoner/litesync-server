@@ -100,8 +100,10 @@ func TestLse3GenerationMonotonic(t *testing.T) {
 	}
 }
 
-// E2EE 下 MOVE：LSE3 HEAD（fileId-AAD，路径不入 AAD）放行；LSE2 HEAD 拒绝。
-func TestMoveUnderE2ee(t *testing.T) {
+// E2EE 下改名（协议 v6）：改名只动元数据，与信封版本无关——LSE3 与 LSE2 都放行，
+// 因为服务器根本不碰密文。这与 v5 的路径式 MOVE 不同：那时 LSE1/LSE2 的 AAD 绑路径，
+// 服务器侧移动会产出无法解密的内容，所以必须拒绝。
+func TestRenameUnderE2ee(t *testing.T) {
 	e := newTestEnv(t, 1<<20)
 	e.upload(t, "v3.md", 0, lse3Payload(1, 1, "v3"))
 	lse2 := append([]byte("LSE2"), []byte("\x00\x00\x00\x01iv-ct-v2")...)
@@ -114,20 +116,17 @@ func TestMoveUnderE2ee(t *testing.T) {
 		t.Fatal("complete failed (all heads are LSE ciphertext)")
 	}
 
-	// LSE3 HEAD → 放行，fileId 跟随
 	before := e.snapshotFiles(t)
 	v3ID := before["v3.md"]["fileId"].(string)
-	if r, _ := e.move(t, "v3.md", "moved.md", 1); r.StatusCode != http.StatusOK {
-		t.Fatalf("move LSE3 under e2ee = %d, want 200", r.StatusCode)
+	if r, _ := e.rename(t, "v3.md", "moved.md", 0); r.StatusCode != http.StatusOK {
+		t.Fatalf("rename LSE3 under e2ee = %d, want 200", r.StatusCode)
 	}
-	after := e.snapshotFiles(t)
-	if after["moved.md"]["fileId"] != v3ID {
-		t.Fatal("fileId must follow content across e2ee move")
+	if e.snapshotFiles(t)["moved.md"]["fileId"] != v3ID {
+		t.Fatal("fileId must follow content across rename")
 	}
-
-	// LSE2 HEAD（AAD 绑路径）→ 拒绝
-	if r, _ := e.move(t, "v2.md", "nope.md", 1); r.StatusCode != http.StatusConflict {
-		t.Fatalf("move LSE2 under e2ee = %d, want 409", r.StatusCode)
+	// LSE2 也放行：改名不重写密文
+	if r, _ := e.rename(t, "v2.md", "moved2.md", 0); r.StatusCode != http.StatusOK {
+		t.Fatalf("rename LSE2 under e2ee = %d, want 200 (rename never touches ciphertext)", r.StatusCode)
 	}
 }
 

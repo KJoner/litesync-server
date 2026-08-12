@@ -93,8 +93,8 @@ func TestSnapshotLinearizability(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if int64(len(snap.Files)) != snap.Sequence {
-			t.Fatalf("snapshot not linearizable: sequence=%d but files=%d", snap.Sequence, len(snap.Files))
+		if int64(len(snap.Objects)) != snap.Sequence {
+			t.Fatalf("snapshot not linearizable: sequence=%d but files=%d", snap.Sequence, len(snap.Objects))
 		}
 		select {
 		case <-done:
@@ -105,8 +105,8 @@ func TestSnapshotLinearizability(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if snap.Sequence != total || len(snap.Files) != total {
-				t.Fatalf("final snapshot = seq %d files %d, want %d", snap.Sequence, len(snap.Files), total)
+			if snap.Sequence != total || len(snap.Objects) != total {
+				t.Fatalf("final snapshot = seq %d files %d, want %d", snap.Sequence, len(snap.Objects), total)
 			}
 			return
 		default:
@@ -214,7 +214,7 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 	s := newService(t, syncsvc.Options{HistoryEnabled: true, HistoryDays: 90, HistoryMaxPerFile: 10})
 	old := []byte("sensitive old content")
 	upload(t, s, "secret.md", 0, old)
-	if _, err := s.Delete("secret.md", 1, "d1"); err != nil {
+	if _, err := s.Delete(syncsvc.DeleteParams{Path: "secret.md", BaseRevision: 1, DeviceID: "d1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -230,14 +230,30 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 		t.Fatalf("priorHash = %q, want pre-delete content hash", conflict.PriorHash)
 	}
 
-	// 显式基于墓碑 revision 的重建仍然允许（同名新内容）
+	// v6：带任意 baseRevision 的普通上传都无法穿透墓碑——重建必须走显式 restore
 	newContent := []byte("brand new note")
-	res, err := s.Upload(syncsvc.UploadParams{
+	_, err = s.Upload(syncsvc.UploadParams{
 		Path: "secret.md", BaseRevision: conflict.Revision, ClaimedHash: sha256HexT(newContent),
 		DeviceID: "d2", Action: "upsert",
 	}, bytes.NewReader(newContent))
-	if err != nil || res.Revision != 3 {
-		t.Fatalf("explicit recreate = %v rev %v", err, res)
+	if !asConflict(err, &conflict) || !conflict.Deleted {
+		t.Fatalf("upsert with tombstone revision = %v, want deleted conflict (restore is required)", err)
+	}
+
+	// 显式恢复：revision 连续（2 → 3），身份不变
+	rr, err := s.Restore(syncsvc.RestoreParams{
+		FileID: conflict.FileID, ExpectedTombstoneRevision: conflict.Revision,
+		ContentGeneration: 1, Pseudonym: "secret.md", DeviceID: "d2",
+	})
+	if err != nil || rr.Revision != 3 {
+		t.Fatalf("restore = %v %v", err, rr)
+	}
+	res, err := s.Upload(syncsvc.UploadParams{
+		Path: "secret.md", BaseRevision: rr.Revision, ClaimedHash: sha256HexT(newContent),
+		DeviceID: "d2", Action: "upsert",
+	}, bytes.NewReader(newContent))
+	if err != nil || res.Revision != 4 || res.FileID != conflict.FileID {
+		t.Fatalf("write after restore = %v %v", err, res)
 	}
 }
 

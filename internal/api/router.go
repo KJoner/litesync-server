@@ -46,7 +46,8 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/file", h.getFile)
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
-	mux.HandleFunc("POST /api/v1/file/move", h.moveFile) // v9.3 原子改名（明文模式）
+	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile) // v6：改名 = 元数据更新，不产生 tombstone
+	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile) // v6：显式恢复已删除对象
 	mux.HandleFunc("GET /api/v1/history", h.history)
 	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
 	mux.HandleFunc("GET /api/v1/version", h.version)
@@ -58,14 +59,21 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/e2ee/begin", h.e2eeBegin)
 	mux.HandleFunc("POST /api/v1/e2ee/complete", h.e2eeComplete)
 	mux.HandleFunc("POST /api/v1/e2ee/abort", h.e2eeAbort)
+	// 信封升级完成：验证全部 HEAD 为 LSE3 后把仓库下限提升到 3（ADR-006）
+	mux.HandleFunc("POST /api/v1/envelope/complete", h.envelopeComplete)
 
 	// 元数据加密（v9.3 三期）：改名 = 元数据更新；complete = 明文路径抹除（单向）
 	mux.HandleFunc("GET /api/v1/file/meta", h.getFileMeta)
-	mux.HandleFunc("PUT /api/v1/file/meta", h.updateFileMeta)
-	mux.HandleFunc("POST /api/v1/meta/migrate", h.migrateFileMeta)
+	mux.HandleFunc("GET /api/v1/meta/status", h.metaStatus)
 	mux.HandleFunc("POST /api/v1/meta/begin", h.metaBegin)
+	mux.HandleFunc("POST /api/v1/meta/migrate", h.migrateObject)
+	mux.HandleFunc("GET /api/v1/meta/tombstones", h.listPlaintextTombstones)
+	mux.HandleFunc("POST /api/v1/meta/migrate-tombstone", h.migrateTombstone)
+	mux.HandleFunc("POST /api/v1/meta/verify", h.metaVerify)
+	mux.HandleFunc("GET /api/v1/meta/validate", h.metaValidate)
 	mux.HandleFunc("POST /api/v1/meta/complete", h.metaComplete)
 	mux.HandleFunc("POST /api/v1/meta/abort", h.metaAbort)
+	mux.HandleFunc("GET /api/v1/admin/migration/report", h.erasureReport)
 	mux.HandleFunc("POST /api/v1/share", h.createShare)
 	mux.HandleFunc("GET /api/v1/shares", h.listShares)
 	mux.HandleFunc("DELETE /api/v1/share", h.revokeShare)
@@ -114,9 +122,13 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 // E2EE 原子 MOVE。
 // v5（v9 三阶段三期）：元数据加密——伪名路径 + LSM1 加密元数据 + 改名即
 // 元数据更新。meta-encrypted 态对 v4 客户端完全不可用（只见伪名），Min 抬到 5。
+// v6（v10 阶段 1）：fileId 为主键的对象模型（ADR-001）、隐私 tombstone 台账与
+// 显式 restore（ADR-002）、四态迁移状态机 + journal（ADR-003）、
+// 仓库级 minimumEnvelopeVersion 与 formatEpoch（ADR-006）。
+// v5 客户端按 path 寻址且不携带 formatEpoch，在 v6 仓库上会写坏对象身份，Min 抬到 6。
 const (
-	ProtocolVersion    = 5
-	MinProtocolVersion = 5
+	ProtocolVersion    = 6
+	MinProtocolVersion = 6
 )
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
@@ -144,7 +156,15 @@ func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
 		"encryptionState":    ri.EncryptionState,
 		"keyEpoch":           ri.KeyEpoch,
 		"metaState":          ri.MetaState,
-		"serverTime":         time.Now().Unix(),
+		// 协议 v6：寻址格式世代与仓库信封下限（ADR-006）。
+		// formatEpoch 变化 → 客户端必须丢弃游标重新对账；
+		// minimumEnvelopeVersion 告诉客户端「再产出旧信封会被拒」。
+		"formatEpoch":            ri.FormatEpoch,
+		"minimumEnvelopeVersion": ri.MinimumEnvelopeVersion,
+		"schemaVersion":          ri.SchemaVersion,
+		"migrationId":            ri.MigrationID,
+		"migrationOwnerDeviceId": ri.MigrationOwnerDeviceID,
+		"serverTime":             time.Now().Unix(),
 	})
 }
 
@@ -175,6 +195,15 @@ const (
 	CodeFileIDConflict      = "FILE_ID_CONFLICT"
 	CodeTombstonePlaintext  = "TOMBSTONE_PLAINTEXT"
 	CodeHashMismatch        = "HASH_MISMATCH"
+	// --- 协议 v6 新增（ADR-003 / ADR-006） ---
+	CodeFormatEpochMismatch = "FORMAT_EPOCH_MISMATCH"
+	CodeUpgradeRequired     = "UPGRADE_REQUIRED"
+	CodeMigrationLocked     = "MIGRATION_LOCKED"
+	CodeMigrationIncomplete = "MIGRATION_INCOMPLETE"
+	CodeMigrationMismatch   = "MIGRATION_MISMATCH"
+	CodeValidationFailed    = "MIGRATION_VALIDATION_FAILED"
+	CodeStaleRevision       = "STALE_REVISION"
+	CodeTombstonePurged     = "TOMBSTONE_PURGED"
 	CodeNotFound            = "NOT_FOUND"
 	CodeUnauthorized        = "UNAUTHORIZED"
 	CodeForbidden           = "FORBIDDEN"

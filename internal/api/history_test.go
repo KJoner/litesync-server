@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
@@ -83,12 +82,29 @@ func TestVersionHistoryFlow(t *testing.T) {
 		t.Fatalf("unknown revision = %d, want 404", resp.StatusCode)
 	}
 
-	// 文件删除后历史仍在，基于 tombstone revision 重新创建继续线性追加
-	//（v9：base 0 会被 tombstone 409 拒绝，必须显式携带墓碑 revision）
-	e.upload(t, "Notes/h.md", 3, []byte("resurrected"))
+	// 文件删除后历史仍在。v6：重建必须走**显式恢复**（ADR-002 §3.6），
+	// 恢复后 revision 线性延续、身份不变、删除前的历史全部仍可达
+	_, hbody := e.history(t, "Notes/h.md")
+	firstFileID := hbody["versions"].([]any)[0].(map[string]any)["fileId"].(string)
+	if r, _ := e.restore(t, firstFileID, map[string]any{
+		"expectedTombstoneRevision": 3, "contentGeneration": 0, "pseudonym": "Notes/h.md",
+	}); r.StatusCode != http.StatusOK {
+		t.Fatalf("restore = %d", r.StatusCode)
+	}
+	e.upload(t, "Notes/h.md", 4, []byte("resurrected"))
 	_, body2 := e.history(t, "Notes/h.md")
-	if len(body2["versions"].([]any)) != 4 {
-		t.Fatal("history must survive delete + recreate")
+	versions = body2["versions"].([]any)
+	if len(versions) != 5 {
+		t.Fatalf("history must survive delete + restore + edit: %d versions", len(versions))
+	}
+	for _, v := range versions {
+		if v.(map[string]any)["fileId"] != firstFileID {
+			t.Fatal("identity must survive delete → restore → edit (INV-05)")
+		}
+	}
+	// 删除前的版本内容依然可下载
+	if r, d := e.version(t, "Notes/h.md", 1); r.StatusCode != http.StatusOK || !bytes.Equal(d, v1) {
+		t.Fatalf("pre-delete version after restore = %d", r.StatusCode)
 	}
 }
 
@@ -210,81 +226,5 @@ func TestHistoryDisabled(t *testing.T) {
 	dresp, data := e.download(t, "n.md")
 	if dresp.StatusCode != http.StatusOK || !bytes.Equal(data, content) {
 		t.Fatal("download must serve from blob store")
-	}
-}
-
-// v1 升级场景：已有 files 记录（revision 5）但无版本历史 → Backfill 补记当前版本。
-func TestBackfillVersions(t *testing.T) {
-	e := newTestEnv(t, 1<<20)
-	content := []byte("legacy content")
-	hash := sha256Hex(content)
-
-	// 模拟 v1 遗留状态：直接写 vault 文件 + files 行，无版本记录
-	if err := os.MkdirAll(e.vaultDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(e.vaultDir, "old.md"), content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	e.insertLegacyFile(t, "old.md", hash, int64(len(content)), 5)
-
-	if err := e.svc.BackfillVersions(); err != nil {
-		t.Fatal(err)
-	}
-	_, body := e.history(t, "old.md")
-	versions := body["versions"].([]any)
-	if len(versions) != 1 {
-		t.Fatalf("backfill: len(versions) = %d, want 1", len(versions))
-	}
-	vresp, data := e.version(t, "old.md", 5)
-	if vresp.StatusCode != http.StatusOK || !bytes.Equal(data, content) {
-		t.Fatalf("backfilled version fetch = %d", vresp.StatusCode)
-	}
-	// 幂等：再跑一次不产生重复
-	if err := e.svc.BackfillVersions(); err != nil {
-		t.Fatal(err)
-	}
-	_, body2 := e.history(t, "old.md")
-	if len(body2["versions"].([]any)) != 1 {
-		t.Fatal("backfill must be idempotent")
-	}
-}
-
-// 历史接口同样需要认证。
-func TestHistoryAuth(t *testing.T) {
-	e := newTestEnv(t, 1<<20)
-	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/api/v1/history?path=a.md", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("history without token = %d, want 401", resp.StatusCode)
-	}
-}
-
-// 版本接口路径安全。
-func TestVersionPathSafety(t *testing.T) {
-	e := newTestEnv(t, 1<<20)
-	if resp, _ := e.version(t, "../secret", 1); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("traversal version = %d, want 400", resp.StatusCode)
-	}
-	resp, _ := e.history(t, "../secret")
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("traversal history = %d, want 400", resp.StatusCode)
-	}
-}
-
-// insertLegacyFile 直接向 files 表插入一行（模拟 v1 数据），绕过版本记录。
-func (e *testEnv) insertLegacyFile(t *testing.T, path, hash string, size, revision int64) {
-	t.Helper()
-	now := time.Now().Unix()
-	if _, err := e.db.Exec(
-		`INSERT INTO files (path, content_hash, size, mtime, revision, deleted, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
-		path, hash, size, now*1000, revision, now, now,
-	); err != nil {
-		t.Fatal(err)
 	}
 }

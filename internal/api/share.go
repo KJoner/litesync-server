@@ -39,18 +39,24 @@ func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
 		// v9.3 三期：加密元数据（真实路径在里面；快照是对账与接入的权威清单）
 		MetaEnc        string `json:"metaEnc,omitempty"`
 		MetaGeneration int64  `json:"metaGeneration,omitempty"`
+		// 协议 v6：抗回退比较与信封下限核对需要
+		ContentGeneration int64 `json:"contentGeneration,omitempty"`
+		EnvelopeVersion   int64 `json:"envelopeVersion,omitempty"`
 	}
-	out := make([]apiFile, 0, len(snap.Files))
-	for _, f := range snap.Files {
+	out := make([]apiFile, 0, len(snap.Objects))
+	for i := range snap.Objects {
+		o := &snap.Objects[i]
 		out = append(out, apiFile{
-			Path: f.Path, Revision: f.Revision, Hash: f.ContentHash, Size: f.Size, Mtime: f.Mtime,
-			FileID: f.FileID, MetaEnc: f.MetaEnc, MetaGeneration: f.MetaGeneration,
+			Path: o.Pseudonym, Revision: o.Revision, Hash: o.ContentHash, Size: o.Size, Mtime: o.Mtime,
+			FileID: o.FileID, MetaEnc: o.EncryptedMetadata, MetaGeneration: o.MetaGeneration,
+			ContentGeneration: o.ContentGeneration, EnvelopeVersion: o.EnvelopeVersion,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"repoEpoch": snap.RepoEpoch,
-		"sequence":  snap.Sequence,
-		"files":     out,
+		"repoEpoch":   snap.RepoEpoch,
+		"formatEpoch": snap.FormatEpoch,
+		"sequence":    snap.Sequence,
+		"files":       out,
 	})
 }
 

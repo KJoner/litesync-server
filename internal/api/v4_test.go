@@ -165,9 +165,9 @@ func TestChangesPruneAndResync(t *testing.T) {
 
 func TestMaintenanceHistorySweep(t *testing.T) {
 	e := newTestEnvOpts(t, 1<<20, syncsvc.Options{
-		HistoryEnabled:        true,
-		HistoryMaxPerFile:     100, // md 宽松
-		HistoryAttachmentMax:  2,   // 附件最多 2 个版本
+		HistoryEnabled:       true,
+		HistoryMaxPerFile:    100, // md 宽松
+		HistoryAttachmentMax: 2,   // 附件最多 2 个版本
 	})
 	// 附件传 4 个版本 → 维护后只剩 2
 	for i := 0; i < 4; i++ {
@@ -253,40 +253,5 @@ func TestMaintenanceOrphanBlobsAndShares(t *testing.T) {
 	dresp, data := e.download(t, "keep.md")
 	if dresp.StatusCode != http.StatusOK || !bytes.Equal(data, content) {
 		t.Fatal("download broken after maintenance")
-	}
-}
-
-// ---------- HEAD → blob 迁移（旧部署升级） ----------
-
-func TestMigrateHeadToBlobs(t *testing.T) {
-	e := newTestEnv(t, 1<<20)
-	content := []byte("legacy head content")
-	hash := sha256Hex(content)
-
-	// 模拟 v0.4 之前的状态：内容在 vault 目录 + files 行，blob 不存在
-	os.MkdirAll(e.vaultDir, 0o700)
-	if err := os.WriteFile(filepath.Join(e.vaultDir, "old.md"), content, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	e.insertLegacyFile(t, "old.md", hash, int64(len(content)), 3)
-
-	if err := e.svc.MigrateHeadToBlobs(); err != nil {
-		t.Fatal(err)
-	}
-	// blob 已建立，vault 物理文件已删除
-	if _, err := os.Stat(blobPath(e.blobDir, hash)); err != nil {
-		t.Fatal("blob must exist after migration")
-	}
-	if _, err := os.Stat(filepath.Join(e.vaultDir, "old.md")); !os.IsNotExist(err) {
-		t.Fatal("vault file must be absorbed")
-	}
-	// 下载从 blob 服务
-	dresp, data := e.download(t, "old.md")
-	if dresp.StatusCode != http.StatusOK || !bytes.Equal(data, content) {
-		t.Fatalf("download after migration = %d", dresp.StatusCode)
-	}
-	// 幂等
-	if err := e.svc.MigrateHeadToBlobs(); err != nil {
-		t.Fatal(err)
 	}
 }

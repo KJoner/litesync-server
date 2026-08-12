@@ -49,7 +49,7 @@ func TestRepoEpochAndHeadSequence(t *testing.T) {
 	if info["headSequence"].(float64) != 2 || info["latestSequence"].(float64) != 2 {
 		t.Fatalf("headSequence/latestSequence = %v/%v", info["headSequence"], info["latestSequence"])
 	}
-	if info["encryptionState"] != "plaintext" || info["protocolVersion"].(float64) != 5 {
+	if info["encryptionState"] != "plaintext" || info["protocolVersion"].(float64) != 6 {
 		t.Fatalf("encryptionState/protocolVersion = %v/%v", info["encryptionState"], info["protocolVersion"])
 	}
 	if info["metaState"] != "plain" {
@@ -183,10 +183,23 @@ func TestPathRules(t *testing.T) {
 		t.Fatalf("self update = %d", resp.StatusCode)
 	}
 
-	// 原路径删除（tombstone）后，冲突路径允许创建
-	e.delete(t, "Notes/Note.md", 2)
-	if resp, _ := e.upload(t, "notes/note.md", 0, []byte("y")); resp.StatusCode != http.StatusOK {
-		t.Fatalf("create after tombstone = %d", resp.StatusCode)
+	// 原路径删除后，同名（含大小写变体）依然被删除屏障挡住（v6 / ADR-002）：
+	// tombstone 保留 canonical 键，「删掉再换个大小写建回来」不再能静默复活，
+	// 必须走显式 restore。v5 在这里是直接放行的。
+	_, delBody := e.delete(t, "Notes/Note.md", 2)
+	deletedID := delBody["fileId"].(string)
+	resp, cbody := e.upload(t, "notes/note.md", 0, []byte("y"))
+	if resp.StatusCode != http.StatusConflict || cbody["deleted"] != true {
+		t.Fatalf("create after tombstone = %d %v, want 409 deleted", resp.StatusCode, cbody)
+	}
+	if cbody["fileId"] != deletedID {
+		t.Fatalf("tombstone conflict must name the deleted object: %v", cbody["fileId"])
+	}
+	// 显式恢复到新的大小写名字 → 允许
+	if r, _ := e.restore(t, deletedID, map[string]any{
+		"expectedTombstoneRevision": cbody["revision"], "contentGeneration": 0, "pseudonym": "notes/note.md",
+	}); r.StatusCode != http.StatusOK {
+		t.Fatalf("restore to case-variant name = %d, want 200", r.StatusCode)
 	}
 
 	// Windows 保留名与尾随句点/空格 → 400

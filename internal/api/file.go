@@ -13,10 +13,10 @@ import (
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-// putFile 处理文件上传。
-// Header：X-File-Path（percent-encoded，支持中文等非 ASCII 路径）、
-// X-Base-Revision、X-Content-Hash（SHA-256 hex）、X-File-Mtime（毫秒，可选）。
-// Body：原始文件字节。
+// putFile 处理内容上传。
+// Header：X-File-Path（percent-encoded 的服务器可见寻址名）、X-Base-Revision、
+// X-Content-Hash（SHA-256 hex）、X-File-Mtime（毫秒，可选）、
+// X-Format-Epoch / X-LiteSync-Protocol（协议 v6 逐请求校验）、X-Operation-Id（幂等键）。
 func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	path, err := url.PathUnescape(r.Header.Get("X-File-Path"))
 	if err != nil || path == "" {
@@ -33,8 +33,7 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "X-Content-Hash must be a sha256 hex digest", false)
 		return
 	}
-	// 元数据 Header 的格式与长度上限（v0.12.1 / LS-121-S04）：
-	// 不再依赖 HTTP Server 的总 Header 上限作为唯一保护
+	// 元数据 Header 的格式与长度上限：不依赖 HTTP Server 的总 Header 上限兜底
 	if bad := validateMetaHeaders(r.Header); bad != "" {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "invalid "+bad+" header", false)
 		return
@@ -43,35 +42,66 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	if v := r.Header.Get("X-File-Mtime"); v != "" {
 		mtime, _ = strconv.ParseInt(v, 10, 64)
 	}
-	action := r.Header.Get("X-Action") // ""/upsert/merge/restore
-	deviceID := auditDeviceID(r)
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
 	res, err := h.svc.Upload(syncsvc.UploadParams{
-		Path:         path,
-		BaseRevision: baseRevision,
-		ClaimedHash:  hash,
-		Mtime:        mtime,
-		DeviceID:     deviceID,
-		Action:       action,
-		// X-File-Id（v9.3）：E2EE 客户端为新文件预生成的稳定身份
-		ClientFileID: r.Header.Get("X-File-Id"),
-		// v9.3 三期：加密元数据与 canonical HMAC（meta 模式建档必带）
-		MetaEnc:       r.Header.Get("X-Meta-Enc"),
-		CanonicalHash: r.Header.Get("X-Canonical-Hash"),
+		Path:            path,
+		BaseRevision:    baseRevision,
+		ClaimedHash:     hash,
+		Mtime:           mtime,
+		DeviceID:        auditDeviceID(r),
+		Action:          r.Header.Get("X-Action"), // ""/upsert/merge/restore
+		ClientFileID:    r.Header.Get("X-File-Id"),
+		MetaEnc:         r.Header.Get("X-Meta-Enc"),
+		CanonicalHash:   r.Header.Get("X-Canonical-Hash"),
+		OperationID:     operationID(r),
+		FormatEpoch:     headerInt(r, "X-Format-Epoch"),
+		ProtocolVersion: headerInt(r, "X-LiteSync-Protocol"),
 	}, body)
 	if err != nil {
 		h.writeUploadError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":     res.Path,
-		"revision": res.Revision,
-		"hash":     res.Hash,
-		"size":     res.Size,
-		"sequence": res.Sequence,
-		"fileId":   res.FileID,
+		"path":              res.Path,
+		"revision":          res.Revision,
+		"hash":              res.Hash,
+		"size":              res.Size,
+		"sequence":          res.Sequence,
+		"fileId":            res.FileID,
+		"contentGeneration": res.ContentGeneration,
+		"metaGeneration":    res.MetaGeneration,
 	})
+}
+
+// operationID 幂等键：客户端在响应丢失后用同一个 id 重试，服务器返回首次结果。
+func operationID(r *http.Request) string {
+	v := r.Header.Get("X-Operation-Id")
+	if len(v) > 64 || !isSafeToken(v) {
+		return ""
+	}
+	return v
+}
+
+func isSafeToken(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func headerInt(r *http.Request, name string) int64 {
+	v := r.Header.Get(name)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
@@ -82,20 +112,25 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	case errors.As(err, &conflict):
 		writeConflict(w, conflict)
 	case errors.As(err, &collision):
-		// 422：请求合法但该路径与现有文件在大小写不敏感文件系统上冲突
 		writeCollision(w, collision)
 	case errors.Is(err, syncsvc.ErrEnvelopeTooOld):
-		// 信封降级冻结（LS-121-S01）：HEAD 已是 LSE3，旧信封覆盖一律拒绝。
-		// 机器码让客户端能区分「revision 冲突」与「协议级拒绝」
+		// 仓库级信封下限（ADR-006）：覆盖新建、更新与删除后重建的全部写入路径
 		writeCoded(w, http.StatusConflict, CodeEnvelopeTooOld,
-			"current head uses the LSE3 envelope; downgrading to an older envelope is not allowed", false)
+			"envelope version is below the repository minimum; upgrade the envelope first", false)
+	case errors.Is(err, syncsvc.ErrFormatEpoch):
+		writeCoded(w, http.StatusConflict, CodeFormatEpochMismatch,
+			"format epoch mismatch; refresh repository state and reconcile", false)
+	case errors.Is(err, syncsvc.ErrUpgradeRequired):
+		writeCoded(w, http.StatusUpgradeRequired, CodeUpgradeRequired,
+			"this repository requires a newer client (protocol v6)", false)
+	case errors.Is(err, syncsvc.ErrMigrationLocked):
+		writeCoded(w, http.StatusConflict, CodeMigrationLocked,
+			"a metadata migration is in progress; only the migration owner may write unmigrated objects", true)
 	case errors.Is(err, syncsvc.ErrFileIDConflict):
 		writeCoded(w, http.StatusConflict, CodeFileIDConflict, "client-provided file id is already in use", false)
 	case errors.Is(err, syncsvc.ErrPlaintextRejected):
-		// E2EE 明文冻结：仓库已启用加密，明文上传一律拒绝
 		writeCoded(w, http.StatusConflict, CodePlaintextRejected, err.Error(), false)
 	case errors.Is(err, syncsvc.ErrMetaRequired):
-		// 元数据加密态：伪名路径 + 加密元数据缺失
 		writeCoded(w, http.StatusBadRequest, CodeMetaRequired, err.Error(), false)
 	case errors.As(err, &tooBig):
 		writeCoded(w, http.StatusRequestEntityTooLarge, CodeTooLarge, "file too large", false)
@@ -103,12 +138,14 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
 	case errors.Is(err, storage.ErrHashMismatch):
 		writeCoded(w, http.StatusBadRequest, CodeHashMismatch, "content hash mismatch", false)
+	case errors.Is(err, syncsvc.ErrNotFound):
+		writeCoded(w, http.StatusNotFound, CodeNotFound, "not found", false)
 	default:
 		h.internalError(w, "upload", err)
 	}
 }
 
-// writeCollision 422：canonical 归一化后与现有文件同名（meta 模式下比较的是 HMAC）。
+// writeCollision 422：canonical 归一化后与现有对象同名（meta 模式下比较的是 HMAC）。
 func writeCollision(w http.ResponseWriter, c *syncsvc.PathCollisionError) {
 	writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 		"code":      CodeCanonicalCollision,
@@ -120,71 +157,115 @@ func writeCollision(w http.ResponseWriter, c *syncsvc.PathCollisionError) {
 	})
 }
 
-// moveFile 原子改名（v9.3）。Body：{"fromPath","toPath","baseRevision"}
-// 明文模式专用；E2EE / 目标占用 / revision 不符时客户端回退 delete+upsert。
-func (h *handlers) moveFile(w http.ResponseWriter, r *http.Request) {
+// renameFile 改名（协议 v6）：一次元数据更新，**不产生 tombstone**（ADR-001 §3.4）。
+// POST /api/v1/file/rename  Body: {"fromPath","toPath","baseMetaGeneration","metaEnc","canonicalHash"}
+func (h *handlers) renameFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FromPath     string `json:"fromPath"`
-		ToPath       string `json:"toPath"`
-		BaseRevision int64  `json:"baseRevision"`
+		FromPath           string `json:"fromPath"`
+		ToPath             string `json:"toPath"`
+		BaseMetaGeneration int64  `json:"baseMetaGeneration"`
+		MetaEnc            string `json:"metaEnc"`
+		CanonicalHash      string `json:"canonicalHash"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
-		req.FromPath == "" || req.ToPath == "" {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxMetaEncSize+1024)).Decode(&req); err != nil ||
+		req.FromPath == "" || req.ToPath == "" || req.BaseMetaGeneration < 0 ||
+		len(req.MetaEnc) > maxMetaEncSize || !isBase64Header(req.MetaEnc) ||
+		(req.CanonicalHash != "" && !isLowerHexOfLen(req.CanonicalHash, canonicalHashHexLen)) {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
 		return
 	}
-	res, err := h.svc.Move(req.FromPath, req.ToPath, req.BaseRevision, auditDeviceID(r))
+	res, err := h.svc.Rename(syncsvc.RenameParams{
+		FromPseudonym:      req.FromPath,
+		ToPseudonym:        req.ToPath,
+		BaseMetaGeneration: req.BaseMetaGeneration,
+		MetaEnc:            req.MetaEnc,
+		CanonicalHash:      req.CanonicalHash,
+		DeviceID:           auditDeviceID(r),
+		OperationID:        operationID(r),
+		FormatEpoch:        headerInt(r, "X-Format-Epoch"),
+		ProtocolVersion:    headerInt(r, "X-LiteSync-Protocol"),
+	})
 	if err != nil {
-		var conflict *syncsvc.ConflictError
-		var collision *syncsvc.PathCollisionError
-		switch {
-		case errors.As(err, &conflict):
-			writeConflict(w, conflict)
-		case errors.As(err, &collision):
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error": "path collision", "path": collision.Path, "existing": collision.Existing,
-			})
-		case errors.Is(err, syncsvc.ErrEncryptionState):
-			writeErr(w, http.StatusConflict, "move is not supported while vault encryption is enabled")
-		case errors.Is(err, syncsvc.ErrNotFound):
-			writeErr(w, http.StatusNotFound, "not found")
-		case errors.Is(err, storage.ErrInvalidPath):
-			writeErr(w, http.StatusBadRequest, "invalid path")
-		default:
-			h.internalError(w, "move", err)
-		}
+		h.metaError(w, "rename", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"fromPath":          res.FromPath,
-		"toPath":            res.ToPath,
-		"revision":          res.Revision,
-		"tombstoneRevision": res.TombstoneRevision,
-		"sequence":          res.Sequence,
+		"fileId":         res.FileID,
+		"fromPath":       res.FromPseudonym,
+		"toPath":         res.ToPseudonym,
+		"revision":       res.Revision,
+		"metaGeneration": res.MetaGeneration,
+		"sequence":       res.Sequence,
 	})
 }
 
-// getFile 下载文件原始字节，元数据通过响应 Header 返回。
+// restoreFile 显式恢复已删除对象（ADR-002 §3.6）。
+// POST /api/v1/files/{fileId}/restore
+func (h *handlers) restoreFile(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("fileId")
+	var req struct {
+		ExpectedTombstoneRevision int64  `json:"expectedTombstoneRevision"`
+		ContentGeneration         int64  `json:"contentGeneration"`
+		Pseudonym                 string `json:"pseudonym"`
+		MetaEnc                   string `json:"metaEnc"`
+		CanonicalHash             string `json:"canonicalHash"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxMetaEncSize+1024)).Decode(&req); err != nil ||
+		req.Pseudonym == "" || req.ExpectedTombstoneRevision <= 0 || req.ContentGeneration < 0 ||
+		len(req.MetaEnc) > maxMetaEncSize || !isBase64Header(req.MetaEnc) ||
+		(req.CanonicalHash != "" && !isLowerHexOfLen(req.CanonicalHash, canonicalHashHexLen)) {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
+		return
+	}
+	res, err := h.svc.Restore(syncsvc.RestoreParams{
+		FileID:                    fileID,
+		ExpectedTombstoneRevision: req.ExpectedTombstoneRevision,
+		ContentGeneration:         req.ContentGeneration,
+		Pseudonym:                 req.Pseudonym,
+		MetaEnc:                   req.MetaEnc,
+		CanonicalHash:             req.CanonicalHash,
+		OperationID:               operationID(r),
+		DeviceID:                  auditDeviceID(r),
+		FormatEpoch:               headerInt(r, "X-Format-Epoch"),
+		ProtocolVersion:           headerInt(r, "X-LiteSync-Protocol"),
+	})
+	if err != nil {
+		h.metaError(w, "restore", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fileId":    res.FileID,
+		"path":      res.Pseudonym,
+		"revision":  res.Revision,
+		"sequence":  res.Sequence,
+		"restored":  true,
+	})
+}
+
+// getFile 下载内容，元数据通过响应 Header 返回。
 func (h *handlers) getFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		writeErr(w, http.StatusBadRequest, "missing path")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
 	meta, rc, err := h.svc.OpenFile(path)
 	if err != nil {
 		switch {
 		case errors.Is(err, syncsvc.ErrNotFound):
-			if meta != nil && meta.Deleted {
-				// 告知客户端该文件已被删除以及 tombstone revision
+			if meta != nil {
+				// 告知客户端该对象已被删除、tombstone revision 与身份，
+				// 客户端据此走显式 restore 而不是当作新文件重建
 				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "not found", "deleted": true, "revision": meta.Revision,
+					"code": CodeNotFound, "message": "not found", "retryable": false,
+					"error": "not found", "deleted": true,
+					"revision": meta.Revision, "fileId": meta.FileID,
 				})
 				return
 			}
-			writeErr(w, http.StatusNotFound, "not found")
+			writeCoded(w, http.StatusNotFound, CodeNotFound, "not found", false)
 		case errors.Is(err, storage.ErrInvalidPath):
-			writeErr(w, http.StatusBadRequest, "invalid path")
+			writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
 		default:
 			h.internalError(w, "download", err)
 		}
@@ -199,34 +280,48 @@ func (h *handlers) getFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-File-Size", strconv.FormatInt(meta.Size, 10))
 	w.Header().Set("X-File-Mtime", strconv.FormatInt(meta.Mtime, 10))
 	w.Header().Set("X-File-Id", meta.FileID)
-	if meta.MetaEnc != "" {
-		// v9.3 三期：加密元数据随下载返回（客户端解出真实路径）
-		w.Header().Set("X-Meta-Enc", meta.MetaEnc)
+	w.Header().Set("X-Content-Generation", strconv.FormatInt(meta.ContentGeneration, 10))
+	if meta.EncryptedMetadata != "" {
+		w.Header().Set("X-Meta-Enc", meta.EncryptedMetadata)
 		w.Header().Set("X-Meta-Generation", strconv.FormatInt(meta.MetaGeneration, 10))
 	}
 	io.Copy(w, rc) //nolint:errcheck // 传输中断由客户端 hash 校验兜底
 }
 
-// deleteFile 逻辑删除文件。Body：{"path": "...", "baseRevision": N}
+// deleteFile 删除对象：HEAD 移入 tombstone 台账（ADR-002），历史保留。
+// Body：{"path": "...", "baseRevision": N}
 func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path         string `json:"path"`
 		BaseRevision int64  `json:"baseRevision"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.Path == "" {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
 		return
 	}
-	res, err := h.svc.Delete(req.Path, req.BaseRevision, auditDeviceID(r))
+	res, err := h.svc.Delete(syncsvc.DeleteParams{
+		Path:            req.Path,
+		BaseRevision:    req.BaseRevision,
+		DeviceID:        auditDeviceID(r),
+		OperationID:     operationID(r),
+		FormatEpoch:     headerInt(r, "X-Format-Epoch"),
+		ProtocolVersion: headerInt(r, "X-LiteSync-Protocol"),
+	})
 	if err != nil {
 		var conflict *syncsvc.ConflictError
 		switch {
 		case errors.As(err, &conflict):
 			writeConflict(w, conflict)
 		case errors.Is(err, syncsvc.ErrNotFound):
-			writeErr(w, http.StatusNotFound, "not found")
+			writeCoded(w, http.StatusNotFound, CodeNotFound, "not found", false)
+		case errors.Is(err, syncsvc.ErrFormatEpoch):
+			writeCoded(w, http.StatusConflict, CodeFormatEpochMismatch, "format epoch mismatch", false)
+		case errors.Is(err, syncsvc.ErrUpgradeRequired):
+			writeCoded(w, http.StatusUpgradeRequired, CodeUpgradeRequired, "client upgrade required", false)
+		case errors.Is(err, syncsvc.ErrMigrationLocked):
+			writeCoded(w, http.StatusConflict, CodeMigrationLocked, "a metadata migration is in progress", true)
 		case errors.Is(err, storage.ErrInvalidPath):
-			writeErr(w, http.StatusBadRequest, "invalid path")
+			writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
 		default:
 			h.internalError(w, "delete", err)
 		}
@@ -236,6 +331,7 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 		"path":     res.Path,
 		"revision": res.Revision,
 		"sequence": res.Sequence,
+		"fileId":   res.FileID,
 		"deleted":  true,
 	})
 }
@@ -243,7 +339,7 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
 	body := map[string]any{
 		// code=CONFLICT 表示「这是 revision 冲突，响应里带着服务器当前状态」，
-		// 与协议级的 409（如 ENVELOPE_TOO_OLD）区分开（LS-121-S05）
+		// 与协议级的 409（如 ENVELOPE_TOO_OLD）区分开
 		"code":      CodeConflict,
 		"message":   "conflict",
 		"retryable": false,
@@ -258,11 +354,15 @@ func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
 		// 客户端据此区分「陈旧副本复活」与「同名新内容重建」
 		body["priorHash"] = c.PriorHash
 	}
+	if c.FileID != "" {
+		// 冲突对象的稳定身份：客户端据此走显式 restore
+		body["fileId"] = c.FileID
+	}
 	writeJSON(w, http.StatusConflict, body)
 }
 
 // auditDeviceID：历史记录里的设备身份。设备 Token 认证时用服务器侧的可信
-// 设备 ID（v9.2，客户端自报的 X-Device-ID 不再作为审计身份）；根 Token 保留自报值。
+// 设备 ID（客户端自报的 X-Device-ID 不再作为审计身份）；根 Token 保留自报值。
 func auditDeviceID(r *http.Request) string {
 	if me := identityFrom(r); me != nil && me.DeviceID != "" {
 		return me.DeviceID
@@ -271,13 +371,5 @@ func auditDeviceID(r *http.Request) string {
 }
 
 func isSHA256Hex(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
-	for _, r := range s {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
+	return isLowerHexOfLen(strings.ToLower(s), 64)
 }

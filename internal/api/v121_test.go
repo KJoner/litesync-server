@@ -57,28 +57,30 @@ func TestUpdateFileMetaRequiresMetaState(t *testing.T) {
 	_, body := e.upload(t, "a.md", 0, lse3Payload(1, 1, "a"))
 	fileID := body["fileId"].(string)
 
-	// plain 状态：即使 path 恰好是合法伪名格式，也不得挂上 metaEnc / canonical HMAC
-	r, b := e.doJSON(t, http.MethodPut, "/api/v1/file/meta", testToken, map[string]any{
-		"path": fileID, "baseMetaGeneration": 0, "metaEnc": metaEncA, "canonicalHash": canonA,
+	// plain 状态：改名接口不得接受加密元数据（v6 的改名承接了 v5 的 file/meta）
+	r, b := e.doJSON(t, http.MethodPost, "/api/v1/file/rename", testToken, map[string]any{
+		"fromPath": "a.md", "toPath": "a.md", "baseMetaGeneration": 0,
+		"metaEnc": metaEncA, "canonicalHash": canonA,
 	})
 	if r.StatusCode != http.StatusConflict {
 		t.Fatalf("meta update in plain state = %d, want 409", r.StatusCode)
 	}
 	assertErrorBody(t, b, "META_STATE_INVALID")
+	_ = fileID
 
 	// 该文件的元数据不得被污染
 	if v, ok := e.snapshotFiles(t)["a.md"]["metaEnc"]; ok && v != "" {
 		t.Fatalf("plain-state repo must not carry metaEnc: %v", v)
 	}
 
-	// 进入 migrating 后才允许（此处路径尚未伪名化，因此按 404 拒绝而不是状态拒绝）
-	e.postE2ee(t, "begin")
-	e.postE2ee(t, "complete")
+	// 进入 migrating 后才允许（此处伪名尚不存在，因此按 404 拒绝而不是状态拒绝）
+	e.enterEncryptedRepo(t)
 	e.postMeta(t, "begin", nil)
-	if r2, _ := e.doJSON(t, http.MethodPut, "/api/v1/file/meta", testToken, map[string]any{
-		"path": "ffffffffffffffffffffffffffffffff", "baseMetaGeneration": 0, "metaEnc": metaEncA, "canonicalHash": canonA,
+	if r2, _ := e.doJSON(t, http.MethodPost, "/api/v1/file/rename", testToken, map[string]any{
+		"fromPath": "ffffffffffffffffffffffffffffffff", "toPath": "ffffffffffffffffffffffffffffffff",
+		"baseMetaGeneration": 0, "metaEnc": metaEncA, "canonicalHash": canonA,
 	}); r2.StatusCode != http.StatusNotFound {
-		t.Fatalf("meta update on unknown pseudonym = %d, want 404", r2.StatusCode)
+		t.Fatalf("rename on unknown pseudonym = %d, want 404", r2.StatusCode)
 	}
 }
 
@@ -180,14 +182,51 @@ func TestEnvelopeDowngradeAcrossLifecycle(t *testing.T) {
 	e := newTestEnv(t, 1<<20)
 	e.upload(t, "n.md", 0, lse3Payload(1, 1, "v1"))
 
-	// 删除后重建：tombstone 上没有 LSE3 HEAD，因此不受降级检查约束
-	//（重建走的是 tombstone revision 分支；仓库级 minimumEnvelopeVersion 是 v0.13.0 的工作）
-	if r, _ := e.delete(t, "n.md", 1); r.StatusCode != http.StatusOK {
+	// 删除后重建：v0.12.1 在这里是放行的（tombstone 上没有 LSE3 HEAD，降级检查够不着）。
+	// v6 把这条路径也堵上了——先被删除屏障挡住（ADR-002），恢复后再被仓库级
+	// minimumEnvelopeVersion 挡住（ADR-006）。
+	rd, delBody := e.delete(t, "n.md", 1)
+	if rd.StatusCode != http.StatusOK {
 		t.Fatal("delete failed")
 	}
-	if r, _ := e.upload(t, "n.md", 2, []byte("plaintext recreate")); r.StatusCode != http.StatusOK {
-		t.Fatalf("recreate after delete = %d, want 200 (v0.12.1 只冻结现有 LSE3 HEAD 的降级)", r.StatusCode)
+	deletedID := delBody["fileId"].(string)
+	if r, b := e.upload(t, "n.md", 2, []byte("plaintext recreate")); r.StatusCode != http.StatusConflict ||
+		b["deleted"] != true {
+		t.Fatalf("recreate after delete must hit the tombstone: %d %v", r.StatusCode, b)
 	}
+	// 提升仓库信封下限后，即使走完整的 restore 流程也不能写回明文
+	e.postE2ee(t, "begin")
+	e.postE2ee(t, "complete")
+	if r, _ := e.doJSON(t, http.MethodPost, "/api/v1/envelope/complete", testToken, nil); r.StatusCode != http.StatusOK {
+		t.Fatal("envelope complete")
+	}
+	if r, _ := e.restore(t, deletedID, map[string]any{
+		"expectedTombstoneRevision": 2, "contentGeneration": 5, "pseudonym": "n.md",
+	}); r.StatusCode != http.StatusOK {
+		t.Fatalf("restore = %d", r.StatusCode)
+	}
+	// 用 LSE1 而不是明文：明文会先被 E2EE 明文冻结拦下，看不出下限这一层。
+	// LSE1 通过了明文冻结，正好落在仓库级 minimumEnvelopeVersion 上——
+	// 这条路径 v0.12.1 完全挡不住（tombstone 上没有 LSE3 HEAD 可比）。
+	lse1 := append([]byte("LSE1"), []byte("iv-and-ciphertext-old")...)
+	rr, rb := e.upload(t, "n.md", 3, lse1)
+	if rr.StatusCode != http.StatusConflict || rb["code"] != "ENVELOPE_TOO_OLD" {
+		t.Fatalf("LSE1 write after restore = %d %v, want 409 ENVELOPE_TOO_OLD", rr.StatusCode, rb)
+	}
+	// 明文同样被拒（先撞上 E2EE 明文冻结）
+	if r, b := e.upload(t, "n.md", 3, []byte("plaintext recreate")); r.StatusCode != http.StatusConflict ||
+		b["code"] != "PLAINTEXT_REJECTED" {
+		t.Fatalf("plaintext write after restore = %d %v, want 409 PLAINTEXT_REJECTED", r.StatusCode, b)
+	}
+	// LSE3 放行：下限只挡降级，不挡正常写入
+	if r, _ := e.upload(t, "n.md", 3, lse3Payload(1, 9, "ok")); r.StatusCode != http.StatusOK {
+		t.Fatalf("LSE3 write after restore = %d, want 200", r.StatusCode)
+	}
+}
+
+// 活的 LSE3 HEAD 在仓库下限尚未提升时同样不得被降级覆盖（两道检查互补）。
+func TestLiveHeadDowngradeWithoutFloor(t *testing.T) {
+	e := newTestEnv(t, 1<<20)
 
 	// 活的 LSE3 HEAD 无论仓库处于哪种加密状态都不得被降级覆盖
 	e.upload(t, "m.md", 0, lse3Payload(1, 1, "m1"))

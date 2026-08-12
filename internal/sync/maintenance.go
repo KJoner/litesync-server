@@ -19,6 +19,8 @@ type MaintenanceStats struct {
 	ChangesCount    int64
 	// IntegrityIssues：本轮完整性 scrub 发现的问题数（应始终为 0）
 	IntegrityIssues int
+	// TombstonesPurged：本轮清理的删除记录数（默认配置下恒为 0）
+	TombstonesPurged int
 }
 
 // RunMaintenance 执行一轮资源治理（启动时 + 每 N 小时）。
@@ -58,6 +60,13 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 	if _, err := s.maintainEnrollments(now); err != nil {
 		s.log.Warn("maintenance: enrollments", "error", err)
 	}
+	// tombstone 清理走双条件（时间 + 全部未撤销设备已确认越过删除点）；
+	// 默认配置下 TombstoneRetentionDays = 0，这里永远是 no-op（ADR-002 §3.4）
+	if n, err := s.PurgeTombstones(now); err != nil {
+		s.log.Warn("maintenance: tombstones", "error", err)
+	} else {
+		stats.TombstonesPurged = n
+	}
 	if n, err := s.maintainIntegrity(); err != nil {
 		s.log.Warn("maintenance: integrity", "error", err)
 	} else {
@@ -70,7 +79,7 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 	}
 
 	stats.HistoryBytes, _ = db.NonHeadHistoryBytes(s.db)          //nolint:errcheck
-	s.db.QueryRow(`SELECT COUNT(*) FROM changes`).Scan(&stats.ChangesCount) //nolint:errcheck
+	s.db.QueryRow(`SELECT COUNT(*) FROM object_changes`).Scan(&stats.ChangesCount) //nolint:errcheck
 
 	s.log.Info("maintenance done",
 		"versionsPruned", stats.VersionsPruned,
@@ -82,6 +91,7 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 		"historyBytes", stats.HistoryBytes,
 		"changesCount", stats.ChangesCount,
 		"integrityIssues", stats.IntegrityIssues,
+		"tombstonesPurged", stats.TombstonesPurged,
 	)
 	return stats
 }
@@ -104,44 +114,49 @@ func (s *Service) maintainIntegrity() (int, error) {
 	}
 
 	s.mu.Lock()
-	files, err := db.ListFiles(s.db)
+	heads, err := db.ListHeads(s.db)
 	s.mu.Unlock()
 	if err != nil {
 		return issues, err
 	}
 
-	for i := range files {
-		f := &files[i]
-		size, ok := s.blobs.StatSize(f.ContentHash)
-		if !ok {
-			issues++
-			s.log.Error("integrity: HEAD blob missing", "path", f.Path, "blob", f.ContentHash)
+	// 日志隐私（ADR-008 §3.5）：只输出截断的 fileId，绝不输出路径
+	for i := range heads {
+		h := &heads[i]
+		if h.BlobID == "" {
 			continue
 		}
-		if size != f.Size {
+		size, ok := s.blobs.StatSize(h.BlobID)
+		if !ok {
 			issues++
-			s.log.Error("integrity: HEAD blob size mismatch", "path", f.Path, "want", f.Size, "got", size)
+			s.log.Error("integrity: HEAD blob missing", "fileId", truncateID(h.FileID), "blob", h.BlobID)
+			continue
+		}
+		if size != h.Size {
+			issues++
+			s.log.Error("integrity: HEAD blob size mismatch", "fileId", truncateID(h.FileID), "want", h.Size, "got", size)
 		}
 	}
 
 	// 随机抽查全量 hash（每轮最多 8 个；伪随机取样即可）
 	sampled := 0
-	for i := range files {
+	for i := range heads {
 		if sampled >= 8 {
 			break
 		}
-		if len(files) > 8 && i%(len(files)/8+1) != 0 {
+		if len(heads) > 8 && i%(len(heads)/8+1) != 0 {
 			continue
 		}
-		f := &files[i]
-		ok, err := s.blobs.VerifyHash(f.ContentHash)
+		h := &heads[i]
+		ok, err := s.blobs.VerifyHash(h.BlobID)
 		if err != nil {
 			continue // 存在性问题已在上面报告
 		}
 		sampled++
 		if !ok {
 			issues++
-			s.log.Error("integrity: blob content corrupted (hash mismatch)", "path", f.Path, "blob", f.ContentHash)
+			s.log.Error("integrity: blob content corrupted (hash mismatch)",
+				"fileId", truncateID(h.FileID), "blob", h.BlobID)
 		}
 	}
 	return issues, nil
@@ -153,20 +168,31 @@ func (s *Service) maintainHistoryRetention(now int64) (int, error) {
 	if !s.opts.HistoryEnabled {
 		return 0, nil
 	}
-	paths, err := db.DistinctVersionPaths(s.db)
+	fileIDs, err := db.DistinctVersionFileIDs(s.db)
+	if err != nil {
+		return 0, err
+	}
+	rs, err := db.GetRepoState(s.db)
 	if err != nil {
 		return 0, err
 	}
 	pruned := 0
-	for _, path := range paths {
+	for _, fileID := range fileIDs {
 		s.mu.Lock()
 		tx, err := s.db.Begin()
 		if err != nil {
 			s.mu.Unlock()
 			return pruned, err
 		}
-		days, maxPerFile := s.retentionFor(path)
-		blobs, err := s.pruneVersionsTx(tx, path, now, days, maxPerFile)
+		// meta 模式下服务器看不到后缀，retentionFor 自动退化为「最长保留」。
+		// 注意：这里必须用 tx 而不是 s.db——连接池上限是 1，事务开着时
+		// 任何走 s.db 的查询都会永远等待那条被占用的连接（死锁）
+		pseudonym := fileID
+		if h, herr := db.GetHead(tx, fileID); herr == nil && h != nil {
+			pseudonym = h.Pseudonym
+		}
+		days, maxPerFile := s.retentionFor(rs.MetaState, pseudonym)
+		blobs, err := s.pruneVersionsTx(tx, fileID, now, days, maxPerFile)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck
 			s.mu.Unlock()
@@ -213,7 +239,7 @@ func (s *Service) maintainHistoryBudget() (int, error) {
 		var blobs []string
 		freed := int64(0)
 		for _, v := range victims {
-			if _, err := tx.Exec(`DELETE FROM file_versions WHERE id = ?`, v.ID); err != nil {
+			if _, err := tx.Exec(`DELETE FROM object_versions WHERE id = ?`, v.ID); err != nil {
 				tx.Rollback() //nolint:errcheck
 				s.mu.Unlock()
 				return pruned, err
@@ -317,7 +343,7 @@ func (s *Service) maintainChanges(now int64) (int64, error) {
 		cutoff := now - int64(s.opts.ChangesDays)*86400
 		var seq int64
 		if err := s.db.QueryRow(
-			`SELECT COALESCE(MAX(sequence), 0) FROM changes WHERE created_at < ?`, cutoff,
+			`SELECT COALESCE(MAX(sequence), 0) FROM object_changes WHERE created_at < ?`, cutoff,
 		).Scan(&seq); err != nil {
 			return 0, err
 		}
@@ -325,13 +351,13 @@ func (s *Service) maintainChanges(now int64) (int64, error) {
 	}
 	if s.opts.ChangesMax > 0 {
 		var count int64
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM changes`).Scan(&count); err != nil {
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM object_changes`).Scan(&count); err != nil {
 			return 0, err
 		}
 		if count > int64(s.opts.ChangesMax) {
 			var seq int64
 			if err := s.db.QueryRow(
-				`SELECT sequence FROM changes ORDER BY sequence DESC LIMIT 1 OFFSET ?`, s.opts.ChangesMax,
+				`SELECT sequence FROM object_changes ORDER BY sequence DESC LIMIT 1 OFFSET ?`, s.opts.ChangesMax,
 			).Scan(&seq); err != nil {
 				return 0, err
 			}
@@ -349,7 +375,7 @@ func (s *Service) maintainChanges(now int64) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	res, err := tx.Exec(`DELETE FROM changes WHERE sequence <= ?`, deleteUpTo)
+	res, err := tx.Exec(`DELETE FROM object_changes WHERE sequence <= ?`, deleteUpTo)
 	if err != nil {
 		return 0, err
 	}

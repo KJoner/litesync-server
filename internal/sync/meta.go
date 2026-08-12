@@ -1,104 +1,229 @@
 package sync
 
-// 元数据加密（v9.3 三期，协议 v5）。
+// 元数据加密状态机与迁移（协议 v6 / ADR-003）。
 //
-// meta-encrypted 态下服务器彻底不知道文件路径：
-//   - 可见 path = 32-hex 伪名（= file_id）；真实路径在 LSM1 加密的 meta_enc 里
-//   - 改名 = 元数据更新（metaGeneration CAS），内容 blob 与内容 generation 不动
-//   - 同名并存判定靠客户端 HMAC 的 canonical 键（服务器学不到路径内容）
+//	PLAIN ──begin──► META_MIGRATING ──verify──► META_VERIFYING ──complete──► META_ENCRYPTED
+//	  ▲                    │                          │
+//	  └────────────────────┴──────────────────────────┘
+//	                     abort（无破坏性操作）
 //
-// 迁移（plain → migrating → encrypted）：
-//   - migrate-file：单事务把「真实路径行」搬到「伪名行」（file_id 继承、
-//     内容零重加密——LSE3 的 AAD 绑 fileId 不绑路径，这是二期铺垫的直接收益），
-//     并同步改写该文件历史版本的 path
-//   - complete：验证全量伪名化后执行「明文路径抹除」：删除全部 tombstone 行、
-//     清除无法再解密的旧信封（LSE1/LSE2）历史、全量裁剪 changes 并推进水位线
-//     （旧 changes 里的明文路径随之消失；所有客户端下轮走 snapshot 对账）
-//   - abort：停在混合态（已迁移的伪名行照常工作），不做任何破坏性操作
-//
-// 抹除是单向点：只发生在 complete，且要求调用方显式确认。
+// 与 v5 的关键差异：
+//   - **验证与不可逆擦除彻底分离**：VERIFYING 是独立一态，验证失败时数据没被动过
+//   - 迁移进度落在 migration_journal，服务端重启可续跑（INV-11）
+//   - 迁移只改 pseudonym / encrypted_metadata / canonical HMAC，
+//     revision、contentGeneration、blob 全部原样不动，**不产生任何 tombstone**
+//   - tombstone 做**格式转换**而不是删除（ADR-002），删除屏障完整保留（INV-06）
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
 )
 
-type MetaUpdateResult struct {
-	Path           string
-	Revision       int64
-	MetaGeneration int64
-	Sequence       int64
+// 迁移租约默认时长。owner 需在此之前续租；过期后可被显式接管（v0.13.1）。
+const migrationLeaseDuration = 30 * time.Minute
+
+// MigrationStatus 汇报迁移进度（GET /api/v1/meta/status）。
+type MigrationStatus struct {
+	MetaState              string           `json:"metaState"`
+	MigrationID            string           `json:"migrationId"`
+	OwnerDeviceID          string           `json:"ownerDeviceId"`
+	LeaseExpiresAt         int64            `json:"leaseExpiresAt"`
+	CutoffSequence         int64            `json:"cutoffSequence"`
+	TargetFormatEpoch      int64            `json:"targetFormatEpoch"`
+	FormatEpoch            int64            `json:"formatEpoch"`
+	MinimumEnvelopeVersion int64            `json:"minimumEnvelopeVersion"`
+	Journal                map[string]int64 `json:"journal"`
+	PlaintextTombstones    int64            `json:"plaintextTombstones"`
 }
 
-// UpdateFileMeta 元数据更新（改名）：内容不动，metaGeneration CAS 后 +1，
-// 发布一条 hash 不变但 metaGeneration 变新的 change（客户端据此做本地 rename）。
-func (s *Service) UpdateFileMeta(path string, baseMetaGeneration int64, metaEnc, canonicalHash, deviceID string) (*MetaUpdateResult, error) {
-	if !isHex32(path) || metaEnc == "" || !isHex64(canonicalHash) || baseMetaGeneration < 0 {
-		return nil, ErrMetaRequired
-	}
+// ValidationFailure 是 complete 验证器的一条失败项。
+type ValidationFailure struct {
+	Check   string `json:"check"`
+	Code    string `json:"code"`
+	Count   int64  `json:"count"`
+	Example string `json:"example,omitempty"` // 只放截断后的 fileId，绝不放路径
+}
 
+// ValidationError 携带**完整**失败清单——用户需要一次看到全部问题，
+// 而不是修一个跑一次（ADR-003 §3.5）。
+type ValidationError struct {
+	Failures []ValidationFailure
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("migration validation failed (%d checks)", len(e.Failures))
+}
+
+func newMigrationID() (string, error) {
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+// MigrationStatusOf 返回当前迁移状态与 journal 汇总。
+func (s *Service) MigrationStatusOf() (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// 状态守卫（v0.12.1 / LS-121-S03）：只有仓库确实处在元数据迁移或
-	// 元数据加密状态时，才允许写入 meta_enc / canonical HMAC / metaGeneration。
-	// plain 状态下这些字段没有任何合法来源——放行等于允许用特制文件名污染
-	// 元数据语义（例如给普通文件挂上伪造的 canonical 键去顶掉别人的路径）。
 	rs, err := db.GetRepoState(s.db)
 	if err != nil {
 		return nil, err
 	}
-	if rs.MetaState != db.MetaMigrating && rs.MetaState != db.MetaEncrypted {
-		return nil, ErrEncryptionState
+	counts := map[string]int64{}
+	if rs.MigrationID != "" {
+		if counts, err = db.JournalCounts(s.db, rs.MigrationID); err != nil {
+			return nil, err
+		}
 	}
-
-	cur, err := db.GetFile(s.db, path)
+	plain, err := db.PlaintextTombstoneCount(s.db)
 	if err != nil {
 		return nil, err
 	}
-	if cur == nil || cur.Deleted {
-		return nil, ErrNotFound
-	}
-	if cur.MetaGeneration != baseMetaGeneration {
-		return nil, ErrMetaCAS
-	}
-	// 新名字与其他现存文件同名 → 拒绝（HMAC 比较，不泄露路径）
-	if other, err := db.FindCanonicalCollision(s.db, "h:"+canonicalHash, path); err != nil {
+	return &MigrationStatus{
+		MetaState: rs.MetaState, MigrationID: rs.MigrationID,
+		OwnerDeviceID: rs.MigrationOwnerDeviceID, LeaseExpiresAt: rs.MigrationLeaseExpiresAt,
+		CutoffSequence: rs.MigrationCutoffSequence, TargetFormatEpoch: rs.MigrationTargetFormatEpoch,
+		FormatEpoch: rs.FormatEpoch, MinimumEnvelopeVersion: rs.MinimumEnvelopeVersion,
+		Journal: counts, PlaintextTombstones: plain,
+	}, nil
+}
+
+// BeginMetaMigration：plain → migrating。
+// 同一 owner 重复调用 = 续租（幂等）；其他 owner 且租约未过期 → MIGRATION_LOCKED。
+func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
 		return nil, err
-	} else if other != "" {
-		return nil, &PathCollisionError{Path: path, Existing: other}
+	}
+	// 前置：内容加密必须已完成，且信封下限已经是 LSE3——
+	// 否则迁移后会留下无法按 fileId 解密的旧信封内容
+	if rs.EncryptionState != db.EncryptionEncrypted {
+		return nil, ErrEncryptionState
+	}
+	if rs.MinimumEnvelopeVersion < db.EnvelopeLSE3 {
+		return nil, ErrEnvelopeTooOld
 	}
 
-	now := time.Now().Unix()
-	newGen := cur.MetaGeneration + 1
+	switch rs.MetaState {
+	case db.MetaEncrypted:
+		return nil, ErrEncryptionState
+	case db.MetaMigrating, db.MetaVerifying:
+		if rs.MigrationOwnerDeviceID != "" && rs.MigrationOwnerDeviceID != deviceID &&
+			rs.MigrationLeaseExpiresAt > time.Now().Unix() {
+			return nil, ErrMigrationLocked
+		}
+		// 同一 owner（或租约已过期后由本设备显式重入）→ 续租并继续
+		if err := db.RenewMigrationLease(s.db, rs.MigrationID,
+			time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
+			return nil, err
+		}
+		if rs.MetaState == db.MetaVerifying {
+			// 回到 migrating 以便补迁移遗漏项
+			if err := db.SetMetaState(s.db, db.MetaMigrating); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.enqueueMigrationJournalLocked(rs.MigrationID); err != nil {
+			return nil, err
+		}
+		return s.statusLocked()
+	}
 
+	migrationID, err := newMigrationID()
+	if err != nil {
+		return nil, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-
-	cur.MetaEnc = metaEnc
-	cur.MetaGeneration = newGen
-	cur.CanonicalKey = "h:" + canonicalHash
-	cur.UpdatedAt = now
-	if err := db.UpsertFile(tx, cur); err != nil {
+	if err := db.SetMetaState(tx, db.MetaMigrating); err != nil {
 		return nil, err
 	}
-	seq, err := db.InsertChangeMeta(tx, path, cur.Revision, "upsert", cur.ContentHash, now, newGen)
-	if err != nil {
+	if err := db.BeginMigrationRecord(tx, migrationID, deviceID,
+		time.Now().Add(migrationLeaseDuration).Unix(), rs.HeadSequence,
+		rs.FormatEpoch+1, rs.KeyEpoch); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	s.log.Info("meta update", "fileId", cur.FileID, "metaGen", newGen, "device", deviceID)
-	return &MetaUpdateResult{Path: path, Revision: cur.Revision, MetaGeneration: newGen, Sequence: seq}, nil
+	if err := s.enqueueMigrationJournalLocked(migrationID); err != nil {
+		return nil, err
+	}
+	s.log.Info("meta migration begin", "migrationId", migrationID, "device", deviceID,
+		"cutoff", rs.HeadSequence, "targetFormatEpoch", rs.FormatEpoch+1)
+	return s.statusLocked()
 }
 
-// MigrateFileMeta 迁移单个文件：真实路径行 → 伪名行（单事务，断点续传安全）。
-func (s *Service) MigrateFileMeta(fromPath, metaEnc, canonicalHash, deviceID string) (*MoveResult, error) {
+// enqueueMigrationJournalLocked 把全部待迁移对象与明文 tombstone 登记进 journal（幂等）。
+func (s *Service) enqueueMigrationJournalLocked(migrationID string) error {
+	heads, err := db.ListHeads(s.db)
+	if err != nil {
+		return err
+	}
+	for i := range heads {
+		if heads[i].Pseudonym == heads[i].FileID && heads[i].EncryptedMetadata != "" {
+			continue // 已经是伪名化状态
+		}
+		if err := db.EnqueueJournal(s.db, migrationID, heads[i].FileID, db.KindObject, "plain", "pseudonymous"); err != nil {
+			return err
+		}
+	}
+	tombs, err := db.ListTombstones(s.db)
+	if err != nil {
+		return err
+	}
+	for i := range tombs {
+		if tombs[i].LastPseudonym == tombs[i].FileID {
+			continue // 已经是隐私格式
+		}
+		if err := db.EnqueueJournal(s.db, migrationID, tombs[i].FileID, db.KindTombstone, "plain", "private"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) statusLocked() (*MigrationStatus, error) {
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	counts := map[string]int64{}
+	if rs.MigrationID != "" {
+		if counts, err = db.JournalCounts(s.db, rs.MigrationID); err != nil {
+			return nil, err
+		}
+	}
+	plain, err := db.PlaintextTombstoneCount(s.db)
+	if err != nil {
+		return nil, err
+	}
+	return &MigrationStatus{
+		MetaState: rs.MetaState, MigrationID: rs.MigrationID,
+		OwnerDeviceID: rs.MigrationOwnerDeviceID, LeaseExpiresAt: rs.MigrationLeaseExpiresAt,
+		CutoffSequence: rs.MigrationCutoffSequence, TargetFormatEpoch: rs.MigrationTargetFormatEpoch,
+		FormatEpoch: rs.FormatEpoch, MinimumEnvelopeVersion: rs.MinimumEnvelopeVersion,
+		Journal: counts, PlaintextTombstones: plain,
+	}, nil
+}
+
+// MigrateObjectMeta 把一个对象伪名化（真实路径 → fileId + LSM1 元数据）。
+//
+// 与 v5 的 MigrateFileMeta 不同：这里**只是一次元数据更新**。
+// revision、contentGeneration、blob 全部不动，也不产生任何 tombstone——
+// 这正是 v0.12.1 死结（迁移必然留下明文 tombstone）消失的原因。
+func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID string) (*RenameResult, error) {
 	if metaEnc == "" || !isHex64(canonicalHash) {
 		return nil, ErrMetaRequired
 	}
@@ -113,56 +238,35 @@ func (s *Service) MigrateFileMeta(fromPath, metaEnc, canonicalHash, deviceID str
 	if rs.MetaState != db.MetaMigrating {
 		return nil, ErrEncryptionState
 	}
+	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
+		return nil, ErrMigrationLocked
+	}
 
-	from, err := db.GetFile(s.db, fromPath)
+	cur, err := db.GetHeadByPseudonym(s.db, pseudonym)
 	if err != nil {
 		return nil, err
 	}
-	if from == nil || from.Deleted {
+	if cur == nil {
 		return nil, ErrNotFound
 	}
-	// 内容必须已是 LSE3（fileId-AAD）——否则搬到伪名路径后无法解密
-	if _, isV3 := s.lse3GenerationFromBlob(from.ContentHash); !isV3 {
+	// 内容必须已是 LSE3（fileId-AAD）——否则伪名化后无法解密
+	if cur.EnvelopeVersion < 3 {
 		return nil, ErrPlaintextRejected
 	}
 
-	pseudonym := from.FileID
+	// 幂等：已经伪名化且元数据一致 → 直接成功（断点续传安全）
+	if cur.Pseudonym == cur.FileID && cur.EncryptedMetadata == metaEnc {
+		if err := db.MarkJournalDone(s.db, rs.MigrationID, cur.FileID, db.KindObject); err != nil {
+			return nil, err
+		}
+		return &RenameResult{FileID: cur.FileID, FromPseudonym: pseudonym, ToPseudonym: cur.Pseudonym,
+			Revision: cur.Revision, MetaGeneration: cur.MetaGeneration}, nil
+	}
+
 	now := time.Now().Unix()
-
-	// 幂等：已是伪名行 → 只补/更新元数据
-	if fromPath == pseudonym {
-		if from.MetaEnc == metaEnc {
-			return &MoveResult{FromPath: fromPath, ToPath: pseudonym, Revision: from.Revision, Sequence: 0}, nil
-		}
-		tx, err := s.db.Begin()
-		if err != nil {
-			return nil, err
-		}
-		defer tx.Rollback() //nolint:errcheck
-		from.MetaEnc = metaEnc
-		from.MetaGeneration = max(from.MetaGeneration, 1)
-		from.CanonicalKey = "h:" + canonicalHash
-		from.UpdatedAt = now
-		if err := db.UpsertFile(tx, from); err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return &MoveResult{FromPath: fromPath, ToPath: pseudonym, Revision: from.Revision, Sequence: 0}, nil
-	}
-
-	// 伪名位置被占（不应发生：fileId 唯一）→ 拒绝
-	if occupied, err := db.GetFile(s.db, pseudonym); err != nil {
-		return nil, err
-	} else if occupied != nil && !occupied.Deleted {
-		return nil, &ConflictError{Path: pseudonym, Revision: occupied.Revision}
-	}
-
-	tombRev := from.Revision + 1
-	tombID, err := db.NewFileID()
-	if err != nil {
-		return nil, err
+	metaGen := cur.MetaGeneration
+	if metaGen < 1 {
+		metaGen = 1
 	}
 
 	tx, err := s.db.Begin()
@@ -171,84 +275,46 @@ func (s *Service) MigrateFileMeta(fromPath, metaEnc, canonicalHash, deviceID str
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// 1) 原真实路径 → tombstone（complete 时整体删除；迁移窗口内保留防复活）
-	if err := db.UpsertFile(tx, &db.File{
-		Path: fromPath, ContentHash: from.ContentHash, Size: from.Size, Mtime: from.Mtime,
-		Revision: tombRev, Deleted: true, CreatedAt: from.CreatedAt, UpdatedAt: now,
-		CanonicalKey: from.CanonicalKey, FileID: tombID,
-	}); err != nil {
+	head := *cur
+	head.Pseudonym = cur.FileID
+	head.EncryptedMetadata = metaEnc
+	head.CanonicalPathHmac = "h:" + canonicalHash
+	head.MetaGeneration = metaGen
+	head.UpdatedAt = now
+	if err := db.UpsertHead(tx, &head); err != nil {
 		return nil, err
 	}
-	if _, err := db.InsertChange(tx, fromPath, tombRev, "delete", "", now); err != nil {
-		return nil, err
-	}
-
-	// 2) 伪名行：内容/身份原样继承 + 挂上加密元数据
-	if err := db.UpsertFile(tx, &db.File{
-		Path: pseudonym, ContentHash: from.ContentHash, Size: from.Size, Mtime: from.Mtime,
-		Revision: 1, Deleted: false, CreatedAt: from.CreatedAt, UpdatedAt: now,
-		CanonicalKey: "h:" + canonicalHash, FileID: from.FileID,
-		MetaEnc: metaEnc, MetaGeneration: 1,
-	}); err != nil {
-		return nil, err
-	}
-	seq, err := db.InsertChangeMeta(tx, pseudonym, 1, "upsert", from.ContentHash, now, 1)
+	seq, err := db.InsertChange(tx, &db.ObjectChange{
+		FileID: head.FileID, Action: "upsert", Revision: head.Revision,
+		ContentGeneration: head.ContentGeneration, MetaGeneration: metaGen,
+		Pseudonym: head.Pseudonym, ContentHash: head.ContentHash, CreatedAt: now,
+	})
 	if err != nil {
 		return nil, err
 	}
-	// 3) 该文件的历史版本路径改写为伪名（LSE3 历史按 fileId 解密，不受影响；
-	//    旧信封历史在 complete 时统一清除）
-	if _, err := tx.Exec(`UPDATE file_versions SET path = ? WHERE path = ?`, pseudonym, fromPath); err != nil {
+	// journal 标记与数据变更同一事务提交（INV-11）
+	if err := db.MarkJournalDone(tx, rs.MigrationID, head.FileID, db.KindObject); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
-	s.log.Info("meta migrate", "fileId", from.FileID, "device", deviceID)
-	return &MoveResult{FromPath: fromPath, ToPath: pseudonym, Revision: 1, TombstoneRevision: tombRev, Sequence: seq}, nil
+	s.log.Info("meta migrate object", "fileId", truncateID(head.FileID), "device", deviceID)
+	return &RenameResult{FileID: head.FileID, FromPseudonym: pseudonym, ToPseudonym: head.Pseudonym,
+		Revision: head.Revision, MetaGeneration: metaGen, Sequence: seq}, nil
 }
 
-// BeginMetaMigration：plain → migrating（幂等）。前置：内容加密必须已是 encrypted。
-func (s *Service) BeginMetaMigration() (*db.RepoState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
-	if err != nil {
-		return nil, err
-	}
-	if rs.EncryptionState != db.EncryptionEncrypted {
-		return nil, ErrEncryptionState // 先启用 E2EE 才谈得上元数据加密
-	}
-	switch rs.MetaState {
-	case db.MetaMigrating:
-		return rs, nil
-	case db.MetaEncrypted:
-		return nil, ErrEncryptionState
-	}
-	if err := db.SetMetaState(s.db, db.MetaMigrating); err != nil {
-		return nil, err
-	}
-	return db.GetRepoState(s.db)
+// PlaintextTombstone 是待转换的删除记录（迁移客户端据此计算 canonical HMAC）。
+type PlaintextTombstone struct {
+	FileID           string `json:"fileId"`
+	LastPseudonym    string `json:"lastPseudonym"`
+	DeletionRevision int64  `json:"deletionRevision"`
 }
 
-// CompleteMetaMigration：验证全部未删除文件均已伪名化（path==file_id 且带 meta），
-// 然后执行明文路径抹除（单向点）：
-//   - 清除旧信封（非 LSE3）历史版本（其 path 已改写但内容按路径 AAD 无法再解）
-//   - 全量裁剪 changes 并把水位线推到 head（旧 changes 的明文路径消失，
-//     所有客户端下轮 snapshot 对账，快照只含伪名+密文元数据）
-//
-// v0.12.1（LS-121-S02）：**不再删除 tombstone**。
-//
-// 旧实现用 `DELETE FROM files WHERE deleted = 1` 来抹掉 tombstone 行里的明文
-// 路径，代价是把「删除事实」本身一起丢掉（INV-06）：一台离线很久的旧设备
-// 重新上线后，会把本已删除的文件当成新文件重新建档复活。
-//
-// 「擦除明文」永远不是丢失删除屏障的理由。因此当仓库里还存在携带明文路径的
-// tombstone 时，complete 直接拒绝并返回 ErrTombstonePlaintext——迁移停在
-// migrating（可 abort 回退，已伪名化的行照常工作）。把 tombstone 转成不泄露
-// 路径又能防复活的隐私 ledger 是 v0.13.0 / 协议 v6 的工作。
-func (s *Service) CompleteMetaMigration() (*db.RepoState, error) {
+// ListPlaintextTombstones 列出仍带明文寻址名的删除记录（仅 migrating 态、仅 owner）。
+// 客户端本来就知道这些真实路径，返回给它不构成新的泄露面。
+func (s *Service) ListPlaintextTombstones(deviceID string) ([]PlaintextTombstone, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rs, err := db.GetRepoState(s.db)
@@ -258,53 +324,310 @@ func (s *Service) CompleteMetaMigration() (*db.RepoState, error) {
 	if rs.MetaState != db.MetaMigrating {
 		return nil, ErrEncryptionState
 	}
-	files, err := db.ListFiles(s.db)
+	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
+		return nil, ErrMigrationLocked
+	}
+	tombs, err := db.ListTombstones(s.db)
 	if err != nil {
 		return nil, err
 	}
-	for i := range files {
-		f := &files[i]
-		if f.Path != f.FileID || f.MetaEnc == "" {
-			return nil, ErrMetaRequired
+	out := make([]PlaintextTombstone, 0, len(tombs))
+	for i := range tombs {
+		if tombs[i].LastPseudonym == tombs[i].FileID {
+			continue
 		}
-		if _, isV3 := s.lse3GenerationFromBlob(f.ContentHash); !isV3 {
-			return nil, ErrPlaintextRejected
-		}
+		out = append(out, PlaintextTombstone{
+			FileID: tombs[i].FileID, LastPseudonym: tombs[i].LastPseudonym,
+			DeletionRevision: tombs[i].DeletionRevision,
+		})
+	}
+	return out, nil
+}
+
+// MigrateTombstone 把一条 tombstone 转成隐私格式（ADR-002 §3.2）。
+// 明文寻址名换成 fileId、归一化路径换成客户端 HMAC；删除屏障完整保留。
+func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error {
+	if !isHex32(fileID) || !isHex64(canonicalHash) {
+		return ErrMetaRequired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return err
+	}
+	if rs.MetaState != db.MetaMigrating {
+		return ErrEncryptionState
+	}
+	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
+		return ErrMigrationLocked
+	}
+	t, err := db.GetTombstone(s.db, fileID)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return ErrNotFound
 	}
 
-	// 明文 tombstone 检查（LS-121-S02）：只要还有一行删除记录的 path 不是伪名，
-	// 就无法在不丢删除屏障的前提下完成抹除 → 拒绝 complete
-	var plainTombstones int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM files WHERE deleted = 1 AND path != file_id`).Scan(&plainTombstones); err != nil {
-		return nil, err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	if plainTombstones > 0 {
-		s.log.Warn("meta complete refused: plaintext tombstones would have to be dropped",
-			"tombstones", plainTombstones)
-		return nil, ErrTombstonePlaintext
+	defer tx.Rollback() //nolint:errcheck
+	if err := db.ConvertTombstoneToPrivate(tx, fileID, "h:"+canonicalHash); err != nil {
+		return err
 	}
+	if err := db.MarkJournalDone(tx, rs.MigrationID, fileID, db.KindTombstone); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
-	// 收集将被清除的旧信封历史的 blob（事务后 GC）
-	rows, err := s.db.Query(
-		`SELECT DISTINCT blob_id FROM file_versions WHERE COALESCE(blob_id, '') != ''`)
+// VerifyMetaMigration：migrating → verifying。
+// 前置：journal 中不存在 pending/failed 条目。进入 verifying 后不再接受迁移写入，
+// 只接受验证读取与 complete——**验证失败时数据一个字节都没被动过**。
+func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
 	if err != nil {
 		return nil, err
 	}
-	var candidates []string
-	for rows.Next() {
-		var b string
-		if err := rows.Scan(&b); err != nil {
-			rows.Close()
+	if rs.MetaState == db.MetaVerifying {
+		return s.statusLocked() // 幂等
+	}
+	if rs.MetaState != db.MetaMigrating {
+		return nil, ErrEncryptionState
+	}
+	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
+		return nil, ErrMigrationLocked
+	}
+	unfinished, err := db.UnfinishedJournalCount(s.db, rs.MigrationID)
+	if err != nil {
+		return nil, err
+	}
+	if unfinished > 0 {
+		return nil, ErrMigrationIncomplete
+	}
+	if err := db.SetMetaState(s.db, db.MetaVerifying); err != nil {
+		return nil, err
+	}
+	s.log.Info("meta migration verifying", "migrationId", rs.MigrationID)
+	return s.statusLocked()
+}
+
+// AbortMetaMigration：migrating / verifying → plain。
+// 已伪名化的对象保持原样（混合态可正常同步），不做任何删除或改写。
+func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.MetaState != db.MetaMigrating && rs.MetaState != db.MetaVerifying {
+		return nil, ErrEncryptionState
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := db.SetMetaState(tx, db.MetaPlain); err != nil {
+		return nil, err
+	}
+	if err := db.ClearMigrationRecord(tx); err != nil {
+		return nil, err
+	}
+	if err := db.ClearJournal(tx, rs.MigrationID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.log.Info("meta migration aborted", "migrationId", rs.MigrationID)
+	return s.statusLocked()
+}
+
+// ValidateMetaMigration 执行 ADR-003 §3.5 的全部 11 项检查。
+// 返回的清单是**完整**的——用户需要一次看到所有问题。
+func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	var out []ValidationFailure
+	add := func(check, code string, count int64, example string) {
+		if count > 0 {
+			out = append(out, ValidationFailure{Check: check, Code: code, Count: count, Example: example})
+		}
+	}
+
+	heads, err := db.ListHeads(s.db)
+	if err != nil {
+		return nil, err
+	}
+
+	// 1) 所有 live HEAD 均为当前 keyEpoch 的 LSE3
+	var badEnvelope, badKeyEpoch int64
+	var envExample, keyExample string
+	// 2) 所有 live HEAD 有加密元数据且已伪名化
+	var missingMeta int64
+	var metaExample string
+	// 3) 所有对象有合法 fileId
+	var badFileID int64
+	var idExample string
+	// 5) generation 单调（HEAD 不得低于其历史最大值）
+	var badGeneration int64
+	var genExample string
+	for i := range heads {
+		h := &heads[i]
+		if h.EnvelopeVersion < 3 {
+			badEnvelope++
+			envExample = truncateID(h.FileID)
+		}
+		if rs.KeyEpoch > 0 && h.KeyEpoch != rs.KeyEpoch {
+			badKeyEpoch++
+			keyExample = truncateID(h.FileID)
+		}
+		if h.EncryptedMetadata == "" || h.Pseudonym != h.FileID {
+			missingMeta++
+			metaExample = truncateID(h.FileID)
+		}
+		if !isHex32(h.FileID) {
+			badFileID++
+			idExample = truncateID(h.FileID)
+		}
+		var maxGen int64
+		if err := s.db.QueryRow(
+			`SELECT COALESCE(MAX(content_generation), 0) FROM object_versions WHERE vault_id = ? AND file_id = ?`,
+			db.DefaultVaultID, h.FileID).Scan(&maxGen); err != nil {
 			return nil, err
 		}
-		if _, isV3 := s.lse3GenerationFromBlob(b); !isV3 {
-			candidates = append(candidates, b)
+		if h.ContentGeneration < maxGen {
+			badGeneration++
+			genExample = truncateID(h.FileID)
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	add("all live heads are LSE3", "ENVELOPE_TOO_OLD", badEnvelope, envExample)
+	add("all live heads use the current key epoch", "KEY_EPOCH_MISMATCH", badKeyEpoch, keyExample)
+	add("all live heads carry encrypted metadata and a pseudonymous name", "META_REQUIRED", missingMeta, metaExample)
+	add("all objects have a valid file id", "INVALID_FILE_ID", badFileID, idExample)
+	add("content generation is monotonic", "GENERATION_NOT_MONOTONIC", badGeneration, genExample)
+
+	// 4) 历史 (file_id, revision) 无重复（UNIQUE 保证，这里再核一次）
+	var dupRevisions int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM (SELECT file_id, revision FROM object_versions
+		 WHERE vault_id = ? GROUP BY file_id, revision HAVING COUNT(*) > 1)`,
+		db.DefaultVaultID).Scan(&dupRevisions); err != nil {
 		return nil, err
+	}
+	add("history revisions are unique per object", "REVISION_CONFLICT", dupRevisions, "")
+
+	// 6) 历史全部能归属到已知对象
+	var orphanHistory int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM object_versions v WHERE v.vault_id = ?
+		   AND NOT EXISTS (SELECT 1 FROM file_objects o WHERE o.vault_id = v.vault_id AND o.file_id = v.file_id)`,
+		db.DefaultVaultID).Scan(&orphanHistory); err != nil {
+		return nil, err
+	}
+	add("history rows all resolve to a known object", "ORPHAN_HISTORY", orphanHistory, "")
+
+	// 7) 所有 tombstone 已转为隐私格式
+	plainTombs, err := db.PlaintextTombstoneCount(s.db)
+	if err != nil {
+		return nil, err
+	}
+	add("tombstones carry no plaintext names", "TOMBSTONE_PLAINTEXT", plainTombs, "")
+
+	// 8) cutoff 之后不得再有以明文寻址名发布的变更。
+	//
+	// 只看 cutoff 之后：cutoff 之前的变更本来就是迁移前产生的，它们携带明文路径
+	// 是正常的，并且会被 complete 的全量裁剪一并清除。真正要抓的是**迁移期间**
+	// 有设备绕过冻结、又把真实路径写了回来。
+	var staleChanges int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM object_changes
+		  WHERE vault_id = ? AND sequence > ? AND pseudonym != file_id`,
+		db.DefaultVaultID, rs.MigrationCutoffSequence).Scan(&staleChanges); err != nil {
+		return nil, err
+	}
+	add("no plaintext-addressed change was published after the cutoff", "STALE_CHANGES", staleChanges, "")
+
+	// 9) 分享名不含真实路径（meta 模式下必须为空）
+	var namedShares int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM shares WHERE revoked = 0 AND name != ''`).Scan(&namedShares); err != nil {
+		return nil, err
+	}
+	add("share names carry no plaintext paths", "SHARE_NAME_PLAINTEXT", namedShares, "")
+
+	// 10) 当前逻辑库中没有明文路径哨兵
+	residual, err := s.scanLogicalSentinels()
+	if err != nil {
+		return nil, err
+	}
+	add("no plaintext sentinel remains in logical tables", "PLAINTEXT_SENTINEL", residual, "")
+
+	// 11) formatEpoch 与信封下限已就绪
+	var notReady int64
+	if rs.MigrationTargetFormatEpoch <= rs.FormatEpoch || rs.MinimumEnvelopeVersion < db.EnvelopeLSE3 {
+		notReady = 1
+	}
+	add("format epoch and envelope floor are ready", "FORMAT_EPOCH_NOT_READY", notReady, "")
+
+	return out, nil
+}
+
+// CompleteMetaMigration：verifying → encrypted。
+//
+// 先跑完整验证器；任一项失败即返回**完整清单**并保持 verifying——
+// 不删除旧数据、不清空 changes、不执行任何擦除（INV-11）。
+// 全部通过后执行擦除流程（ADR-008）并递增 formatEpoch。
+func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*MigrationStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.MetaState == db.MetaEncrypted {
+		return s.statusLocked() // 幂等
+	}
+	if rs.MetaState != db.MetaVerifying {
+		return nil, ErrEncryptionState
+	}
+	if migrationID != "" && migrationID != rs.MigrationID {
+		return nil, ErrMigrationMismatch
+	}
+	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
+		return nil, ErrMigrationLocked
+	}
+
+	failures, err := s.ValidateMetaMigration()
+	if err != nil {
+		return nil, err
+	}
+	if len(failures) > 0 {
+		s.log.Warn("meta complete refused", "migrationId", rs.MigrationID, "failures", len(failures))
+		return nil, &ValidationError{Failures: failures}
+	}
+
+	// 擦除（ADR-008）：任一步失败保持 verifying，可修复后重试
+	report, err := s.erasePlaintextPathsLocked(rs)
+	if err != nil {
+		return nil, err
+	}
+	if report.Residual > 0 {
+		s.log.Error("erasure left residual sentinels", "residual", report.Residual)
+		return nil, &ValidationError{Failures: []ValidationFailure{{
+			Check: "post-erasure sentinel scan", Code: "PLAINTEXT_SENTINEL", Count: report.Residual,
+		}}}
 	}
 
 	tx, err := s.db.Begin()
@@ -312,54 +635,33 @@ func (s *Service) CompleteMetaMigration() (*db.RepoState, error) {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-
-	// 注意：这里**不删除 tombstone**（LS-121-S02）。删除事实必须保留，
-	// 否则旧设备重新上线会复活已删内容（INV-06）。
-	// 旧信封历史（path AAD，改写路径后永远无法解密）→ 连元数据一起清除
-	if _, err := tx.Exec(
-		`DELETE FROM file_versions WHERE id IN (
-			SELECT v.id FROM file_versions v WHERE COALESCE(v.blob_id, '') != '' AND v.blob_id IN (`+
-			placeholders(len(candidates))+`)
-		)`, toAny(candidates)...); err != nil {
+	if err := db.SetMetaState(tx, db.MetaEncrypted); err != nil {
 		return nil, err
 	}
-	// 明文路径抹除：全量裁剪 changes + 水位线推到 head → 全体客户端 snapshot 对账
-	if _, err := tx.Exec(`DELETE FROM changes`); err != nil {
+	if err := db.SetFormatEpoch(tx, rs.MigrationTargetFormatEpoch); err != nil {
+		return nil, err
+	}
+	// 全量裁剪 changes：旧记录里还带着迁移前的明文寻址名，
+	// 且 formatEpoch 变化本来就要求所有客户端重新对账
+	if _, err := tx.Exec(`DELETE FROM object_changes WHERE vault_id = ?`, db.DefaultVaultID); err != nil {
 		return nil, err
 	}
 	if err := db.SetMinRetainedSequence(tx, rs.HeadSequence); err != nil {
 		return nil, err
 	}
-	if err := db.SetMetaState(tx, db.MetaEncrypted); err != nil {
+	if err := db.ClearMigrationRecord(tx); err != nil {
+		return nil, err
+	}
+	if err := db.ClearJournal(tx, rs.MigrationID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	// 事务外 GC（锁内二次确认引用的既有安全语义）
-	s.gcBlobs(candidates)
 
-	s.log.Info("meta migration complete: plaintext paths erased",
-		"files", len(files), "oldEnvelopeBlobs", len(candidates))
-	return db.GetRepoState(s.db)
-}
-
-// AbortMetaMigration：migrating → plain。已迁移的伪名行保持原样（混合态可正常同步），
-// 不做任何删除或改写。
-func (s *Service) AbortMetaMigration() (*db.RepoState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db)
-	if err != nil {
-		return nil, err
-	}
-	if rs.MetaState != db.MetaMigrating {
-		return nil, ErrEncryptionState
-	}
-	if err := db.SetMetaState(s.db, db.MetaPlain); err != nil {
-		return nil, err
-	}
-	return db.GetRepoState(s.db)
+	s.log.Info("meta migration complete", "migrationId", rs.MigrationID,
+		"formatEpoch", rs.MigrationTargetFormatEpoch)
+	return s.statusLocked()
 }
 
 // isHex64 校验 32 字节 hex（canonical path HMAC）。
@@ -373,23 +675,4 @@ func isHex64(s string) bool {
 		}
 	}
 	return true
-}
-
-func placeholders(n int) string {
-	if n == 0 {
-		return "''" // 空集合：IN ('') 永假
-	}
-	out := "?"
-	for i := 1; i < n; i++ {
-		out += ",?"
-	}
-	return out
-}
-
-func toAny(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
 }
