@@ -30,11 +30,9 @@ type RestoreParams struct {
 	Pseudonym     string
 	MetaEnc       string
 	CanonicalHash string
-	OperationID   string
 	DeviceID      string
-	FormatEpoch   int64
-	// ProtocolVersion 客户端协议版本
-	ProtocolVersion int64
+	// Client：逐请求协议/世代上下文（含幂等键）
+	Client ClientContext
 }
 
 // RestoreResult 恢复结果。随后的内容上传以 Revision 作为 baseRevision。
@@ -62,7 +60,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.FormatEpoch, p.ProtocolVersion, p.DeviceID, p.Pseudonym); err != nil {
+	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.Pseudonym); err != nil {
 		return nil, err
 	}
 
@@ -77,8 +75,8 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 	}
 
 	// 幂等：同一 operationId 已提交过 → 返回那次结果
-	if p.OperationID != "" {
-		if prev, err := db.FindChangeByOperation(s.db, p.FileID, p.OperationID); err != nil {
+	if p.Client.OperationID != "" {
+		if prev, err := db.FindChangeByOperation(s.db, p.FileID, p.Client.OperationID); err != nil {
 			return nil, err
 		} else if prev != nil {
 			return &RestoreResult{FileID: p.FileID, Pseudonym: prev.Pseudonym,
@@ -181,7 +179,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		FileID: p.FileID, Action: "restore", Revision: newRevision,
 		ContentGeneration: p.ContentGeneration, MetaGeneration: head.MetaGeneration,
 		Pseudonym: p.Pseudonym, ContentHash: head.ContentHash,
-		OperationID: p.OperationID, CreatedAt: now,
+		OperationID: p.Client.OperationID, CreatedAt: now,
 	})
 	if err != nil {
 		return nil, err
@@ -191,7 +189,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 			FileID: p.FileID, Revision: newRevision, ContentGeneration: p.ContentGeneration,
 			BlobID: head.BlobID, ContentHash: head.ContentHash, Size: head.Size, Mtime: head.Mtime,
 			Action: "restore", DeviceID: p.DeviceID, KeyEpoch: head.KeyEpoch,
-			OperationID: p.OperationID, CreatedAt: now,
+			OperationID: p.Client.OperationID, CreatedAt: now,
 		}); err != nil {
 			return nil, err
 		}

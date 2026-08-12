@@ -45,18 +45,16 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
 	res, err := h.svc.Upload(syncsvc.UploadParams{
-		Path:            path,
-		BaseRevision:    baseRevision,
-		ClaimedHash:     hash,
-		Mtime:           mtime,
-		DeviceID:        auditDeviceID(r),
-		Action:          r.Header.Get("X-Action"), // ""/upsert/merge/restore
-		ClientFileID:    r.Header.Get("X-File-Id"),
-		MetaEnc:         r.Header.Get("X-Meta-Enc"),
-		CanonicalHash:   r.Header.Get("X-Canonical-Hash"),
-		OperationID:     operationID(r),
-		FormatEpoch:     headerInt(r, "X-Format-Epoch"),
-		ProtocolVersion: headerInt(r, "X-LiteSync-Protocol"),
+		Path:          path,
+		BaseRevision:  baseRevision,
+		ClaimedHash:   hash,
+		Mtime:         mtime,
+		DeviceID:      auditDeviceID(r),
+		Action:        r.Header.Get("X-Action"), // ""/upsert/merge/restore
+		ClientFileID:  r.Header.Get("X-File-Id"),
+		MetaEnc:       r.Header.Get("X-Meta-Enc"),
+		CanonicalHash: r.Header.Get("X-Canonical-Hash"),
+		Client:        clientContext(r),
 	}, body)
 	if err != nil {
 		h.writeUploadError(w, err)
@@ -72,6 +70,30 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 		"contentGeneration": res.ContentGeneration,
 		"metaGeneration":    res.MetaGeneration,
 	})
+}
+
+// clientContext 抽取逐请求协议/世代上下文（计划书 §5.3）。
+//
+// 服务器可能在两次请求之间从备份恢复（repoEpoch 变）、完成元数据迁移
+//（formatEpoch 变）或轮换密钥（keyEpoch 变），而客户端此刻仍拿着旧判断在写。
+// 因此这些必须**逐请求**校验，而不是「会话首轮查一次」。
+func clientContext(r *http.Request) syncsvc.ClientContext {
+	return syncsvc.ClientContext{
+		ProtocolVersion: headerInt(r, "X-LiteSync-Protocol"),
+		RepoEpoch:       safeEpochHeader(r.Header.Get("X-Repo-Epoch")),
+		FormatEpoch:     headerInt(r, "X-Format-Epoch"),
+		KeyEpoch:        headerInt(r, "X-Key-Epoch"),
+		OperationID:     operationID(r),
+	}
+}
+
+// safeEpochHeader：repoEpoch 是 32 位小写 hex；非法值按「未携带」处理，
+// 绝不把任意字符串带进比较逻辑。
+func safeEpochHeader(v string) string {
+	if isLowerHexOfLen(v, 32) {
+		return v
+	}
+	return ""
 }
 
 // operationID 幂等键：客户端在响应丢失后用同一个 id 重试，服务器返回首次结果。
@@ -120,6 +142,12 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	case errors.Is(err, syncsvc.ErrFormatEpoch):
 		writeCoded(w, http.StatusConflict, CodeFormatEpochMismatch,
 			"format epoch mismatch; refresh repository state and reconcile", false)
+	case errors.Is(err, syncsvc.ErrRepoEpoch):
+		writeCoded(w, http.StatusConflict, CodeRepoEpochMismatch,
+			"repo epoch mismatch; the server was restored from a backup — enter disaster recovery", false)
+	case errors.Is(err, syncsvc.ErrKeyEpoch):
+		writeCoded(w, http.StatusConflict, CodeKeyEpochMismatch,
+			"key epoch mismatch; refresh the vault key binding before writing", false)
 	case errors.Is(err, syncsvc.ErrUpgradeRequired):
 		writeCoded(w, http.StatusUpgradeRequired, CodeUpgradeRequired,
 			"this repository requires a newer client (protocol v6)", false)
@@ -181,9 +209,7 @@ func (h *handlers) renameFile(w http.ResponseWriter, r *http.Request) {
 		MetaEnc:            req.MetaEnc,
 		CanonicalHash:      req.CanonicalHash,
 		DeviceID:           auditDeviceID(r),
-		OperationID:        operationID(r),
-		FormatEpoch:        headerInt(r, "X-Format-Epoch"),
-		ProtocolVersion:    headerInt(r, "X-LiteSync-Protocol"),
+		Client:             clientContext(r),
 	})
 	if err != nil {
 		h.metaError(w, "rename", err)
@@ -224,21 +250,19 @@ func (h *handlers) restoreFile(w http.ResponseWriter, r *http.Request) {
 		Pseudonym:                 req.Pseudonym,
 		MetaEnc:                   req.MetaEnc,
 		CanonicalHash:             req.CanonicalHash,
-		OperationID:               operationID(r),
 		DeviceID:                  auditDeviceID(r),
-		FormatEpoch:               headerInt(r, "X-Format-Epoch"),
-		ProtocolVersion:           headerInt(r, "X-LiteSync-Protocol"),
+		Client:                    clientContext(r),
 	})
 	if err != nil {
 		h.metaError(w, "restore", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"fileId":    res.FileID,
-		"path":      res.Pseudonym,
-		"revision":  res.Revision,
-		"sequence":  res.Sequence,
-		"restored":  true,
+		"fileId":   res.FileID,
+		"path":     res.Pseudonym,
+		"revision": res.Revision,
+		"sequence": res.Sequence,
+		"restored": true,
 	})
 }
 
@@ -300,12 +324,10 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := h.svc.Delete(syncsvc.DeleteParams{
-		Path:            req.Path,
-		BaseRevision:    req.BaseRevision,
-		DeviceID:        auditDeviceID(r),
-		OperationID:     operationID(r),
-		FormatEpoch:     headerInt(r, "X-Format-Epoch"),
-		ProtocolVersion: headerInt(r, "X-LiteSync-Protocol"),
+		Path:         req.Path,
+		BaseRevision: req.BaseRevision,
+		DeviceID:     auditDeviceID(r),
+		Client:       clientContext(r),
 	})
 	if err != nil {
 		var conflict *syncsvc.ConflictError
@@ -316,6 +338,10 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 			writeCoded(w, http.StatusNotFound, CodeNotFound, "not found", false)
 		case errors.Is(err, syncsvc.ErrFormatEpoch):
 			writeCoded(w, http.StatusConflict, CodeFormatEpochMismatch, "format epoch mismatch", false)
+		case errors.Is(err, syncsvc.ErrRepoEpoch):
+			writeCoded(w, http.StatusConflict, CodeRepoEpochMismatch, "repo epoch mismatch", false)
+		case errors.Is(err, syncsvc.ErrKeyEpoch):
+			writeCoded(w, http.StatusConflict, CodeKeyEpochMismatch, "key epoch mismatch", false)
 		case errors.Is(err, syncsvc.ErrUpgradeRequired):
 			writeCoded(w, http.StatusUpgradeRequired, CodeUpgradeRequired, "client upgrade required", false)
 		case errors.Is(err, syncsvc.ErrMigrationLocked):

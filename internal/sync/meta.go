@@ -116,11 +116,13 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 	case db.MetaEncrypted:
 		return nil, ErrEncryptionState
 	case db.MetaMigrating, db.MetaVerifying:
-		if rs.MigrationOwnerDeviceID != "" && rs.MigrationOwnerDeviceID != deviceID &&
-			rs.MigrationLeaseExpiresAt > time.Now().Unix() {
+		if rs.MigrationOwnerDeviceID != "" && rs.MigrationOwnerDeviceID != deviceID {
+			// 别的设备持有迁移：租约未过期 → 锁定；已过期 → 仍然拒绝，
+			// 必须走**显式接管**（POST /meta/takeover）。绝不因为「begin 又被调了一次」
+			// 就悄悄换 owner——那会让两台设备同时以为自己在推进迁移
 			return nil, ErrMigrationLocked
 		}
-		// 同一 owner（或租约已过期后由本设备显式重入）→ 续租并继续
+		// 同一 owner → 续租并继续
 		if err := db.RenewMigrationLease(s.db, rs.MigrationID,
 			time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
 			return nil, err
@@ -218,6 +220,64 @@ func (s *Service) statusLocked() (*MigrationStatus, error) {
 	}, nil
 }
 
+// RenewMigrationLease 续租（计划书 §5.4）。
+//
+// owner 在长时间迁移中必须周期性续租；租约到期后其他设备可以**显式接管**，
+// 但服务器绝不自动接管、也绝不自动 complete——迁移停在原地是安全的。
+func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.MigrationID == "" {
+		return nil, ErrEncryptionState
+	}
+	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
+		return nil, ErrMigrationNotOwner
+	}
+	if err := db.RenewMigrationLease(s.db, rs.MigrationID,
+		time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
+		return nil, err
+	}
+	return s.statusLocked()
+}
+
+// TakeoverMigration 显式接管一个租约已过期的迁移（计划书 §5.4）。
+//
+// 「租约到期就自动接管」会让两台设备同时认为自己是 owner；接管必须是单方、
+// 显式、且携带正确的 migrationId 的动作。owner 失联后迁移不会自动完成，
+// 也不会自动回滚——需要人来决定。
+func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs, err := db.GetRepoState(s.db)
+	if err != nil {
+		return nil, err
+	}
+	if rs.MigrationID == "" {
+		return nil, ErrEncryptionState
+	}
+	if migrationID != rs.MigrationID {
+		return nil, ErrMigrationMismatch
+	}
+	if rs.MigrationOwnerDeviceID == deviceID {
+		return s.statusLocked() // 幂等：本来就是自己
+	}
+	if rs.MigrationLeaseExpiresAt > time.Now().Unix() {
+		return nil, ErrLeaseActive
+	}
+	if err := db.BeginMigrationRecord(s.db, rs.MigrationID, deviceID,
+		time.Now().Add(migrationLeaseDuration).Unix(), rs.MigrationCutoffSequence,
+		rs.MigrationTargetFormatEpoch, rs.MigrationKeyEpoch); err != nil {
+		return nil, err
+	}
+	s.log.Warn("migration taken over", "migrationId", rs.MigrationID,
+		"previousOwner", rs.MigrationOwnerDeviceID, "newOwner", deviceID)
+	return s.statusLocked()
+}
+
 // MigrateObjectMeta 把一个对象伪名化（真实路径 → fileId + LSM1 元数据）。
 //
 // 与 v5 的 MigrateFileMeta 不同：这里**只是一次元数据更新**。
@@ -239,7 +299,7 @@ func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID 
 		return nil, ErrEncryptionState
 	}
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
-		return nil, ErrMigrationLocked
+		return nil, ErrMigrationNotOwner
 	}
 
 	cur, err := db.GetHeadByPseudonym(s.db, pseudonym)
@@ -325,7 +385,7 @@ func (s *Service) ListPlaintextTombstones(deviceID string) ([]PlaintextTombstone
 		return nil, ErrEncryptionState
 	}
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
-		return nil, ErrMigrationLocked
+		return nil, ErrMigrationNotOwner
 	}
 	tombs, err := db.ListTombstones(s.db)
 	if err != nil {
@@ -361,7 +421,7 @@ func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error
 		return ErrEncryptionState
 	}
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
-		return ErrMigrationLocked
+		return ErrMigrationNotOwner
 	}
 	t, err := db.GetTombstone(s.db, fileID)
 	if err != nil {
@@ -402,7 +462,7 @@ func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error)
 		return nil, ErrEncryptionState
 	}
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
-		return nil, ErrMigrationLocked
+		return nil, ErrMigrationNotOwner
 	}
 	unfinished, err := db.UnfinishedJournalCount(s.db, rs.MigrationID)
 	if err != nil {
@@ -606,7 +666,7 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 		return nil, ErrMigrationMismatch
 	}
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
-		return nil, ErrMigrationLocked
+		return nil, ErrMigrationNotOwner
 	}
 
 	failures, err := s.ValidateMetaMigration()

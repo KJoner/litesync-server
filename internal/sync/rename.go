@@ -39,10 +39,8 @@ type RenameParams struct {
 	MetaEnc       string
 	CanonicalHash string
 	DeviceID      string
-	OperationID   string
-	FormatEpoch   int64
-	// ProtocolVersion 客户端协议版本
-	ProtocolVersion int64
+	// Client：逐请求协议/世代上下文（含幂等键）
+	Client ClientContext
 }
 
 // Rename 执行改名（元数据更新）。
@@ -61,7 +59,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.FormatEpoch, p.ProtocolVersion, p.DeviceID, p.FromPseudonym); err != nil {
+	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.FromPseudonym); err != nil {
 		return nil, err
 	}
 
@@ -94,8 +92,8 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 	}
 
 	// 幂等：同一 operationId 已提交过 → 返回那次结果
-	if p.OperationID != "" {
-		if prev, err := db.FindChangeByOperation(s.db, cur.FileID, p.OperationID); err != nil {
+	if p.Client.OperationID != "" {
+		if prev, err := db.FindChangeByOperation(s.db, cur.FileID, p.Client.OperationID); err != nil {
 			return nil, err
 		} else if prev != nil {
 			return &RenameResult{
@@ -160,7 +158,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 		FileID: head.FileID, Action: "upsert", Revision: head.Revision,
 		ContentGeneration: head.ContentGeneration, MetaGeneration: newMetaGen,
 		Pseudonym: head.Pseudonym, ContentHash: head.ContentHash,
-		OperationID: p.OperationID, CreatedAt: now,
+		OperationID: p.Client.OperationID, CreatedAt: now,
 	})
 	if err != nil {
 		return nil, err

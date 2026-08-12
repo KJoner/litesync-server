@@ -69,6 +69,8 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/meta/migrate", h.migrateObject)
 	mux.HandleFunc("GET /api/v1/meta/tombstones", h.listPlaintextTombstones)
 	mux.HandleFunc("POST /api/v1/meta/migrate-tombstone", h.migrateTombstone)
+	mux.HandleFunc("POST /api/v1/meta/renew", h.metaRenew)
+	mux.HandleFunc("POST /api/v1/meta/takeover", h.metaTakeover)
 	mux.HandleFunc("POST /api/v1/meta/verify", h.metaVerify)
 	mux.HandleFunc("GET /api/v1/meta/validate", h.metaValidate)
 	mux.HandleFunc("POST /api/v1/meta/complete", h.metaComplete)
@@ -111,24 +113,10 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, svc, mux)))
 }
 
-// 协议版本（v7 仓库拆分起正式管理）：插件与服务器各自独立发版，
-// 兼容性由 protocol 区间判定而不是比对版本号。
-// 破坏性协议变更时递增 ProtocolVersion；不再兼容旧客户端时抬高 MinProtocolVersion。
-//
-// v2（v9 一阶段）：repoEpoch/headSequence、tombstone 拒绝 base 0、
-// E2EE 状态机与明文冻结、vault-key CAS。
-// v3（v9 二阶段）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
-// v4（v9 三阶段二期）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）、
-// E2EE 原子 MOVE。
-// v5（v9 三阶段三期）：元数据加密——伪名路径 + LSM1 加密元数据 + 改名即
-// 元数据更新。meta-encrypted 态对 v4 客户端完全不可用（只见伪名），Min 抬到 5。
-// v6（v10 阶段 1）：fileId 为主键的对象模型（ADR-001）、隐私 tombstone 台账与
-// 显式 restore（ADR-002）、四态迁移状态机 + journal（ADR-003）、
-// 仓库级 minimumEnvelopeVersion 与 formatEpoch（ADR-006）。
-// v5 客户端按 path 寻址且不携带 formatEpoch，在 v6 仓库上会写坏对象身份，Min 抬到 6。
+// 协议版本由服务层定义（逐请求校验发生在那里）；这里只做转发。
 const (
-	ProtocolVersion    = 6
-	MinProtocolVersion = 6
+	ProtocolVersion    = syncsvc.ProtocolVersion
+	MinProtocolVersion = syncsvc.MinProtocolVersion
 )
 
 func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
@@ -197,6 +185,10 @@ const (
 	CodeHashMismatch        = "HASH_MISMATCH"
 	// --- 协议 v6 新增（ADR-003 / ADR-006） ---
 	CodeFormatEpochMismatch = "FORMAT_EPOCH_MISMATCH"
+	CodeRepoEpochMismatch   = "REPO_EPOCH_MISMATCH"
+	CodeKeyEpochMismatch    = "KEY_EPOCH_MISMATCH"
+	CodeMigrationNotOwner   = "MIGRATION_NOT_OWNER"
+	CodeLeaseActive         = "MIGRATION_LEASE_ACTIVE"
 	CodeUpgradeRequired     = "UPGRADE_REQUIRED"
 	CodeMigrationLocked     = "MIGRATION_LOCKED"
 	CodeMigrationIncomplete = "MIGRATION_INCOMPLETE"

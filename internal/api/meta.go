@@ -73,6 +73,16 @@ func (h *handlers) metaError(w http.ResponseWriter, op string, err error) {
 		writeCoded(w, http.StatusConflict, CodeMigrationMismatch, "migration id mismatch", false)
 	case errors.Is(err, syncsvc.ErrFormatEpoch):
 		writeCoded(w, http.StatusConflict, CodeFormatEpochMismatch, "format epoch mismatch", false)
+	case errors.Is(err, syncsvc.ErrRepoEpoch):
+		writeCoded(w, http.StatusConflict, CodeRepoEpochMismatch, "repo epoch mismatch", false)
+	case errors.Is(err, syncsvc.ErrKeyEpoch):
+		writeCoded(w, http.StatusConflict, CodeKeyEpochMismatch, "key epoch mismatch", false)
+	case errors.Is(err, syncsvc.ErrMigrationNotOwner):
+		writeCoded(w, http.StatusConflict, CodeMigrationNotOwner,
+			"only the migration owner may perform this action", false)
+	case errors.Is(err, syncsvc.ErrLeaseActive):
+		writeCoded(w, http.StatusConflict, CodeLeaseActive,
+			"the current migration lease is still active; takeover is not allowed yet", true)
 	case errors.Is(err, syncsvc.ErrUpgradeRequired):
 		writeCoded(w, http.StatusUpgradeRequired, CodeUpgradeRequired, "client upgrade required", false)
 	case errors.Is(err, syncsvc.ErrEncryptionState):
@@ -187,6 +197,33 @@ func (h *handlers) migrateTombstone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"fileId": req.FileID, "converted": true})
+}
+
+// metaRenew 续租（计划书 §5.4）：owner 在长迁移中周期调用。
+func (h *handlers) metaRenew(w http.ResponseWriter, r *http.Request) {
+	st, err := h.svc.RenewMigrationLease(auditDeviceID(r))
+	if err != nil {
+		h.metaError(w, "meta renew", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// metaTakeover 显式接管租约已过期的迁移（绝不自动发生）。
+func (h *handlers) metaTakeover(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MigrationID string `json:"migrationId"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.MigrationID == "" {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "migrationId required", false)
+		return
+	}
+	st, err := h.svc.TakeoverMigration(req.MigrationID, auditDeviceID(r))
+	if err != nil {
+		h.metaError(w, "meta takeover", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 // metaVerify migrating → verifying。进入后只接受验证读取与 complete。

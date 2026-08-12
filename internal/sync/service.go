@@ -62,12 +62,36 @@ var (
 	ErrFormatEpoch = errors.New("format epoch mismatch")
 	// ErrUpgradeRequired：旧协议客户端在 formatEpoch > 1 的仓库上尝试写入
 	ErrUpgradeRequired = errors.New("client upgrade required")
+	// ErrRepoEpoch（计划书 §5.3）：客户端携带的 repoEpoch 与仓库不符——
+	// 服务器从备份恢复过，该客户端的游标与 baseRevision 全部作废
+	ErrRepoEpoch = errors.New("repo epoch mismatch")
+	// ErrKeyEpoch：客户端携带的 keyEpoch 与仓库不符（密钥世代已轮换）
+	ErrKeyEpoch = errors.New("key epoch mismatch")
+	// ErrMigrationNotOwner：非 owner 设备试图推进迁移
+	ErrMigrationNotOwner = errors.New("only the migration owner may perform this action")
+	// ErrLeaseActive：租约仍然有效，不允许接管
+	ErrLeaseActive = errors.New("migration lease is still active")
 	// ErrMigrationLocked：另一台设备持有未过期的迁移租约
 	ErrMigrationLocked = errors.New("another migration is in progress")
 	// ErrMigrationIncomplete：journal 中仍有未完成条目
 	ErrMigrationIncomplete = errors.New("migration journal still has unfinished entries")
 	// ErrMigrationMismatch：complete 携带的 migrationId 与当前迁移不符
 	ErrMigrationMismatch = errors.New("migration id mismatch")
+)
+
+// 协议版本（插件与服务器独立发版，兼容性由区间判定）。
+// 定义在服务层：逐请求校验（计划书 §5.3）发生在这里，api 层只做转发。
+//
+// v2（v9 一阶段）：repoEpoch/headSequence、tombstone 拒绝 base 0、
+// E2EE 状态机与明文冻结、vault-key CAS。
+// v3（v9 二阶段）：设备级凭据与配对包 v2、LSE2 加密信封。
+// v4（v9 三阶段二期）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）。
+// v5（v9 三阶段三期）：元数据加密——伪名路径 + LSM1 加密元数据。
+// v6（v10 阶段 1）：fileId 为主键的对象模型、隐私 tombstone 与显式 restore、
+// 四态迁移状态机、仓库级 minimumEnvelopeVersion 与 formatEpoch。
+const (
+	ProtocolVersion    = 6
+	MinProtocolVersion = 6
 )
 
 const vaultKeyMetaKey = "vault-key"
@@ -278,6 +302,19 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// ClientContext 是每个写请求都必须携带的协议/世代上下文（计划书 §5.3）。
+//
+// 逐请求校验而不是「会话首轮查一次」：服务器可能在两次请求之间从备份恢复
+//（repoEpoch 变）、完成元数据迁移（formatEpoch 变）或轮换密钥（keyEpoch 变），
+// 而客户端此刻仍拿着旧判断在写入。
+type ClientContext struct {
+	ProtocolVersion int64
+	RepoEpoch       string
+	FormatEpoch     int64
+	KeyEpoch        int64
+	OperationID     string
+}
+
 // UploadParams：上传参数。
 type UploadParams struct {
 	// Path 是服务器可见的寻址名（pseudonym）
@@ -294,12 +331,8 @@ type UploadParams struct {
 	MetaEnc string
 	// CanonicalHash：客户端 HMAC 的 canonical 碰撞键
 	CanonicalHash string
-	// OperationID：幂等键。网络响应丢失后用同一个 id 重试不会产生第二个 revision
-	OperationID string
-	// FormatEpoch：客户端认为的寻址格式世代；0 = 未携带（协议 v5 客户端）
-	FormatEpoch int64
-	// ProtocolVersion：客户端协议版本；0 = 未携带
-	ProtocolVersion int64
+	// Client：逐请求协议/世代上下文（含幂等键）
+	Client ClientContext
 }
 
 // Upload 处理内容上传。
@@ -341,7 +374,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.FormatEpoch, p.ProtocolVersion, p.DeviceID, p.Path); err != nil {
+	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.Path); err != nil {
 		return nil, err
 	}
 
@@ -394,8 +427,8 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	}
 
 	// 幂等 ②：同一 operationId 已经提交过 → 返回那次的结果，绝不产生第二个 revision
-	if cur != nil && p.OperationID != "" {
-		if prev, err := db.FindChangeByOperation(s.db, cur.FileID, p.OperationID); err != nil {
+	if cur != nil && p.Client.OperationID != "" {
+		if prev, err := db.FindChangeByOperation(s.db, cur.FileID, p.Client.OperationID); err != nil {
 			return nil, err
 		} else if prev != nil {
 			return &UploadResult{
@@ -506,7 +539,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	seq, err := db.InsertChange(tx, &db.ObjectChange{
 		FileID: head.FileID, Action: "upsert", Revision: head.Revision,
 		ContentGeneration: head.ContentGeneration, MetaGeneration: head.MetaGeneration,
-		Pseudonym: head.Pseudonym, ContentHash: actualHash, OperationID: p.OperationID, CreatedAt: now,
+		Pseudonym: head.Pseudonym, ContentHash: actualHash, OperationID: p.Client.OperationID, CreatedAt: now,
 	})
 	if err != nil {
 		return nil, err
@@ -518,7 +551,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 			FileID: head.FileID, Revision: head.Revision, ContentGeneration: head.ContentGeneration,
 			BlobID: actualHash, ContentHash: actualHash, Size: size, Mtime: head.Mtime,
 			Action: action, DeviceID: p.DeviceID, KeyEpoch: head.KeyEpoch,
-			OperationID: p.OperationID, CreatedAt: now,
+			OperationID: p.Client.OperationID, CreatedAt: now,
 		}); err != nil {
 			return nil, err
 		}
@@ -541,13 +574,27 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 }
 
 // guardWrite 是所有写路径共用的前置校验（ADR-003 §3.4 / ADR-006 §2.3）。
-func (s *Service) guardWrite(rs *db.RepoState, clientFormatEpoch, protocolVersion int64, deviceID, pseudonym string) error {
-	// 旧客户端写冻结：寻址格式已经变过，不带 formatEpoch 的写请求一律拒绝
-	if rs.FormatEpoch > 1 && clientFormatEpoch == 0 {
+func (s *Service) guardWrite(rs *db.RepoState, c ClientContext, deviceID, pseudonym string) error {
+	// 协议版本：低于最低要求的客户端一律不得写入（计划书 §5.3）
+	if c.ProtocolVersion != 0 && c.ProtocolVersion < MinProtocolVersion {
 		return ErrUpgradeRequired
 	}
-	if clientFormatEpoch != 0 && clientFormatEpoch != rs.FormatEpoch {
+	// 旧客户端写冻结：寻址格式已经变过，不带 formatEpoch 的写请求一律拒绝
+	if rs.FormatEpoch > 1 && c.FormatEpoch == 0 {
+		return ErrUpgradeRequired
+	}
+	if c.FormatEpoch != 0 && c.FormatEpoch != rs.FormatEpoch {
 		return ErrFormatEpoch
+	}
+	// repoEpoch：客户端拿的是灾备恢复前的世代 → 它的 baseRevision / 游标全部作废，
+	// 必须先走恢复合并；放行等于让它用旧世代的判断覆盖恢复后的内容
+	if c.RepoEpoch != "" && c.RepoEpoch != rs.RepoEpoch {
+		return ErrRepoEpoch
+	}
+	// keyEpoch：密钥世代不符说明客户端要写的密文用的是别的世代的密钥，
+	// 写进去以后当前世代的设备都解不开
+	if c.KeyEpoch != 0 && rs.KeyEpoch != 0 && c.KeyEpoch != rs.KeyEpoch {
+		return ErrKeyEpoch
 	}
 	// 迁移期间的写入冻结：非 owner 只能写**已经伪名化**的对象——
 	// 那不会把任何真实路径写回服务器；未伪名化的对象只有 owner 能动
@@ -687,12 +734,10 @@ func (s *Service) envelopeVersionOfBlob(hash string) int64 {
 
 // DeleteParams：删除参数。
 type DeleteParams struct {
-	Path            string
-	BaseRevision    int64
-	DeviceID        string
-	OperationID     string
-	FormatEpoch     int64
-	ProtocolVersion int64
+	Path         string
+	BaseRevision int64
+	DeviceID     string
+	Client       ClientContext
 }
 
 // Delete 删除对象：HEAD 行移入 tombstones 台账（ADR-002），历史版本保留（恢复仍可用）。
@@ -708,7 +753,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.FormatEpoch, p.ProtocolVersion, p.DeviceID, p.Path); err != nil {
+	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.Path); err != nil {
 		return nil, err
 	}
 
@@ -748,7 +793,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	seq, err := db.InsertChange(tx, &db.ObjectChange{
 		FileID: cur.FileID, Action: "delete", Revision: newRevision,
 		ContentGeneration: cur.ContentGeneration, MetaGeneration: cur.MetaGeneration,
-		Pseudonym: cur.Pseudonym, OperationID: p.OperationID, CreatedAt: now,
+		Pseudonym: cur.Pseudonym, OperationID: p.Client.OperationID, CreatedAt: now,
 	})
 	if err != nil {
 		return nil, err
@@ -778,7 +823,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 		if err := db.InsertVersion(tx, &db.ObjectVersion{
 			FileID: cur.FileID, Revision: newRevision, BlobID: "", ContentHash: "",
 			Size: 0, Mtime: cur.Mtime, Action: "delete", DeviceID: p.DeviceID,
-			OperationID: p.OperationID, CreatedAt: now,
+			OperationID: p.Client.OperationID, CreatedAt: now,
 		}); err != nil {
 			return nil, err
 		}
