@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 // 迁移租约默认时长。owner 需在此之前续租；过期后可被显式接管（v0.13.1）。
@@ -309,6 +310,11 @@ func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationSta
 // revision、contentGeneration、blob 全部不动，也不产生任何 tombstone——
 // 这正是 v0.12.1 死结（迁移必然留下明文 tombstone）消失的原因。
 func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID string) (*RenameResult, error) {
+	// §8.1 注入点：迁移逐对象推进。此刻崩溃 → journal 里这条仍是 pending，
+	// 续跑时会重做；重做必须幂等，绝不能产生第二个对象或第二条 change
+	if err := failpoint.Eval(failpoint.MigrationEachObj); err != nil {
+		return nil, err
+	}
 	if metaEnc == "" || !isHex64(canonicalHash) {
 		return nil, ErrMetaRequired
 	}
@@ -674,6 +680,11 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 // 不删除旧数据、不清空 changes、不执行任何擦除（INV-11）。
 // 全部通过后执行擦除流程（ADR-008）并递增 formatEpoch。
 func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*MigrationStatus, error) {
+	// §8.1 注入点：complete 之前。complete 会不可逆地抹掉明文寻址名，
+	// 因此这里崩溃必须让仓库停在 verifying，而不是半个 encrypted
+	if err := failpoint.Eval(failpoint.MigrationBeforeDone); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 // stagingName 固定不变：restic 按 host+paths 分组快照，
@@ -24,11 +26,11 @@ type Quiescer interface {
 
 // Manifest 写入 staging 根目录，恢复时用于确认备份完整性与版本。
 type Manifest struct {
-	Format         int    `json:"format"`
-	CreatedAt      int64  `json:"createdAt"`
+	Format          int    `json:"format"`
+	CreatedAt       int64  `json:"createdAt"`
 	LitesyncVersion string `json:"litesyncVersion"`
-	SchemaVersion  int    `json:"schemaVersion"`
-	LatestSequence int64  `json:"latestSequence"`
+	SchemaVersion   int    `json:"schemaVersion"`
+	LatestSequence  int64  `json:"latestSequence"`
 }
 
 // buildStaging 生成一致性备份快照目录：
@@ -60,6 +62,11 @@ func buildStaging(database *sql.DB, q Quiescer, dataDir, version string) (string
 			return fmt.Errorf("vacuum into: %w", err)
 		}
 
+		// §8.1 注入点：数据库快照已就位、blob 尚未 link。此刻崩溃留下的是一个
+		// 不完整的 staging 目录——下次备份会先清空它重做，绝不能被当成有效备份
+		if err := failpoint.Eval(failpoint.BackupStaging); err != nil {
+			return err
+		}
 		for _, dir := range []string{"blobs", "shares", "vaults"} {
 			src := filepath.Join(dataDir, dir)
 			if _, err := os.Stat(src); err != nil {

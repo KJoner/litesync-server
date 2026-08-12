@@ -195,3 +195,67 @@ func TestFailpointsInactiveByDefault(t *testing.T) {
 		t.Fatalf("未激活的注入点必须是零行为，得到 %v", err)
 	}
 }
+
+// 迁移逐对象推进时崩溃：journal 里那条仍是 pending，续跑必须幂等重做，
+// 而不是产生第二个对象或第二条 change（§8.2「migration 每个对象之间」）。
+func TestServerCrashBetweenMigrationObjects(t *testing.T) {
+	defer failpoint.Reset()
+	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
+	content := []byte("content for migration crash test")
+	if _, err := uploadOnce(s, "note.md", 0, content); err != nil {
+		t.Fatal(err)
+	}
+
+	cancel := failpoint.EnableError(failpoint.MigrationEachObj, 1)
+	_, err := s.MigrateObjectMeta("note.md", "", "", "dev-1")
+	cancel()
+	if err == nil {
+		t.Fatal("注入点没有生效")
+	}
+
+	// 崩溃点在任何状态改动之前 → 对象必须完好无损
+	h, herr := db.GetHeadByPseudonym(s.DB(), "note.md")
+	if herr != nil || h == nil {
+		t.Fatalf("迁移中断不得损坏对象: %v", herr)
+	}
+	if h.Revision != 1 {
+		t.Fatalf("迁移不改内容 revision，期望 1 得到 %d", h.Revision)
+	}
+	assertNoDanglingHeads(t, s, blobDir)
+}
+
+// complete 之前崩溃：complete 会不可逆地抹掉明文寻址名，
+// 因此此刻崩溃必须让仓库停在原状态，绝不能出现半个 encrypted
+// （§8.2「complete 各阶段」）。
+func TestServerCrashBeforeMigrationComplete(t *testing.T) {
+	defer failpoint.Reset()
+	s, _ := newServiceAt(t, syncsvc.Options{HistoryEnabled: true})
+	before, err := db.GetRepoState(s.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel := failpoint.EnableError(failpoint.MigrationBeforeDone, 1)
+	_, cerr := s.CompleteMetaMigration("some-migration", "dev-1")
+	cancel()
+	if cerr == nil {
+		t.Fatal("注入点没有生效")
+	}
+
+	after, err := db.GetRepoState(s.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.MetaState != before.MetaState {
+		t.Fatalf("complete 之前崩溃却改了仓库状态：%s -> %s", before.MetaState, after.MetaState)
+	}
+	if after.FormatEpoch != before.FormatEpoch {
+		t.Fatalf("complete 之前崩溃却推进了 formatEpoch：%d -> %d", before.FormatEpoch, after.FormatEpoch)
+	}
+}
+
+// WAL checkpoint 与 VACUUM 的注入点已接在 erasePlaintextPathsLocked 里，
+// 但那段代码只能经由一次**完整**的元数据迁移（plain → migrating → verifying →
+// complete）到达。搭一套完整迁移夹具的成本远高于它能带来的信心，
+// 因此这两点目前只有接线、没有直接测试——这一条如实记在
+// 《v0.14.0-RC 生产资格验证状态》的门槛 4 里，会由真实 Vault 的迁移演练覆盖。

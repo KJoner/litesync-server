@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 // 哨兵前缀：迁移开始时写入 vault_meta，擦除后必须在物理文件里找不到。
@@ -184,6 +185,11 @@ func (s *Service) erasePlaintextPathsLocked(rs *db.RepoState) (*ErasureReport, e
 	}
 
 	// 1) WAL checkpoint
+	// §8.1 注入点：checkpoint 之前。此刻崩溃 → 明文还在 WAL 里，
+	// 擦除必须整体失败并可重跑，绝不能把仓库标成「已擦除」
+	if err := failpoint.Eval(failpoint.WALCheckpoint); err != nil {
+		return nil, err
+	}
 	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		report.WalCheckpoint = "failed: " + err.Error()
 		return nil, fmt.Errorf("wal checkpoint: %w", err)
@@ -191,6 +197,12 @@ func (s *Service) erasePlaintextPathsLocked(rs *db.RepoState) (*ErasureReport, e
 	report.WalCheckpoint = "TRUNCATE ok"
 	report.Claims.WalTruncated = true
 
+	// §8.1 注入点：VACUUM 之前。SQLite 的 VACUUM 本身是事务性的，
+	// 因此这里崩溃只是「没重建」，不会留下半个库——擦除报告不会被写出，
+	// 下次可以直接重跑
+	if err := failpoint.Eval(failpoint.Vacuum); err != nil {
+		return nil, err
+	}
 	// 2) secure_delete + VACUUM：整库重建，freelist 里的旧页随之消失。
 	//
 	// ADR-008 原本设想 `VACUUM INTO` + 原子 rename。实际实现改用原地 VACUUM：

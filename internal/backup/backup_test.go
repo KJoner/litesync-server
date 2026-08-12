@@ -202,7 +202,7 @@ func newTestManager(t *testing.T, runner Runner) (*Manager, string) {
 
 	// 造一点数据：blobs 目录 + shares 目录
 	blobDir := filepath.Join(dataDir, "blobs", "ab")
-	os.MkdirAll(blobDir, 0o700)                                                       //nolint:errcheck
+	os.MkdirAll(blobDir, 0o700)                                                        //nolint:errcheck
 	os.WriteFile(filepath.Join(blobDir, strings.Repeat("ab", 32)), []byte("x"), 0o600) //nolint:errcheck
 
 	keyFile := filepath.Join(t.TempDir(), "backup-config.key") // /data 之外

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 // 备份恢复（v0.13.3 / 计划书 §7.8）。
@@ -89,6 +91,13 @@ func (m *Manager) Restore(ctx context.Context, snapshotID string) (*RestoreResul
 			}
 		}
 		return nil, fmt.Errorf("install restored data: %w", err)
+	}
+
+	// §8.1 注入点：数据已换上、repoEpoch 尚未旋转。这是恢复流程里最危险的窗口——
+	// 此刻起服务如果被启动，客户端会带着恢复点之前的旧游标继续增量同步，
+	// 静默跳过恢复点之后的全部变更。因此调用方必须把「旋转失败」当作硬错误处理
+	if err := failpoint.Eval(failpoint.RestoreBeforeEpoch); err != nil {
+		return nil, err
 	}
 
 	res := &RestoreResult{

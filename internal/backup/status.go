@@ -3,9 +3,9 @@ package backup
 // Status 备份状态（持久化于 vault_meta key = backup-status，明文 JSON，不含任何 Secret）。
 type Status struct {
 	// 运行环境
-	KeyAvailable bool   `json:"keyAvailable"` // backup-config.key 是否可用
-	KeyError     string `json:"keyError,omitempty"`
-	ResticOK     bool   `json:"resticOk"` // restic 二进制是否可执行
+	KeyAvailable  bool   `json:"keyAvailable"` // backup-config.key 是否可用
+	KeyError      string `json:"keyError,omitempty"`
+	ResticOK      bool   `json:"resticOk"` // restic 二进制是否可执行
 	ResticVersion string `json:"resticVersion,omitempty"`
 
 	// 配置概览
@@ -37,11 +37,11 @@ type Status struct {
 
 // BackupResult 单次备份的结果。
 type BackupResult struct {
-	SnapshotID string `json:"snapshotId"`
-	DurationMs int64  `json:"durationMs"`
-	FilesNew   int64  `json:"filesNew"`
-	FilesChanged int64 `json:"filesChanged"`
-	DataAdded  int64  `json:"dataAdded"`
+	SnapshotID   string `json:"snapshotId"`
+	DurationMs   int64  `json:"durationMs"`
+	FilesNew     int64  `json:"filesNew"`
+	FilesChanged int64  `json:"filesChanged"`
+	DataAdded    int64  `json:"dataAdded"`
 }
 
 // Snapshot 是 restic snapshots --json 的精简条目。

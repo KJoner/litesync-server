@@ -354,11 +354,11 @@ func (m *Manager) runBackup(ctx context.Context, cfg Config) (*BackupResult, err
 			continue
 		}
 		var msg struct {
-			MessageType  string `json:"message_type"`
-			SnapshotID   string `json:"snapshot_id"`
-			FilesNew     int64  `json:"files_new"`
-			FilesChanged int64  `json:"files_changed"`
-			DataAdded    int64  `json:"data_added"`
+			MessageType  string  `json:"message_type"`
+			SnapshotID   string  `json:"snapshot_id"`
+			FilesNew     int64   `json:"files_new"`
+			FilesChanged int64   `json:"files_changed"`
+			DataAdded    int64   `json:"data_added"`
 			TotalDur     float64 `json:"total_duration"`
 		}
 		if json.Unmarshal([]byte(line), &msg) == nil && msg.MessageType == "summary" {

@@ -34,8 +34,8 @@ type View struct {
 	Prefix    string `json:"prefix"`
 	Endpoint  string `json:"endpoint"`
 
-	AccessKeyConfigured    bool `json:"accessKeyConfigured"`
-	SecretKeyConfigured    bool `json:"secretKeyConfigured"`
+	AccessKeyConfigured      bool `json:"accessKeyConfigured"`
+	SecretKeyConfigured      bool `json:"secretKeyConfigured"`
 	ResticPasswordConfigured bool `json:"resticPasswordConfigured"`
 
 	BudgetGB int `json:"budgetGb"`
