@@ -358,6 +358,10 @@ func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
 		// 冲突对象的稳定身份：客户端据此走显式 restore
 		body["fileId"] = c.FileID
 	}
+	if c.Deleted {
+		// 删除时的内容世代：restore 必须提交严格大于它的世代（抗回退）
+		body["contentGeneration"] = c.ContentGeneration
+	}
 	writeJSON(w, http.StatusConflict, body)
 }
 

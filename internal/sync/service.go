@@ -117,6 +117,9 @@ type ConflictError struct {
 	PriorHash string
 	// FileID：冲突对象的稳定身份（客户端据此走 restore 而不是新建）
 	FileID string
+	// ContentGeneration：tombstone 冲突时删除时的内容世代——
+	// 客户端 restore 必须提交严格大于它的世代（抗回退），因此必须告诉它
+	ContentGeneration int64
 }
 
 func (e *ConflictError) Error() string {
@@ -429,6 +432,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 			return nil, &ConflictError{
 				Path: p.Path, Revision: tomb.DeletionRevision, Deleted: true,
 				PriorHash: tomb.PriorContentHash, FileID: tomb.FileID,
+				ContentGeneration: tomb.ContentGeneration,
 			}
 		}
 		if p.BaseRevision != 0 {

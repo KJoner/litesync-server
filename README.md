@@ -125,6 +125,29 @@ sync.example.com {
 }
 ```
 
+## 协议 v6（0.13.0）
+
+**0.13.0 是破坏性变更，插件与服务端必须同时升级**（`minProtocolVersion = 6`）。
+
+v5 把 path 当作主键，导致元数据迁移重置 revision、历史撞唯一键、删除丢身份、
+改名断历史。v6 把**身份**（`file_id`）与**展示名**（`pseudonym`）彻底分开：
+
+* 所有表以 `file_id` 为主键（并预留 `vault_id`）；`revision` 属于**对象**，
+  跨改名 / 迁移 / 删除恢复连续递增；
+* 改名与元数据迁移退化为一次元数据更新，**不再产生 tombstone**；
+* 删除进入独立的 `tombstones` 台账，迁移对它做**格式转换**而不是删除——
+  删除屏障、防复活 revision、恢复所需身份全部保留；重建必须走显式
+  `POST /api/v1/files/{fileId}/restore`；
+* 新增 `minimumEnvelopeVersion`（仓库级信封下限，单调不减，落库前校验，
+  覆盖含**删除后重建**的全部写入路径）与 `formatEpoch`（寻址格式世代，
+  变化时客户端丢弃游标全量对账）；
+* 元数据迁移是四态状态机 `plain → migrating → verifying → encrypted`，
+  验证与不可逆擦除分离；进度写入 `migration_journal`，服务端重启可续跑。
+
+升级时 `db.MigrateToV6` 自动把 v5 数据搬到新模型（journal 驱动、可续跑、幂等），
+并把旧表重命名为 `v5_files` / `v5_changes` / `v5_file_versions` **只读保留**作为回滚窗口。
+设计与取舍见插件仓库的 `docs/开发计划/v10/adr/`（ADR-001/002/003/006/008）。
+
 ## API 一览
 
 认证方式（`/api/*`，0.10.0 起设备级凭据）：
@@ -150,13 +173,15 @@ sync.example.com {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 `{"status":"ok"}`（无认证） |
-| GET | `/api/v1/info` | 版本、`protocolVersion` / `minProtocolVersion`（客户端兼容性判定）、`vaultId`（仓库稳定身份，0.8.0+）、latestSequence、服务器时间 |
+| GET | `/api/v1/info` | 版本、`protocolVersion` / `minProtocolVersion`（当前均为 **6**）、`vaultId`、`repoEpoch`、`formatEpoch`、`minimumEnvelopeVersion`、`schemaVersion`、`encryptionState` / `keyEpoch` / `metaState`、latestSequence、服务器时间 |
 | GET | `/api/v1/changes?since=N&limit=500` | 增量变更；游标过旧时返回 `resyncRequired` + `minSequence` |
 | GET | `/api/v1/snapshot` | 当前全部未删除文件的元数据（Web 端 / 全量对账） |
 | GET | `/api/v1/file?path=...` | 下载原始字节，元数据在响应 Header |
 | PUT | `/api/v1/file` | 上传原始字节，参数在请求 Header（见下） |
 | DELETE | `/api/v1/file` | 逻辑删除，Body: `{"path","baseRevision"}` |
-| POST | `/api/v1/file/move` | 原子改名（0.11.0，明文模式）：单事务 tombstone+新行，file_id 跟随内容；E2EE/目标占用/revision 不符 → 409，客户端回退 delete+upsert |
+| POST | `/api/v1/file/rename` | 改名（0.13.0）：**一次元数据更新**——revision / contentGeneration / blob 不动，**不产生 tombstone**；metaGeneration CAS 不符 → 412，目标被占用或目标名上有 tombstone → 409 |
+| POST | `/api/v1/files/{fileId}/restore` | 显式恢复已删除对象（0.13.0）：普通上传无法再穿透墓碑，重建必须走这里 |
+| POST | `/api/v1/envelope/complete` | 验证全部 HEAD 为 LSE3 后把仓库信封下限提升到 3（0.13.0 / ADR-006） |
 | GET | `/api/v1/history?path=...` | 历史版本列表（revision 降序） |
 | DELETE | `/api/v1/history?path=...&beforeRevision=N` | 清理该 revision 之前的历史（E2EE 迁移用） |
 | GET | `/api/v1/version?path=...&revision=N` | 下载某历史版本的原始字节 |
@@ -172,11 +197,15 @@ sync.example.com {
 | POST | `/api/v1/admin/backup/run` | 立即备份（异步；任务互斥，运行中返回 409） |
 | POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
-| GET / PUT | `/api/v1/file/meta` | 元数据读取 / 改名=元数据更新（0.12.0，metaGeneration CAS） |
-| POST | `/api/v1/meta/migrate` | 元数据迁移：单文件真实路径 → 伪名（断点续传安全） |
-| POST | `/api/v1/meta/begin` / `complete` / `abort` | 元数据加密状态机；**complete 自 0.12.1 起在存在明文 tombstone 时返回 409**（见下方 E2EE 小节） |
+| GET | `/api/v1/file/meta` | 轻量读取对象元数据（改名变更无需下载内容） |
+| POST | `/api/v1/meta/migrate` | 单对象伪名化（幂等，断点续传安全） |
+| GET | `/api/v1/meta/status` | 迁移状态与 journal 进度（0.13.0） |
+| POST | `/api/v1/meta/begin` / `verify` / `complete` / `abort` | 四态迁移状态机（0.13.0）：验证与不可逆擦除分离 |
+| GET | `/api/v1/meta/validate` | 只跑 11 项验证器不改状态（complete 前预检） |
+| GET / POST | `/api/v1/meta/tombstones` · `/api/v1/meta/migrate-tombstone` | 删除记录转隐私格式（**转换而不是删除**） |
+| GET | `/api/v1/admin/migration/report` | 最近一次擦除报告 |
 | POST | `/api/v1/e2ee/begin` | E2EE 迁移开始（0.9.0）：进入 migrating，冻结一切明文写入 |
-| POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE1/LSE2 密文后切换到 encrypted |
+| POST | `/api/v1/e2ee/complete` | 验证全部 HEAD 均为 LSE 密文后切换到 encrypted，并把信封下限提升到 1 |
 | POST | `/api/v1/e2ee/abort` | 放弃迁移，回到 plaintext |
 | POST | `/api/v1/devices` | **根 Token 专属**（0.10.0）：直接创建设备凭据（首台设备自注册） |
 | GET | `/api/v1/devices` | 设备列表（不含凭据材料，`current` 标记当前设备） |
@@ -272,13 +301,19 @@ LSE 密文，服务器永远无法获得解密密钥或任何明文。
 目录结构与文件名；同名并存判定靠客户端 HMAC（服务器只见散列）；
 改名 = 元数据更新，内容零重传。要求先完成「升级加密信封 LSE1 → LSE3」。
 
-> ⚠️ **0.12.1 起 `POST /api/v1/meta/complete`（明文路径抹除）被停用。**
-> 旧实现靠删除全部 tombstone 行来抹掉其中的明文路径，代价是丢失删除屏障——
-> 长期离线的旧设备重新上线会复活已删文件。仓库中只要还存在携带明文路径的
-> tombstone，complete 就返回 `409 TOMBSTONE_PLAINTEXT`，迁移停在可回退的
-> `migrating` 态（`POST /api/v1/meta/abort` 无损退回 `plain`）。
-> 因此**迁移前的 tombstone、旧 changes 与既有备份中仍可能保留明文路径**，
-> 在 v0.13 的隐私 tombstone ledger 完成前不得声称明文路径已不可恢复。
+**0.13.0（协议 v6）起的迁移流程**：`begin` → 逐对象伪名化 → **tombstone 转隐私格式**
+→ `verify` → `complete`。关键性质：
+
+* 迁移只改元数据，`revision` / `contentGeneration` / blob 全部不动，**不产生 tombstone**；
+* tombstone 做**格式转换**（明文寻址名 → fileId、归一化路径 → 客户端 HMAC）而**不是删除**——
+  0.12.0 靠删除 tombstone 抹明文，代价是长期离线设备重新上线会复活已删文件；
+* `verify` 是独立一态：验证与不可逆擦除分离，验证失败时数据一个字节都没动；
+* `complete` 前跑 11 项验证器，失败返回**完整清单**并保持 `verifying`；
+* 完成后 `formatEpoch` +1，所有客户端强制重新对账。
+
+> ⚠️ **`complete` 仍然不可逆，且迁移前备份中仍含明文路径。**
+> 擦除报告（`GET /api/v1/admin/migration/report`）会如实登记这一点
+> （`claims.backupsCleaned = false`）。销毁迁移前备份之前，不得声称明文路径已不可恢复。
 
 剩余的元数据暴露面：文件大小、修改时间与访问模式（见 v10 计划的 padding/批处理评估）。
 

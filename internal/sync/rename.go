@@ -124,7 +124,8 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 			return nil, err
 		} else if tomb != nil {
 			return nil, &ConflictError{Path: p.ToPseudonym, Revision: tomb.DeletionRevision,
-				Deleted: true, PriorHash: tomb.PriorContentHash, FileID: tomb.FileID}
+				Deleted: true, PriorHash: tomb.PriorContentHash, FileID: tomb.FileID,
+				ContentGeneration: tomb.ContentGeneration}
 		}
 	}
 	// 目标名与别的 live 对象归一化后同名 → 422（排除自己，允许纯大小写改名）
