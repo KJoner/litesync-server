@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/KJoner/litesync-server/internal/db"
@@ -167,7 +168,9 @@ func authGate(token string, web *sessionStore, svc *syncsvc.Service, next http.H
 				return
 			}
 			// 设备 Token：按 scope 校验（撤销后立即失效）
-			if d, err := svc.AuthDevice(bearer); err == nil && d != nil {
+			clientVer := r.Header.Get("X-Client-Version")
+			clientProto, _ := strconv.ParseInt(r.Header.Get("X-LiteSync-Protocol"), 10, 64) //nolint:errcheck
+			if d, err := svc.AuthDeviceWithClient(bearer, clientVer, clientProto); err == nil && d != nil {
 				if ok := enforceRouteScope(w, r, d.Scopes); !ok {
 					return
 				}

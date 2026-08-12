@@ -111,6 +111,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/devices", h.adminDevices)
 	mux.HandleFunc("DELETE /api/v1/admin/devices/{id}", h.adminRevokeDevice)
 	mux.HandleFunc("GET /api/v1/admin/migration/status", h.adminMigrationStatus)
+	mux.HandleFunc("GET /api/v1/admin/migration/preflight", h.adminPreflight)
 	mux.HandleFunc("GET /api/v1/admin/shares", h.adminShares)
 	mux.HandleFunc("POST /api/v1/admin/shares/{id}/recover", h.adminRecoverShare)
 

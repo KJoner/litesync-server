@@ -139,6 +139,15 @@ func (s *Service) EnrollDevice(secret, name string) (*DeviceCredential, error) {
 
 // AuthDevice 校验设备 token；有效则返回设备并更新 last_seen（节流到 5 分钟一次）。
 func (s *Service) AuthDevice(token string) (*db.Device, error) {
+	return s.AuthDeviceWithClient(token, "", 0)
+}
+
+// AuthDeviceWithClient 在校验的同时记录客户端上报的版本（§15 第 3 步）。
+//
+// 与 last_seen 用同一套节流：每个请求都写一次数据库，只为了记一个几乎不变的
+// 版本号，不值得。版本变化时会在下一个节流窗口被记上，对「迁移前确认全部升级」
+// 这个用途来说，5 分钟的延迟无关紧要。
+func (s *Service) AuthDeviceWithClient(token, clientVersion string, protocol int64) (*db.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, err := db.GetDeviceByTokenHash(s.db, sha256Hex([]byte(token)))
@@ -146,11 +155,19 @@ func (s *Service) AuthDevice(token string) (*db.Device, error) {
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if now-d.LastSeenAt > 300 {
+	// 版本变了就立刻记，否则沿用 5 分钟节流：升级完立刻去看设备列表是个
+	// 很自然的动作，让人等五分钟才看到新版本号会被当成「升级没生效」
+	versionChanged := clientVersion != "" && clientVersion != d.ClientVersion
+	if now-d.LastSeenAt > 300 || versionChanged {
 		if err := db.TouchDevice(s.db, d.DeviceID, now); err != nil {
 			s.log.Warn("device last_seen update failed", "deviceId", d.DeviceID, "error", err)
 		}
 		d.LastSeenAt = now
+		if err := db.RecordClientVersion(s.db, d.DeviceID, clientVersion, protocol); err != nil {
+			s.log.Warn("device client version update failed", "deviceId", d.DeviceID, "error", err)
+		} else if clientVersion != "" {
+			d.ClientVersion, d.ClientProtocol = clientVersion, protocol
+		}
 	}
 	return d, nil
 }

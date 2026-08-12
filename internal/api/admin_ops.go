@@ -45,6 +45,9 @@ func (h *handlers) adminDevices(w http.ResponseWriter, _ *http.Request) {
 			"lastSeenAt":    d.LastSeenAt,
 			"revoked":       d.Revoked,
 			"hasSigningKey": d.SigningPublicKey != "",
+			// §15 第 3 步：迁移前要能一眼看出哪台还没升级
+			"clientVersion":  d.ClientVersion,
+			"clientProtocol": d.ClientProtocol,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
@@ -215,5 +218,41 @@ func (h *handlers) adminRestorePlan(w http.ResponseWriter, r *http.Request) {
 		"whyNotAButton": "恢复要替换正在运行的进程打开着的文件（sync.db / WAL / blob）。" +
 			"在进程内做这件事，中途失败会留下既不是旧库也不是新库的半成品——" +
 			"而这一步发生在你已经出过一次事之后。请停机后在服务器上执行上面的命令。",
+	})
+}
+
+// adminPreflight 迁移前置检查（§15 第 3/6/7 步）。
+// GET /api/v1/admin/migration/preflight?client=0.17.0
+//
+// 与 CLI 的 `obsync migration preflight` 是同一份逻辑。放到 Web 上是因为
+// §15 的第 3 步要挨个核对设备，而那件事在浏览器里做比 SSH 上去做自然得多。
+func (h *handlers) adminPreflight(w http.ResponseWriter, r *http.Request) {
+	rep, err := h.svc.MigrationPreflight(r.URL.Query().Get("client"))
+	if err != nil {
+		h.internalError(w, "admin preflight", err)
+		return
+	}
+	issues := make([]map[string]any, 0, len(rep.Issues))
+	for i := range rep.Issues {
+		issues = append(issues, map[string]any{
+			"blocking": rep.Issues[i].Blocking,
+			"code":     rep.Issues[i].Code,
+			"detail":   rep.Issues[i].Detail,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"blocked":             rep.Blocked(),
+		"activeDevices":       rep.ActiveDevices,
+		"staleDevices":        rep.StaleDevices,
+		"unknownVersion":      rep.UnknownVersion,
+		"outdatedClient":      rep.OutdatedClient,
+		"metaState":           rep.MetaState,
+		"formatEpoch":         rep.FormatEpoch,
+		"envelopeFloor":       rep.EnvelopeFloor,
+		"latestSequence":      rep.LatestSequence,
+		"plaintextTombstones": rep.PlaintextTombstones,
+		"orphanVersions":      rep.OrphanVersions,
+		"missingBlobs":        rep.MissingBlobs,
+		"issues":              issues,
 	})
 }

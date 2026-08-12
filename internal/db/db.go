@@ -118,6 +118,12 @@ func migrateColumns(d *sql.DB) error {
 		{"devices", "user_id", `ALTER TABLE devices ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`, false},
 		// 移除成员后 Vault Key 必须由管理员设备重新封装；在那之前这里记着待办的 epoch
 		{"vaults", "pending_rewrap_epoch", `ALTER TABLE vaults ADD COLUMN pending_rewrap_epoch INTEGER NOT NULL DEFAULT 0`, false},
+
+		// --- v0.17 新增列（§15 第 3 步：迁移前必须能确认没有旧客户端） ---
+		// 没有这一列，「检查设备列表，无旧客户端」这一步根本无法执行——
+		// 而它是不可逆迁移的前置条件。
+		{"devices", "client_version", `ALTER TABLE devices ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`, false},
+		{"devices", "client_protocol", `ALTER TABLE devices ADD COLUMN client_protocol INTEGER NOT NULL DEFAULT 0`, false},
 	}
 
 	for _, m := range migrations {

@@ -22,16 +22,22 @@ type Device struct {
 	// 没有这条绑定，「移除成员时撤销他的设备」无从谈起。
 	VaultID string
 	UserID  string
+	// ClientVersion / ClientProtocol（v0.17 / §15 第 3 步）：
+	// 该设备最后一次请求上报的插件版本与协议版本。
+	// 迁移前要回答「所有设备都升级了吗」，这是唯一的事实来源。
+	ClientVersion  string
+	ClientProtocol int64
 }
 
 const deviceColumns = `id, name, token_hash, scopes, created_at, last_seen_at, revoked,
-	signing_public_key, vault_id, user_id`
+	signing_public_key, vault_id, user_id, client_version, client_protocol`
 
 func scanDevice(sc interface{ Scan(...any) error }) (*Device, error) {
 	d := &Device{}
 	var revoked int64
 	if err := sc.Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt,
-		&d.LastSeenAt, &revoked, &d.SigningPublicKey, &d.VaultID, &d.UserID); err != nil {
+		&d.LastSeenAt, &revoked, &d.SigningPublicKey, &d.VaultID, &d.UserID,
+		&d.ClientVersion, &d.ClientProtocol); err != nil {
 		return nil, err
 	}
 	d.Revoked = revoked != 0
@@ -170,4 +176,18 @@ func defaultIfEmpty(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+// RecordClientVersion 记录设备最后一次上报的客户端版本（§15 第 3 步）。
+//
+// 只写不比较：判断「够不够新」是运维决策，属于 preflight，不属于这里。
+// 服务器在这里做版本门禁会变成一个新的拒绝服务面——一次误配就把所有设备挡在外面。
+func RecordClientVersion(q dbtx, deviceID, version string, protocol int64) error {
+	if version == "" && protocol == 0 {
+		return nil
+	}
+	_, err := q.Exec(
+		`UPDATE devices SET client_version = ?, client_protocol = ? WHERE id = ?`,
+		version, protocol, deviceID)
+	return err
 }
