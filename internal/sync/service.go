@@ -110,11 +110,21 @@ var (
 	lse1Magic = []byte{0x4c, 0x53, 0x45, 0x31} // "LSE1"
 	lse2Magic = []byte{0x4c, 0x53, 0x45, 0x32} // "LSE2"
 	lse3Magic = []byte{0x4c, 0x53, 0x45, 0x33} // "LSE3"
+	// LSE4（v0.17 / 计划书 §11.1）：LSE3 加一个 flags 字节，明文内部带真实长度框，
+	// 从而可以把密文填充到桶边界而不丢失原始大小。
+	//
+	// 服务器对它几乎无感：版本号 4 ≥ 现有下限 3，所以**不需要迁移**——
+	// 存量 LSE3 继续可读，新内容按需用 LSE4。这也是为什么填充做成新信封版本
+	// 而不是「在 LSE3 明文里塞个前缀」：后者无法与「文件恰好以那几个字节开头」
+	// 区分开，解密时会把用户内容当成填充框读。
+	lse4Magic = []byte{0x4c, 0x53, 0x45, 0x34} // "LSE4"
 )
 
 // envelopeVersion 返回内容的信封版本：1/2/3；非 LSE 内容返回 0。
 func envelopeVersion(head []byte) int64 {
 	switch {
+	case bytes.Equal(head, lse4Magic):
+		return 4
 	case bytes.Equal(head, lse3Magic):
 		return 3
 	case bytes.Equal(head, lse2Magic):
@@ -741,21 +751,44 @@ func isHex32(s string) bool {
 type lse3Header struct {
 	keyEpoch   int64
 	generation int64
+	// flags/version 仅 LSE4 有意义（§11.1）
+	flags   byte
+	version int64
 }
 
-// parseLse3Header 读取 LSE3 信封头：'LSE3'(4B) | keyEpoch u32 BE | generation u64 BE。
+// parseLse3Header 读取 LSE3/LSE4 信封头。
+//
+//	LSE3: 'LSE3'(4B) | keyEpoch u32 BE | generation u64 BE
+//	LSE4: 'LSE4'(4B) | flags u8 | keyEpoch u32 BE | generation u64 BE
+//
+// 两者都要认：抗回退重放靠的就是这里读出来的 keyEpoch 与 generation。
+// 只认 LSE3 的话，填充过的对象在服务器眼里 generation 恒为 0，
+// 内容世代校验（INV-08）会整个失效——而且不会有任何报错。
 func parseLse3Header(r io.Reader) (lse3Header, bool) {
-	head := make([]byte, 16)
-	if _, err := io.ReadFull(r, head); err != nil {
+	head := make([]byte, 17)
+	n, err := io.ReadFull(r, head)
+	if err != nil && n < 16 {
 		return lse3Header{}, false
 	}
-	if !bytes.Equal(head[:4], lse3Magic) {
-		return lse3Header{}, false
+	switch {
+	case bytes.Equal(head[:4], lse3Magic):
+		return lse3Header{
+			keyEpoch:   int64(binary.BigEndian.Uint32(head[4:8])),
+			generation: int64(binary.BigEndian.Uint64(head[8:16])),
+			version:    3,
+		}, true
+	case bytes.Equal(head[:4], lse4Magic):
+		if n < 17 {
+			return lse3Header{}, false
+		}
+		return lse3Header{
+			flags:      head[4],
+			keyEpoch:   int64(binary.BigEndian.Uint32(head[5:9])),
+			generation: int64(binary.BigEndian.Uint64(head[9:17])),
+			version:    4,
+		}, true
 	}
-	return lse3Header{
-		keyEpoch:   int64(binary.BigEndian.Uint32(head[4:8])),
-		generation: int64(binary.BigEndian.Uint64(head[8:16])),
-	}, true
+	return lse3Header{}, false
 }
 
 func lse3HeaderOfFile(path string) (lse3Header, bool) {
