@@ -185,8 +185,7 @@ func (f *fakeRunner) callsFor(op string) []call {
 
 type fakeQuiescer struct{}
 
-func (fakeQuiescer) WithGlobalLock(fn func() error) error { return fn() }
-func (fakeQuiescer) LatestSequence() (int64, error)       { return 42, nil }
+func (fakeQuiescer) WithGlobalLock(fn func(latestSequence int64) error) error { return fn(42) }
 
 const backupSummary = `{"message_type":"status","percent_done":1}
 {"message_type":"summary","snapshot_id":"abc123","files_new":3,"files_changed":1,"data_added":1024,"total_duration":1.5}`

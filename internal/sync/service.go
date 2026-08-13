@@ -1151,10 +1151,18 @@ func (s *Service) RepoInfo() (*RepoInfo, error) {
 }
 
 // WithGlobalLock 短暂持有全局写锁执行 fn（备份一致性快照用）。
-func (s *Service) WithGlobalLock(fn func() error) error {
+//
+// latestSequence 在锁内读好传给 fn——fn 在锁内执行，**绝不能**再回调本
+// Service 的任何加锁方法（互斥锁不可重入；0.17.0 的备份闭包就是这样把
+// 整台服务器锁死的，见 backup.Quiescer 的契约说明）。
+func (s *Service) WithGlobalLock(fn func(latestSequence int64) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return fn()
+	rs, err := db.GetRepoState(s.db, s.scope())
+	if err != nil {
+		return err
+	}
+	return fn(rs.HeadSequence)
 }
 
 // Snapshot 返回当前所有 live 对象与最新 sequence（严格对应同一时刻，INV-02）。

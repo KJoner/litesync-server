@@ -57,8 +57,7 @@ func resticBinName() string {
 // quiescer：演练里没有并发写入需要静默。
 type drillQuiescer struct{ seq int64 }
 
-func (drillQuiescer) WithGlobalLock(fn func() error) error { return fn() }
-func (q drillQuiescer) LatestSequence() (int64, error)     { return q.seq, nil }
+func (q drillQuiescer) WithGlobalLock(fn func(latestSequence int64) error) error { return fn(q.seq) }
 
 // 造一个有真实内容的数据目录：sync.db + blobs。
 func seedDataDir(t *testing.T, dataDir string) map[string]string {

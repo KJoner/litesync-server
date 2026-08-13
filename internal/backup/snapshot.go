@@ -19,9 +19,14 @@ import (
 const stagingName = "current"
 
 // Quiescer 由 sync.Service 实现：短暂持有全局写锁，保证快照一致性。
+//
+// 契约（0.17.1 实测死锁修正）：latestSequence 由实现方**在锁内读好**传给 fn。
+// 之前的接口是 fn 里回调 `q.LatestSequence()`——而 sync.Service 的实现自己
+// 也要拿同一把锁，Go 互斥锁不可重入 → 线上第一次跑备份就整库死锁
+//（CLI 与测试替身的 WithGlobalLock 都是无锁直通，恰好全部绕过了真实实现）。
+// 现在闭包拿到的只是一个值，从接口层面消灭「闭包里回调加锁方法」这类错误。
 type Quiescer interface {
-	WithGlobalLock(fn func() error) error
-	LatestSequence() (int64, error)
+	WithGlobalLock(fn func(latestSequence int64) error) error
 }
 
 // Manifest 写入 staging 根目录，恢复时用于确认备份完整性与版本。
@@ -55,7 +60,7 @@ func buildStaging(database *sql.DB, q Quiescer, dataDir, version string) (string
 		return "", err
 	}
 
-	err := q.WithGlobalLock(func() error {
+	err := q.WithGlobalLock(func(latestSequence int64) error {
 		// SQLite 一致性快照：VACUUM INTO 产出独立、紧凑的数据库文件
 		dbCopy := filepath.Join(staging, "sync.db")
 		if _, err := database.Exec(`VACUUM INTO ?`, dbCopy); err != nil {
@@ -77,16 +82,12 @@ func buildStaging(database *sql.DB, q Quiescer, dataDir, version string) (string
 			}
 		}
 
-		latest, err := q.LatestSequence()
-		if err != nil {
-			return err
-		}
 		m := Manifest{
 			Format:          1,
 			CreatedAt:       time.Now().Unix(),
 			LitesyncVersion: version,
 			SchemaVersion:   1,
-			LatestSequence:  latest,
+			LatestSequence:  latestSequence,
 		}
 		raw, err := json.MarshalIndent(m, "", "  ")
 		if err != nil {

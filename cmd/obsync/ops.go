@@ -325,17 +325,17 @@ func opsBackup(args []string) error {
 	return fmt.Errorf("未知的 backup 子命令：%s", args[0])
 }
 
-// cliQuiescer：运维命令运行时服务是停的，没有并发写入需要静默。
-// LatestSequence 仍然如实读库——它会写进备份 manifest，恢复时要靠它判断
+// cliQuiescer：运维命令运行时服务是停的，没有并发写入需要静默，锁是直通的。
+// latestSequence 仍然如实读库——它会写进备份 manifest，恢复时要靠它判断
 // 「这份备份停在哪个 sequence」。
 type cliQuiescer struct{ db *sql.DB }
 
-func (cliQuiescer) WithGlobalLock(fn func() error) error { return fn() }
-
-func (q cliQuiescer) LatestSequence() (int64, error) {
+func (q cliQuiescer) WithGlobalLock(fn func(latestSequence int64) error) error {
 	var seq int64
-	err := q.db.QueryRow(`SELECT COALESCE(MAX(sequence), 0) FROM object_changes`).Scan(&seq)
-	return seq, err
+	if err := q.db.QueryRow(`SELECT COALESCE(MAX(sequence), 0) FROM object_changes`).Scan(&seq); err != nil {
+		return err
+	}
+	return fn(seq)
 }
 
 // restoreWithNewEpoch 执行 §7.8 要求的完整恢复流程。
