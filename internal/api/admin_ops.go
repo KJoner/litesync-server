@@ -48,6 +48,10 @@ func (h *handlers) adminDevices(w http.ResponseWriter, _ *http.Request) {
 			// §15 第 3 步：迁移前要能一眼看出哪台还没升级
 			"clientVersion":  d.ClientVersion,
 			"clientProtocol": d.ClientProtocol,
+			// v0.17 运维页增强：丢设备那天要能一眼认出「哪台是那部手机、
+			// 它最后从哪个网络连上来」
+			"platform": d.Platform,
+			"lastIp":   d.LastIP,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
@@ -167,6 +171,28 @@ func (h *handlers) adminRecoverShare(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, "admin recover share", err)
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "expiresAt": req.ExpiresAt})
+	}
+}
+
+// adminRevokeShare 撤销一个分享。
+// DELETE /api/v1/admin/shares/{id}
+//
+// 撤销立刻生效并回收密文：分享链接落到不该看的人手里时，争的同样是这几分钟。
+// 与「延长有效期」相反，这是一次明确的意图表达——撤销后不能再通过 recover 推翻。
+func (h *handlers) adminRevokeShare(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/shares/")
+	if id == "" || strings.Contains(id, "/") {
+		writeErr(w, http.StatusBadRequest, "missing share id")
+		return
+	}
+	err := h.svc.RevokeShare(id)
+	switch {
+	case errors.Is(err, syncsvc.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "share not found")
+	case err != nil:
+		h.internalError(w, "admin revoke share", err)
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"revoked": id})
 	}
 }
 

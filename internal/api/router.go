@@ -114,6 +114,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/migration/preflight", h.adminPreflight)
 	mux.HandleFunc("GET /api/v1/admin/shares", h.adminShares)
 	mux.HandleFunc("POST /api/v1/admin/shares/{id}/recover", h.adminRecoverShare)
+	mux.HandleFunc("DELETE /api/v1/admin/shares/{id}", h.adminRevokeShare)
 
 	// 配对（v8 新设备接入）：创建/撤销需 Token；消费与落地页公开（一次性 + 5 分钟过期）
 	mux.HandleFunc("POST /api/v1/pairing", h.createPairing)
@@ -135,7 +136,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 		mux.Handle("GET /", http.FileServerFS(dist))
 	}
 
-	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, svc, mux)))
+	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, svc, h.trusted, mux)))
 }
 
 // 协议版本由服务层定义（逐请求校验发生在那里）；这里只做转发。

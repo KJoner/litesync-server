@@ -41,6 +41,11 @@ func newTestEnv(t *testing.T, maxFileSize int64) *testEnv {
 }
 
 func newTestEnvOpts(t *testing.T, maxFileSize int64, opts syncsvc.Options) *testEnv {
+	return newTestEnvProxied(t, maxFileSize, opts, nil)
+}
+
+// newTestEnvProxied 额外配置可信反向代理（clientIP / X-Forwarded-For 语义测试用）。
+func newTestEnvProxied(t *testing.T, maxFileSize int64, opts syncsvc.Options, trustedProxies []string) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
 	database, err := db.Open(filepath.Join(dir, "sync.db"))
@@ -66,10 +71,11 @@ func newTestEnvOpts(t *testing.T, maxFileSize int64, opts syncsvc.Options) *test
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := syncsvc.New(database, store, blobs, shares, opts, logger)
 	handler := api.New(api.Options{
-		Token:       testToken,
-		MaxFileSize: maxFileSize,
-		Version:     "test",
-		Logger:      logger,
+		Token:          testToken,
+		MaxFileSize:    maxFileSize,
+		Version:        "test",
+		Logger:         logger,
+		TrustedProxies: trustedProxies,
 	}, svc)
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)

@@ -27,17 +27,22 @@ type Device struct {
 	// 迁移前要回答「所有设备都升级了吗」，这是唯一的事实来源。
 	ClientVersion  string
 	ClientProtocol int64
+	// Platform / LastIP（v0.17 运维页增强）：该设备最后一次上报的平台
+	// 与最近来源 IP。丢设备的那天，「哪台是那部手机、它最后从哪连上来」
+	// 靠只有设备名的列表答不了。
+	Platform string
+	LastIP   string
 }
 
 const deviceColumns = `id, name, token_hash, scopes, created_at, last_seen_at, revoked,
-	signing_public_key, vault_id, user_id, client_version, client_protocol`
+	signing_public_key, vault_id, user_id, client_version, client_protocol, platform, last_ip`
 
 func scanDevice(sc interface{ Scan(...any) error }) (*Device, error) {
 	d := &Device{}
 	var revoked int64
 	if err := sc.Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt,
 		&d.LastSeenAt, &revoked, &d.SigningPublicKey, &d.VaultID, &d.UserID,
-		&d.ClientVersion, &d.ClientProtocol); err != nil {
+		&d.ClientVersion, &d.ClientProtocol, &d.Platform, &d.LastIP); err != nil {
 		return nil, err
 	}
 	d.Revoked = revoked != 0
@@ -178,16 +183,25 @@ func defaultIfEmpty(v, fallback string) string {
 	return v
 }
 
-// RecordClientVersion 记录设备最后一次上报的客户端版本（§15 第 3 步）。
+// RecordClientSeen 记录设备最后一次上报的客户端版本、平台与来源 IP
+//（§15 第 3 步 + v0.17 运维页增强，原 RecordClientVersion）。
 //
 // 只写不比较：判断「够不够新」是运维决策，属于 preflight，不属于这里。
 // 服务器在这里做版本门禁会变成一个新的拒绝服务面——一次误配就把所有设备挡在外面。
-func RecordClientVersion(q dbtx, deviceID, version string, protocol int64) error {
-	if version == "" && protocol == 0 {
+//
+// 每个字段都是「空值 = 未上报，保留旧值」：旧客户端不带 X-Client-Platform 头，
+// 不能让它每次请求把已记录的平台抹掉；version/protocol 同理。
+func RecordClientSeen(q dbtx, deviceID, version string, protocol int64, platform, ip string) error {
+	if version == "" && protocol == 0 && platform == "" && ip == "" {
 		return nil
 	}
 	_, err := q.Exec(
-		`UPDATE devices SET client_version = ?, client_protocol = ? WHERE id = ?`,
-		version, protocol, deviceID)
+		`UPDATE devices SET
+		 client_version = CASE WHEN ? != '' THEN ? ELSE client_version END,
+		 client_protocol = CASE WHEN ? != 0 THEN ? ELSE client_protocol END,
+		 platform = CASE WHEN ? != '' THEN ? ELSE platform END,
+		 last_ip = CASE WHEN ? != '' THEN ? ELSE last_ip END
+		 WHERE id = ?`,
+		version, version, protocol, protocol, platform, platform, ip, ip, deviceID)
 	return err
 }

@@ -13,10 +13,16 @@ export interface VaultKeyDoc {
 const LSE_MAGIC = [0x4c, 0x53, 0x45, 0x31]; // "LSE1"
 const LSE2_MAGIC = [0x4c, 0x53, 0x45, 0x32]; // "LSE2"（v9.2：AAD 绑定 vaultId+keyEpoch+path）
 const LSE3_MAGIC = [0x4c, 0x53, 0x45, 0x33]; // "LSE3"（v9.3：AAD 绑定 vaultId+keyEpoch+fileId+generation）
+const LSE4_MAGIC = [0x4c, 0x53, 0x45, 0x34]; // "LSE4"（v0.17 §11.1：LSE3 + flags 字节 + 明文定长帧）
 const LSS_MAGIC = [0x4c, 0x53, 0x53, 0x31]; // "LSS1"
 const IV_LEN = 12;
 const EPOCH_LEN = 4;
 const GEN_LEN = 8;
+/** LSE4：flags 字节长度与明文帧头（真实长度 u64 BE）长度。 */
+const FLAGS_LEN = 1;
+const FRAME_HEADER_LEN = 8;
+/** 与插件 padding.ts 的 MAX_PADDED_LENGTH 一致（1TiB）。 */
+const MAX_PADDED_LENGTH = 2 ** 40;
 
 /** LSE2 的 AAD 绑定材料（来自 /api/v1/info）。 */
 export interface FileKeyBinding {
@@ -55,7 +61,12 @@ function hasMagic(data: ArrayBuffer, magic: number[]): boolean {
 }
 
 export function isEncryptedFile(data: ArrayBuffer): boolean {
-	return hasMagic(data, LSE_MAGIC) || hasMagic(data, LSE2_MAGIC) || hasMagic(data, LSE3_MAGIC);
+	return (
+		hasMagic(data, LSE_MAGIC) ||
+		hasMagic(data, LSE2_MAGIC) ||
+		hasMagic(data, LSE3_MAGIC) ||
+		hasMagic(data, LSE4_MAGIC)
+	);
 }
 
 export function isEncryptedShare(data: ArrayBuffer): boolean {
@@ -93,19 +104,41 @@ export async function importVmk(raw: Uint8Array): Promise<CryptoKey> {
 	return crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, false, ["decrypt"]);
 }
 
-/** LSE3 信封头里的世代信息（解密前即可读；GCM 会在解密时认证它们）。 */
+/** LSE3/LSE4 信封头里的世代信息（解密前即可读；GCM 会在解密时认证它们）。 */
 export function lse3Header(payload: ArrayBuffer): { keyEpoch: number; generation: number } | null {
-	if (!hasMagic(payload, LSE3_MAGIC)) return null;
-	const view = new DataView(payload);
-	return {
-		keyEpoch: view.getUint32(4, false),
-		generation: Number(view.getBigUint64(4 + EPOCH_LEN, false)),
-	};
+	if (hasMagic(payload, LSE3_MAGIC)) {
+		const view = new DataView(payload);
+		return {
+			keyEpoch: view.getUint32(4, false),
+			generation: Number(view.getBigUint64(4 + EPOCH_LEN, false)),
+		};
+	}
+	if (hasMagic(payload, LSE4_MAGIC)) {
+		const view = new DataView(payload);
+		return {
+			keyEpoch: view.getUint32(4 + FLAGS_LEN, false),
+			generation: Number(view.getBigUint64(4 + FLAGS_LEN + EPOCH_LEN, false)),
+		};
+	}
+	return null;
 }
 
 /**
- * 解密 LSE1/LSE2/LSE3 文件；失败返回 null。
- * LSE2 需要 binding（vaultId 来自 /info）；LSE3 还需要 fileId（snapshot 提供）。
+ * LSE4 的明文定长帧：`trueLength(u64 BE) | content | 零填充`（§11.1）。
+ * 帧头经 GCM 认证，长度对不上只可能是数据损坏 → null 走「读不出来」分支。
+ */
+function unframePadded(framed: ArrayBuffer): ArrayBuffer | null {
+	if (framed.byteLength < FRAME_HEADER_LEN) return null;
+	const len = new DataView(framed).getBigUint64(0, false);
+	if (len > BigInt(MAX_PADDED_LENGTH)) return null;
+	const n = Number(len);
+	if (FRAME_HEADER_LEN + n > framed.byteLength) return null;
+	return framed.slice(FRAME_HEADER_LEN, FRAME_HEADER_LEN + n);
+}
+
+/**
+ * 解密 LSE1/LSE2/LSE3/LSE4 文件；失败返回 null。
+ * LSE2 需要 binding（vaultId 来自 /info）；LSE3/LSE4 还需要 fileId（snapshot 提供）。
  */
 export async function decryptFile(
 	vmk: CryptoKey,
@@ -114,6 +147,31 @@ export async function decryptFile(
 	binding?: FileKeyBinding,
 	fileId?: string,
 ): Promise<ArrayBuffer | null> {
+	if (hasMagic(payload, LSE4_MAGIC)) {
+		// LSE4（v0.17 §11.1）：magic | flags(u8) | keyEpoch(u32) | generation(u64) | iv | ct。
+		// flags 参与 AAD（抹掉 padded 位会认证失败）；明文是定长帧，解密后去填充
+		if (!binding?.vaultId || !fileId) return null;
+		try {
+			const view = new DataView(payload);
+			const flags = view.getUint8(4);
+			const envelopeEpoch = view.getUint32(4 + FLAGS_LEN, false);
+			const generation = view.getBigUint64(4 + FLAGS_LEN + EPOCH_LEN, false);
+			const head = 4 + FLAGS_LEN + EPOCH_LEN + GEN_LEN;
+			const iv = new Uint8Array(payload, head, IV_LEN);
+			const ct = new Uint8Array(payload, head + IV_LEN);
+			const aad = new TextEncoder().encode(
+				`litesync/v4/file:${binding.vaultId}:${envelopeEpoch}:${fileId}:${generation}:${flags}`,
+			);
+			const framed = await crypto.subtle.decrypt(
+				{ name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource },
+				vmk,
+				ct,
+			);
+			return unframePadded(framed);
+		} catch {
+			return null;
+		}
+	}
 	if (hasMagic(payload, LSE3_MAGIC)) {
 		if (!binding?.vaultId || !fileId) return null;
 		try {

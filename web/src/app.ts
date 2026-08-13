@@ -1391,6 +1391,15 @@ function renderDeviceCard(box: HTMLElement, devices: AdminDevice[]): void {
 				`最后活动 ${fmtTs(d.lastSeenAt)} · 接入于 ${fmtTs(d.createdAt)} · ${d.scopes.join(", ") || "无权限"}`,
 			),
 		);
+		// 平台 / 客户端版本 / 最近 IP：丢设备那天要能一眼认出「哪台是那部手机」。
+		// 空值显示 —（旧客户端没上报过，不是 undefined）
+		info.append(
+			el(
+				"div",
+				"muted small",
+				`${d.platform || "—"} · ${d.clientVersion || "—"} · IP ${d.lastIp || "—"}`,
+			),
+		);
 		row.append(info);
 		if (!d.revoked) {
 			const btn = el("button", "danger", "撤销");
@@ -1441,21 +1450,59 @@ function renderShareCard(box: HTMLElement, shares: AdminShare[]): void {
 		);
 		row.append(info);
 		if (s.recoverable && !s.revoked) {
-			const btn = el("button", "ghost", "延长 7 天");
+			// ExtendShare 的语义是「设定新的到期时间」而不是在原值上叠加——文案照实说
+			const sel = el("select");
+			for (const days of [7, 30, 90]) {
+				const opt = el("option", "", `${days} 天后`);
+				opt.value = String(days);
+				sel.append(opt);
+			}
+			const customOpt = el("option", "", "自定义天数…");
+			customOpt.value = "custom";
+			sel.append(customOpt);
+			const custom = el("input");
+			custom.type = "number";
+			custom.min = "1";
+			custom.step = "1";
+			custom.placeholder = "天数";
+			custom.hidden = true;
+			sel.onchange = () => (custom.hidden = sel.value !== "custom");
+			const btn = el("button", "ghost", "设置新的到期时间");
 			btn.onclick = () => {
+				const days = sel.value === "custom" ? Number(custom.value) : Number(sel.value);
+				if (!Number.isInteger(days) || days <= 0) {
+					alert("自定义天数必须是正整数");
+					return;
+				}
 				btn.disabled = true;
-				const until = Math.floor(Date.now() / 1000) + 7 * 86400;
+				const until = Math.floor(Date.now() / 1000) + days * 86400;
 				void S!.api
 					.adminRecoverShare(s.id, until)
 					.then(() => renderOpsInto(box))
 					.catch((e: unknown) => {
 						btn.disabled = false;
-						alert(`恢复失败：${e instanceof Error ? e.message : String(e)}`);
+						alert(`设置失败：${e instanceof Error ? e.message : String(e)}`);
 					});
 			};
-			row.append(btn);
+			row.append(sel, custom, btn);
 		} else if (!s.revoked) {
 			row.append(el("span", "muted small", "密文已回收，无法恢复"));
+		}
+		if (!s.revoked) {
+			const revokeBtn = el("button", "danger", "撤销");
+			revokeBtn.onclick = () => {
+				// 撤销不可逆且密文一并回收，值得一次确认——但只要一次
+				if (!confirm(`撤销分享「${s.id.slice(0, 12)}…」？链接将立刻失效，密文一并回收，不可恢复。`)) return;
+				revokeBtn.disabled = true;
+				void S!.api
+					.adminRevokeShare(s.id)
+					.then(() => renderOpsInto(box))
+					.catch((e: unknown) => {
+						revokeBtn.disabled = false;
+						alert(`撤销失败：${e instanceof Error ? e.message : String(e)}`);
+					});
+			};
+			row.append(revokeBtn);
 		}
 		list.append(row);
 	}

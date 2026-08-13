@@ -63,7 +63,7 @@ func TestPreflightBlocksOnOutdatedClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 模拟这台设备连过一次，上报了老版本
-	if _, err := s.AuthDeviceWithClient(cred.Token, "0.13.2", 6); err != nil {
+	if _, err := s.AuthDeviceWithClient(cred.Token, "0.13.2", 6, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,7 +96,7 @@ func TestPreflightPassesWhenAllClientsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.AuthDeviceWithClient(cred.Token, "0.17.0", 6); err != nil {
+	if _, err := s.AuthDeviceWithClient(cred.Token, "0.17.0", 6, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	rep, err := s.MigrationPreflight("0.17.0")
@@ -138,7 +138,7 @@ func TestPreflightWarnsButDoesNotBlockOnStaleDevices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.AuthDeviceWithClient(cred.Token, "0.17.0", 6); err != nil {
+	if _, err := s.AuthDeviceWithClient(cred.Token, "0.17.0", 6, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	long := time.Now().AddDate(0, 0, -200).Unix()

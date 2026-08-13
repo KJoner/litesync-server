@@ -134,6 +134,50 @@ func TestAdminShareRecoveryTellsTheTruth(t *testing.T) {
 	}
 }
 
+// admin 撤销分享：链接立刻失效、密文一并回收，且撤销是明确的意图表达——
+// 之后不能再靠「恢复」推翻。
+func TestAdminRevokeShare(t *testing.T) {
+	e := newTestEnv(t, 1<<20)
+	resp, body := e.createShare(t, "note", time.Now().Unix()+3600, []byte("cipher"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("创建分享 = %d", resp.StatusCode)
+	}
+	shareID, _ := body["id"].(string)
+	if shareID == "" {
+		t.Fatal("缺少分享 id")
+	}
+
+	// 撤销前公开链接可达（对照组：没有它，后面的 404 可能只是「从来就打不开」）
+	if r, _ := e.fetchShare(t, shareID); r.StatusCode != http.StatusOK {
+		t.Fatalf("撤销前分享应当可达，得到 %d", r.StatusCode)
+	}
+
+	resp, _ = e.doJSON(t, http.MethodDelete, "/api/v1/admin/shares/"+shareID, testToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("撤销分享 = %d", resp.StatusCode)
+	}
+
+	// 链接立刻 404
+	if r, _ := e.fetchShare(t, shareID); r.StatusCode != http.StatusNotFound {
+		t.Fatalf("撤销后分享链接应当 404，得到 %d", r.StatusCode)
+	}
+	// 密文已回收：服务器不该继续替一个已撤销的分享保管密文
+	if e.svc.ShareCiphertextExists(shareID) {
+		t.Fatal("撤销后密文必须被回收")
+	}
+	// 撤销后延长有效期仍要 409
+	resp, _ = e.doJSON(t, http.MethodPost, "/api/v1/admin/shares/"+shareID+"/recover", testToken,
+		map[string]any{"expiresAt": time.Now().Unix() + 7200})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("撤销后恢复应当 409，得到 %d", resp.StatusCode)
+	}
+	// 不存在的分享 → 404 而不是静默成功
+	resp, _ = e.doJSON(t, http.MethodDelete, "/api/v1/admin/shares/no-such-share", testToken, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("撤销不存在的分享应当 404，得到 %d", resp.StatusCode)
+	}
+}
+
 // 不存在的分享必须明确告知「救不回来」，而不是含糊的 500 或静默成功。
 func TestAdminRecoverMissingShareIsExplicit(t *testing.T) {
 	e := newTestEnv(t, 1<<20)

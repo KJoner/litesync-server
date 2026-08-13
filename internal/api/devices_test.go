@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 func (e *testEnv) doJSON(t *testing.T, method, path, token string, body any) (*http.Response, map[string]any) {
@@ -136,5 +138,84 @@ func TestDeviceAuthRejectsGarbage(t *testing.T) {
 	e := newTestEnv(t, 1<<20)
 	if r, _ := e.doJSON(t, http.MethodGet, "/api/v1/info", "not-a-real-token", nil); r.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("garbage token = %d, want 401", r.StatusCode)
+	}
+}
+
+// --- 运维页 Devices 列表增强（v0.17）：平台 / 最近 IP ---
+
+// adminDevice 从管理列表里取指定设备的行。
+func (e *testEnv) adminDevice(t *testing.T, deviceID string) map[string]any {
+	t.Helper()
+	resp, body := e.doJSON(t, http.MethodGet, "/api/v1/admin/devices", testToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("列设备 = %d", resp.StatusCode)
+	}
+	devices, _ := body["devices"].([]any)
+	for _, d := range devices {
+		if m, _ := d.(map[string]any); m["id"] == deviceID {
+			return m
+		}
+	}
+	t.Fatalf("设备 %s 不在管理列表里", deviceID)
+	return nil
+}
+
+// deviceGet 用设备 Token 发一个 GET 请求，附加任意 Header（平台 / XFF 上报测试用）。
+func (e *testEnv) deviceGet(t *testing.T, devToken, path string, headers map[string]string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+path, nil)
+	req.Header.Set("Authorization", "Bearer "+devToken)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if resp, _ := e.do(t, req); resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d", path, resp.StatusCode)
+	}
+}
+
+// 设备认证一次之后，平台与最近来源 IP 必须能在管理列表里查到——
+// 丢设备那天，「哪台是那部手机、它最后从哪连上来」靠只有设备名的列表答不了。
+func TestAdminDevicesReportPlatformAndLastIP(t *testing.T) {
+	e := newTestEnv(t, 1<<20)
+	devToken, deviceID := e.enrollDevice(t, "口袋里的手机")
+
+	// 白名单外的自报值不落库：Header 是客户端可控的任意字符串，异常值一律归 unknown
+	e.deviceGet(t, devToken, "/api/v1/info", map[string]string{"X-Client-Platform": "<script>alert(1)</script>"})
+	if m := e.adminDevice(t, deviceID); m["platform"] != "unknown" {
+		t.Fatalf("白名单外的平台值应当归 unknown，得到 %v", m["platform"])
+	}
+
+	// 正常值：平台变化立即可见（不等 5 分钟节流），最近 IP 一并记录
+	e.deviceGet(t, devToken, "/api/v1/info", map[string]string{"X-Client-Platform": "android"})
+	m := e.adminDevice(t, deviceID)
+	if m["platform"] != "android" {
+		t.Fatalf("platform = %v, want android", m["platform"])
+	}
+	if m["lastIp"] != "127.0.0.1" {
+		t.Fatalf("lastIp = %v, want 127.0.0.1（httptest 直连地址）", m["lastIp"])
+	}
+}
+
+// last_ip 的方向绝不能反：直连方不是可信代理时 X-Forwarded-For 一律忽略——
+// 否则任何拿到设备 Token 的客户端都能往 last_ip 里写任意地址。
+func TestDeviceLastIPIgnoresForgedXFF(t *testing.T) {
+	e := newTestEnv(t, 1<<20) // 未配置任何可信代理
+	devToken, deviceID := e.enrollDevice(t, "直连设备")
+
+	e.deviceGet(t, devToken, "/api/v1/info", map[string]string{"X-Forwarded-For": "203.0.113.66"})
+	if m := e.adminDevice(t, deviceID); m["lastIp"] != "127.0.0.1" {
+		t.Fatalf("不可信直连伪造的 XFF 不能写入 last_ip，得到 %v", m["lastIp"])
+	}
+}
+
+// 直连方是配置过的可信代理时才解析 XFF：取最右侧不属于可信代理的条目
+//（左边的部分是客户端自报的，可以随便伪造）。
+func TestDeviceLastIPHonorsXFFBehindTrustedProxy(t *testing.T) {
+	e := newTestEnvProxied(t, 1<<20, syncsvc.Options{}, []string{"127.0.0.1"})
+	devToken, deviceID := e.enrollDevice(t, "代理后的设备")
+
+	e.deviceGet(t, devToken, "/api/v1/info", map[string]string{"X-Forwarded-For": "198.51.100.7, 127.0.0.1"})
+	if m := e.adminDevice(t, deviceID); m["lastIp"] != "198.51.100.7" {
+		t.Fatalf("可信代理转发的真实来源应当被记录，得到 %v", m["lastIp"])
 	}
 }

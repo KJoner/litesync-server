@@ -124,6 +124,12 @@ func migrateColumns(d *sql.DB) error {
 		// 而它是不可逆迁移的前置条件。
 		{"devices", "client_version", `ALTER TABLE devices ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`, false},
 		{"devices", "client_protocol", `ALTER TABLE devices ADD COLUMN client_protocol INTEGER NOT NULL DEFAULT 0`, false},
+
+		// --- v0.17 运维页增强：设备平台与最近来源 IP ---
+		// 丢设备的那天，「哪台是那部手机、它最后从哪个网络连上来」必须一眼可答；
+		// 只有设备名的列表回答不了这两个问题。
+		{"devices", "platform", `ALTER TABLE devices ADD COLUMN platform TEXT NOT NULL DEFAULT ''`, false},
+		{"devices", "last_ip", `ALTER TABLE devices ADD COLUMN last_ip TEXT NOT NULL DEFAULT ''`, false},
 	}
 
 	for _, m := range migrations {

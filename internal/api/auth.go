@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -118,7 +119,25 @@ func routeScope(method, path string) (scope string, rootOnly bool) {
 	}
 }
 
-func authGate(token string, web *sessionStore, svc *syncsvc.Service, next http.Handler) http.Handler {
+// clientPlatforms 是 X-Client-Platform 允许落库的值（白名单）。
+// Header 是客户端自报的任意字符串，直接落库等于把一个注入面写进 devices 表；
+// 白名单外的值一律归 unknown，空值视为「未上报」（旧客户端），保留已记录的平台。
+var clientPlatforms = map[string]bool{
+	"windows": true, "macos": true, "linux": true,
+	"ios": true, "android": true, "web": true, "unknown": true,
+}
+
+func normalizeClientPlatform(v string) string {
+	if v == "" {
+		return ""
+	}
+	if !clientPlatforms[v] {
+		return "unknown"
+	}
+	return v
+}
+
+func authGate(token string, web *sessionStore, svc *syncsvc.Service, trusted []netip.Prefix, next http.Handler) http.Handler {
 	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
@@ -170,7 +189,9 @@ func authGate(token string, web *sessionStore, svc *syncsvc.Service, next http.H
 			// 设备 Token：按 scope 校验（撤销后立即失效）
 			clientVer := r.Header.Get("X-Client-Version")
 			clientProto, _ := strconv.ParseInt(r.Header.Get("X-LiteSync-Protocol"), 10, 64) //nolint:errcheck
-			if d, err := svc.AuthDeviceWithClient(bearer, clientVer, clientProto); err == nil && d != nil {
+			platform := normalizeClientPlatform(r.Header.Get("X-Client-Platform"))
+			if d, err := svc.AuthDeviceWithClient(bearer, clientVer, clientProto,
+				platform, clientIP(r, trusted)); err == nil && d != nil {
 				if ok := enforceRouteScope(w, r, d.Scopes); !ok {
 					return
 				}

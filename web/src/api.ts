@@ -234,6 +234,12 @@ export class Api {
 		}).then(() => undefined);
 	}
 
+	adminRevokeShare(id: string): Promise<void> {
+		return this.adminPath(`/api/v1/admin/shares/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+		}).then(() => undefined);
+	}
+
 	adminRestorePlan(snapshot: string): Promise<RestorePlan> {
 		return this.adminPath(
 			`/api/v1/admin/backup/restore-plan?snapshot=${encodeURIComponent(snapshot)}`,
@@ -296,6 +302,12 @@ export interface AdminDevice {
 	lastSeenAt: number;
 	revoked: boolean;
 	hasSigningKey: boolean;
+	/** 最后一次上报的插件版本（§15 第 3 步）；未上报过为空串 */
+	clientVersion: string;
+	/** 最后一次上报的平台 token（windows/macos/linux/ios/android/…）；未上报过为空串 */
+	platform: string;
+	/** 最近来源 IP（可信代理后取 XFF 真实端）；未记录过为空串 */
+	lastIp: string;
 }
 
 export interface AdminMigrationStatus {

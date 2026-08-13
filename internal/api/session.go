@@ -105,6 +105,16 @@ func parseTrustedProxies(entries []string) []netip.Prefix {
 	return out
 }
 
+// fromTrusted：地址是否属于配置的可信反向代理（secureRequest / clientIP 共用）。
+func fromTrusted(trusted []netip.Prefix, addr netip.Addr) bool {
+	for _, p := range trusted {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 // secureRequest：请求是否来自 HTTPS。
 // v9：X-Forwarded-Proto 只信任配置的反向代理来源（默认 loopback），
 // 不再无条件相信任意客户端伪造的转发头。
@@ -123,13 +133,46 @@ func (h *handlers) secureRequest(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
+	return fromTrusted(h.trusted, addr.Unmap())
+}
+
+// clientIP 返回请求方 IP（devices.last_ip 用，与 secureRequest 同族的转发头处理）。
+//
+// 方向绝不能反：只有当**直连方本身**是可信反向代理时才解析 X-Forwarded-For
+//（取最右侧不属于可信代理的条目——左边的部分是客户端自报的，可以随便伪造）；
+// 直连方不可信时 XFF 一律忽略，否则任何客户端都能往 last_ip 里写任意地址。
+func clientIP(r *http.Request, trusted []netip.Prefix) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
 	addr = addr.Unmap()
-	for _, p := range h.trusted {
-		if p.Contains(addr) {
-			return true
+	if !fromTrusted(trusted, addr) {
+		return addr.String()
+	}
+	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		e := strings.TrimSpace(parts[i])
+		if e == "" {
+			continue
+		}
+		// 条目可能带端口（某些代理会写 ip:port）；统一去掉
+		if h, _, err := net.SplitHostPort(e); err == nil {
+			e = h
+		}
+		a, err := netip.ParseAddr(e)
+		if err != nil {
+			break // 解析不了的链条不猜，退回直连地址
+		}
+		if a = a.Unmap(); !fromTrusted(trusted, a) {
+			return a.String()
 		}
 	}
-	return false
+	return addr.String()
 }
 
 func (h *handlers) setSessionCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
