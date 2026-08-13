@@ -4,8 +4,14 @@ data/
 etc-litesync/
 
 # 构建产物
-obsync
-obsync.exe
+#
+# 必须带前导斜杠。不带的话，`obsync` 会匹配**任意层级**的同名文件或目录——
+# 包括源码目录 cmd/obsync/。这条规则曾经让 cmd/obsync/ops.go（整个运维 CLI：
+# backup / integrity / migration / blobid / preflight）从未被提交过，
+# 而本地编译一直正常，因为文件就在磁盘上。
+# 直到 CI 在一个干净 checkout 上跑 go vet 才暴露：undefined: runOps。
+/obsync
+/obsync.exe
 
 # Web 前端依赖（构建产物 internal/web/dist 有意提交，部署无需 Node）
 web/node_modules/
