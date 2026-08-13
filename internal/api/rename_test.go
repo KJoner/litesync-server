@@ -189,3 +189,36 @@ func renameRequest(t *testing.T, e *testEnv, from, to string, baseMetaGeneration
 	req.Header.Set("X-Operation-Id", opID)
 	return req
 }
+
+// restore 响应必须返回恢复后的 metaGeneration（0.17.0-rc.3 回归）：
+// 客户端要拿它做后续改名的 CAS 基线——不返回的话，恢复后的第一次改名
+// 会拿删除前的旧世代（甚至 0）去 CAS，必然 412。
+func TestRestoreReturnsMetaGeneration(t *testing.T) {
+	e := newTestEnv(t, 1<<20)
+	e.upload(t, "r.md", 0, []byte("v1"))
+	// 先改一次名把 metaGeneration 推到 1：暴露「硬编码 0/1」的错误实现
+	if r, _ := e.rename(t, "r.md", "r2.md", 0); r.StatusCode != http.StatusOK {
+		t.Fatal("rename failed")
+	}
+	_, delBody := e.delete(t, "r2.md", 1)
+	deletedID := delBody["fileId"].(string)
+	tombRev := delBody["revision"].(float64)
+
+	r, body := e.restore(t, deletedID, map[string]any{
+		"expectedTombstoneRevision": tombRev, "contentGeneration": 1, "pseudonym": "r2.md",
+	})
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("restore = %d %v", r.StatusCode, body)
+	}
+	metaGen, ok := body["metaGeneration"].(float64)
+	if !ok || metaGen < 2 {
+		t.Fatalf("restore response metaGeneration = %v, want >= 2 (tombstone value + 1)", body["metaGeneration"])
+	}
+	// 以返回值为 CAS 基线的改名必须成功；旧世代必须 412
+	if resp, b := e.rename(t, "r2.md", "r3.md", int64(metaGen)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("rename with restored metaGeneration = %d %v, want 200", resp.StatusCode, b)
+	}
+	if resp, _ := e.rename(t, "r3.md", "r4.md", 0); resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("rename with stale metaGeneration = %d, want 412", resp.StatusCode)
+	}
+}

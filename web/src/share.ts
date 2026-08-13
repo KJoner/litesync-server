@@ -1,7 +1,7 @@
 /** 公开分享查看页：/share.html#<id>.<keyB64url>
  *  Share Key 在 URL fragment 中，浏览器不会把 fragment 发给服务器。 */
-import { b64urlDecode, decryptShare, subtleAvailable, unframeShareContent } from "./crypto";
-import { md } from "./markdown";
+import { b64urlDecode, decryptShare, subtleAvailable, unbundleShare } from "./crypto";
+import { renderSharedNote } from "./share-render";
 
 const app = document.getElementById("app")!;
 
@@ -43,8 +43,8 @@ async function boot(): Promise<void> {
 			return;
 		}
 		// §7.4：显示名从密文帧里取——它和内容一样受 GCM 保护，
-		// 服务器既不知道也改不了
-		const framed = unframeShareContent(plain);
+		// 服务器既不知道也改不了。T2.4：内嵌图片附件同帧携带，本地内联渲染
+		const framed = unbundleShare(plain);
 		const text = new TextDecoder().decode(framed.content);
 		if (framed.name !== null) document.title = `${framed.name} — LiteSync`;
 		app.innerHTML = "";
@@ -56,7 +56,7 @@ async function boot(): Promise<void> {
 		head.innerHTML = `<span class="brand-small">◈ LiteSync</span>${title}<span class="muted small">端到端加密分享 · 本地解密</span>`;
 		const body = document.createElement("div");
 		body.className = "markdown-body note-wrap";
-		body.innerHTML = md.render(text.replace(/(!?)\[\[([^\][\n]+?)\]\]/g, (_w, _b, inner: string) => esc(inner.split("|").pop() ?? "")));
+		renderSharedNote(body, text, framed.attachments);
 		wrap.append(head, body);
 		app.append(wrap);
 	} catch (e) {

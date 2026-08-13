@@ -258,11 +258,12 @@ func (h *handlers) restoreFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"fileId":   res.FileID,
-		"path":     res.Pseudonym,
-		"revision": res.Revision,
-		"sequence": res.Sequence,
-		"restored": true,
+		"fileId":         res.FileID,
+		"path":           res.Pseudonym,
+		"revision":       res.Revision,
+		"metaGeneration": res.MetaGeneration,
+		"sequence":       res.Sequence,
+		"restored":       true,
 	})
 }
 

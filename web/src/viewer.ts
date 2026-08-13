@@ -8,8 +8,8 @@
  *
  * 用法：本地打开 litesync-viewer.html → 粘贴分享链接 → 本地解密渲染。
  */
-import { b64urlDecode, decryptShare, subtleAvailable } from "./crypto";
-import { md } from "./markdown";
+import { b64urlDecode, decryptShare, subtleAvailable, unbundleShare } from "./crypto";
+import { renderSharedNote } from "./share-render";
 
 const $ = (id: string): HTMLElement => document.getElementById(id)!;
 
@@ -61,11 +61,14 @@ async function view(): Promise<void> {
 			status(`<span class="err">解密失败：链接可能不完整或数据被篡改</span>`);
 			return;
 		}
-		const text = new TextDecoder().decode(plain);
-		$("status").innerHTML = `<span class="ok">✓ 已本地解密（服务器只见过密文）</span>`;
-		$("note").innerHTML = md.render(
-			text.replace(/(!?)\[\[([^\][\n]+?)\]\]/g, (_w, _b, inner: string) => esc(inner.split("|").pop() ?? "")),
-		);
+		// 解帧（此前漏了这一步：0.13.3+ 的 LSN1/LSN2 分享会把帧头渲染成正文垃圾）；
+		// T2.4：LSN2 帧携带的内嵌图片附件在本地内联渲染
+		const framed = unbundleShare(plain);
+		const text = new TextDecoder().decode(framed.content);
+		$("status").innerHTML =
+			`<span class="ok">✓ 已本地解密（服务器只见过密文）</span>` +
+			(framed.name !== null ? ` <span class="muted">${esc(framed.name)}</span>` : "");
+		renderSharedNote($("note"), text, framed.attachments);
 	} catch (e) {
 		status(
 			`<span class="err">加载失败：${esc(e instanceof Error ? e.message : String(e))}</span>` +

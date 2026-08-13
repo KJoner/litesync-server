@@ -41,7 +41,10 @@ type RestoreResult struct {
 	Pseudonym string
 	// Revision：恢复后的 revision（= tombstone revision + 1，连续不重置）
 	Revision int64
-	Sequence int64
+	// MetaGeneration：恢复后的元数据世代（= tombstone 的值 + 1）。
+	// 客户端必须记账，否则恢复后的第一次改名会拿旧世代做 CAS 而 412
+	MetaGeneration int64
+	Sequence       int64
 }
 
 // Restore 把一个已删除对象恢复为 live（内容随后由普通上传写入）。
@@ -80,7 +83,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 			return nil, err
 		} else if prev != nil {
 			return &RestoreResult{FileID: p.FileID, Pseudonym: prev.Pseudonym,
-				Revision: prev.Revision, Sequence: prev.Sequence}, nil
+				Revision: prev.Revision, MetaGeneration: prev.MetaGeneration, Sequence: prev.Sequence}, nil
 		}
 	}
 
@@ -94,7 +97,8 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		if h, err := db.GetHead(s.db, p.FileID); err != nil {
 			return nil, err
 		} else if h != nil {
-			return &RestoreResult{FileID: h.FileID, Pseudonym: h.Pseudonym, Revision: h.Revision}, nil
+			return &RestoreResult{FileID: h.FileID, Pseudonym: h.Pseudonym,
+				Revision: h.Revision, MetaGeneration: h.MetaGeneration}, nil
 		}
 		state, err := db.ObjectState(s.db, p.FileID)
 		if err != nil {
@@ -206,7 +210,8 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 	}
 
 	s.log.Info("restore", "fileId", truncateID(p.FileID), "revision", newRevision, "device", p.DeviceID)
-	return &RestoreResult{FileID: p.FileID, Pseudonym: p.Pseudonym, Revision: newRevision, Sequence: seq}, nil
+	return &RestoreResult{FileID: p.FileID, Pseudonym: p.Pseudonym,
+		Revision: newRevision, MetaGeneration: head.MetaGeneration, Sequence: seq}, nil
 }
 
 // PurgeTombstones 清理过期删除记录（ADR-002 §3.4 的双条件）。

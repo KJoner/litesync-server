@@ -3,6 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 页面级 CSP（计划书 §7.5）：分享内容里的外链图片/资源一律不加载——
+     离线查看器的隐私承诺是「除拉取密文外零外部请求」，笔记里一个
+     ![](https://tracker/x.png) 不应该能把查看者 IP 与阅读时间报给第三方。
+     connect-src 放行 https/http 是取密文所必需；图片只允许本地 blob/data。 -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src blob: data:; connect-src https: http:; base-uri 'none'; form-action 'none'">
 <title>LiteSync 离线分享查看器</title>
 <style>
 :root { color-scheme: dark; }

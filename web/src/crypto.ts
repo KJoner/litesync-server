@@ -248,6 +248,63 @@ export function unframeShareContent(plain: ArrayBuffer): { name: string | null; 
 	return { name, content: plain.slice(6 + nameLen) };
 }
 
+/**
+ * 多条目分享帧（0.17.0-rc.3，验收 T2.4）：
+ *
+ *   "LSN2" | nameLen(2,BE) | name | count(2,BE) |
+ *     count × ( pathLen(2,BE) | path | dataLen(4,BE) | data ) | content
+ *
+ * 主文档仍在帧尾（与 LSN1 同构）；内嵌图片作为 (vault 相对路径, 字节) 列表
+ * 随行加密。与插件 src/crypto/crypto.ts 的 frameShareBundle 字节级对应。
+ */
+const SHARE_BUNDLE_MAGIC = [0x4c, 0x53, 0x4e, 0x32];
+
+export interface ShareAttachment {
+	path: string;
+	data: ArrayBuffer;
+}
+
+/** 拆解分享帧（LSN2 / LSN1 / 裸内容三代兼容）；解析失败退化为「整段是内容」。 */
+export function unbundleShare(plain: ArrayBuffer): {
+	name: string | null;
+	content: ArrayBuffer;
+	attachments: ShareAttachment[];
+} {
+	const view = new Uint8Array(plain);
+	if (plain.byteLength < 8 || !SHARE_BUNDLE_MAGIC.every((b, i) => view[i] === b)) {
+		const framed = unframeShareContent(plain);
+		return { name: framed.name, content: framed.content, attachments: [] };
+	}
+	try {
+		const dv = new DataView(plain);
+		const dec = new TextDecoder();
+		let off = 4;
+		const nameLen = dv.getUint16(off, false);
+		off += 2;
+		if (off + nameLen > plain.byteLength) throw new Error("truncated");
+		const name = dec.decode(plain.slice(off, off + nameLen));
+		off += nameLen;
+		const count = dv.getUint16(off, false);
+		off += 2;
+		const attachments: ShareAttachment[] = [];
+		for (let i = 0; i < count; i++) {
+			const pathLen = dv.getUint16(off, false);
+			off += 2;
+			if (off + pathLen > plain.byteLength) throw new Error("truncated");
+			const path = dec.decode(plain.slice(off, off + pathLen));
+			off += pathLen;
+			const dataLen = dv.getUint32(off, false);
+			off += 4;
+			if (off + dataLen > plain.byteLength) throw new Error("truncated");
+			attachments.push({ path, data: plain.slice(off, off + dataLen) });
+			off += dataLen;
+		}
+		return { name, content: plain.slice(off), attachments };
+	} catch {
+		return { name: null, content: plain, attachments: [] };
+	}
+}
+
 /** 解密 LSS1 分享（独立 Share Key）；失败返回 null。 */
 export async function decryptShare(keyRaw: Uint8Array, payload: ArrayBuffer): Promise<ArrayBuffer | null> {
 	if (!isEncryptedShare(payload)) return null;
