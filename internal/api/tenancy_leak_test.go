@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/KJoner/litesync-server/internal/api"
 )
 
 // HTTP 层的跨租户泄露（v0.16.0 / 计划书 §10.6、ADR-010 §9）。
@@ -69,16 +71,31 @@ func TestDedupDoesNotShortCircuitTheUpload(t *testing.T) {
 			"服务器短路了，「秒传」与「真传」可区分，存在性泄露", second, first)
 	}
 
-	// 对照：证明这套计数**能**发现短路。
-	// 拿一个根本不读 body 的接口试一次，读走的字节数必须明显少于全量——
-	// 没有这条，上面的断言可能只是「两次都读完了，因为客户端总会写完」。
-	cr := &countingReader{r: bytes.NewReader(content)}
-	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/api/v1/info", cr)
-	req.ContentLength = int64(len(content))
+	// 上面的字节计数只是辅助信号：它依赖 socket 缓冲区大小。
+	// 缓冲区足够大时，客户端会在服务器读之前就把整个 body 写完，
+	// 于是"服务器短路了"和"服务器读完了"在计数上无法区分——
+	// 这条断言在 Windows 上有效，在 Linux 上因为缓冲区更大而恒真。
+	//
+	// 真正不依赖环境的判据在下面：**服务器有没有真的重新哈希过这份内容**。
+	// 如果它一看"这个哈希我有"就直接返回，那么声称一个已存在的哈希、
+	// 却发送完全不同的字节，它是发现不了的。
+	//
+	// 这同时是一条完整性红线：接受与声明哈希不符的内容，
+	// 等于允许任何人往别人的对象上塞任意数据。
+	forged := bytes.Repeat([]byte("not-the-real-content-"), 64)
+	req, _ := http.NewRequest(http.MethodPut, e.ts.URL+"/api/v1/file", bytes.NewReader(forged))
 	req.Header.Set("Authorization", "Bearer "+testToken)
-	e.do(t, req)
-	if cr.n >= int64(len(content)) {
-		t.Fatal("不读 body 的接口也把 body 读完了 —— 这套计数发现不了短路，上面的断言没有意义")
+	req.Header.Set("X-File-Path", url.PathEscape("forged.md"))
+	req.Header.Set("X-Base-Revision", "0")
+	// 声称的是**已经存在于服务器上**的那份内容的哈希
+	req.Header.Set("X-Content-Hash", sha256Hex(content))
+	resp, body := e.do(t, req)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("服务器接受了一份哈希与内容不符的上传 —— " +
+			"说明它命中去重就短路了，既是存在性预言机，也是一条完整性漏洞")
+	}
+	if code, _ := body["code"].(string); code != api.CodeHashMismatch {
+		t.Fatalf("应当以 %s 拒绝，得到 %d / %v", api.CodeHashMismatch, resp.StatusCode, body)
 	}
 }
 
