@@ -117,14 +117,17 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 			return nil, &ConflictError{Path: p.ToPseudonym, Revision: occupied.Revision,
 				Hash: occupied.ContentHash, FileID: occupied.FileID}
 		}
-		// 防复活：目标名上有 tombstone → 必须走显式 restore
-		if tomb, err := s.findTombstone(p.ToPseudonym, canonicalKey); err != nil {
-			return nil, err
-		} else if tomb != nil {
-			return nil, &ConflictError{Path: p.ToPseudonym, Revision: tomb.DeletionRevision,
-				Deleted: true, PriorHash: tomb.PriorContentHash, FileID: tomb.FileID,
-				ContentGeneration: tomb.ContentGeneration}
-		}
+		// 目标名上只有 tombstone？允许改名（0.17 实测反馈修正）。
+		//
+		// 「防复活」（ADR-002 / INV-06）保护的是**内容**：base-0 上传不得把
+		// 已删除对象的旧内容悄悄带回仓库。把另一个 live 对象改名到这个名字
+		// 不是复活——没有任何已删内容回来，删除事实（tombstone，按 fileId
+		// 记账）原样保留：死对象的显式 restore 会因名字被占而明确 409，
+		// 此名上的后续 base-0 上传撞的是 live 对象的冲突，同样不静默。
+		//
+		// 以前这里 409「必须走 restore」，客户端只能退化为 delete+upsert；
+		// upsert 又撞墓碑走 restore，把改名的内容**嫁接到死对象的身份上**——
+		// 用户看到的是「改名后历史没被继承」（继承的是别人的坟墓）。
 	}
 	// 目标名与别的 live 对象归一化后同名 → 422（排除自己，允许纯大小写改名）
 	if other, err := db.FindCanonicalCollision(s.db, canonicalKey, cur.FileID); err != nil {

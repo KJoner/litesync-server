@@ -139,11 +139,69 @@ func TestRenameRejections(t *testing.T) {
 		t.Fatalf("case-only rename = %d, want 200", r.StatusCode)
 	}
 
-	// 目标名上有 tombstone → 必须走显式 restore，不允许改名覆盖（INV-06）
+	// 目标名上只有 tombstone → 允许改名（0.17 实测修正）：这不是复活——
+	// 没有任何已删内容回到仓库，删除事实按 fileId 保留。详见下面的专项测试
 	e.upload(t, "gone.md", 0, []byte("gone"))
 	e.delete(t, "gone.md", 1)
-	if r, b := e.rename(t, "b.md", "gone.md", 0); r.StatusCode != http.StatusConflict || b["deleted"] != true {
-		t.Fatalf("rename onto tombstone = %d %v, want 409 deleted", r.StatusCode, b)
+	if r, b := e.rename(t, "b.md", "gone.md", 0); r.StatusCode != http.StatusOK {
+		t.Fatalf("rename onto tombstoned name = %d %v, want 200", r.StatusCode, b)
+	}
+}
+
+// 改名到「曾存在、后删除」的名字：身份与历史必须完整延续（实测反馈：
+// 以前这里 409 逼客户端退化成 delete+upsert，新文件嫁接到死对象的身份上，
+// 用户看到「改名后历史没被继承」）。同时删除屏障的三条性质原样保留。
+func TestRenameOntoTombstonedNameKeepsIdentity(t *testing.T) {
+	e := newTestEnv(t, 1<<20)
+	e.upload(t, "a.md", 0, []byte("v1"))
+	e.upload(t, "a.md", 1, []byte("v2"))
+	before := e.snapshotFiles(t)
+	liveID := before["a.md"]["fileId"].(string)
+
+	// 目标名曾存在、已删除
+	e.upload(t, "dead.md", 0, []byte("dead content"))
+	_, delBody := e.delete(t, "dead.md", 1)
+	deadID := delBody["fileId"].(string)
+
+	// 改名 → 200，身份不变
+	r, body := e.rename(t, "a.md", "dead.md", 0)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("rename onto tombstoned name = %d %v, want 200", r.StatusCode, body)
+	}
+	if body["fileId"] != liveID {
+		t.Fatalf("identity must survive: got %v want %v", body["fileId"], liveID)
+	}
+	// 继续编辑：revision 连续
+	e.upload(t, "dead.md", 2, []byte("v3"))
+
+	// 历史一整条（v1/v2/v3），属于原对象而不是死对象
+	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/api/v1/history?path=dead.md", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, hbody := e.do(t, req)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history = %d", resp.StatusCode)
+	}
+	versions := hbody["versions"].([]any)
+	if len(versions) != 3 {
+		t.Fatalf("history across rename-onto-tombstone = %d versions, want 3", len(versions))
+	}
+	for _, v := range versions {
+		if v.(map[string]any)["fileId"] != liveID {
+			t.Fatalf("history must belong to the renamed object, got %v", v.(map[string]any)["fileId"])
+		}
+	}
+
+	// 删除屏障原样保留：死对象的显式 restore 因名字被占而明确失败（不静默）——
+	// 409（占用）或 422（canonical 碰撞）都算，关键是绝不能 200
+	if r, _ := e.restore(t, deadID, map[string]any{
+		"expectedTombstoneRevision": 2, "contentGeneration": 1, "pseudonym": "dead.md",
+	}); r.StatusCode != http.StatusConflict && r.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("restore of dead object onto occupied name = %d, want 409/422", r.StatusCode)
+	}
+	// 此名上的 base-0 上传撞的是 live 对象的冲突（deleted=false），同样不静默
+	if r, b := e.upload(t, "dead.md", 0, []byte("stale copy")); r.StatusCode != http.StatusConflict ||
+		b["deleted"] == true {
+		t.Fatalf("base-0 upload onto renamed name = %d %v, want live conflict", r.StatusCode, b)
 	}
 }
 

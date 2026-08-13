@@ -314,8 +314,11 @@ func GetTombstone(q dbtx, fileID string) (*Tombstone, error) {
 
 // GetTombstoneByPseudonym 按最后可见寻址名查 tombstone（旧设备按旧名字上传时用）。
 func GetTombstoneByPseudonym(q dbtx, pseudonym string) (*Tombstone, error) {
+	// 同一个名字可能对应多条删除记录（删除后经改名重用、再删除）：
+	// 取删除 revision 最大的一条——base-0 冲突要锚定的是最近一次删除
 	return scanTombstone(q.QueryRow(
-		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND last_pseudonym = ? LIMIT 1`,
+		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND last_pseudonym = ?
+		 ORDER BY deletion_revision DESC LIMIT 1`,
 		DefaultVaultID, pseudonym))
 }
 
@@ -325,7 +328,8 @@ func GetTombstoneByCanonical(q dbtx, canonicalKey string) (*Tombstone, error) {
 		return nil, nil
 	}
 	return scanTombstone(q.QueryRow(
-		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND canonical_path_hmac = ? LIMIT 1`,
+		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND canonical_path_hmac = ?
+		 ORDER BY deletion_revision DESC LIMIT 1`,
 		DefaultVaultID, canonicalKey))
 }
 
