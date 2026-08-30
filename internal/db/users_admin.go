@@ -28,11 +28,16 @@ type UserAccount struct {
 
 // ListUserAccounts 返回全部用户及概要（管理列表）。
 func ListUserAccounts(d *sql.DB) ([]UserAccount, error) {
+	// VaultID 用子查询取默认仓库（created_at 最早的 owner vault）——
+	// 曾用 LEFT JOIN memberships，多仓库用户（v0.19）会每仓库出一行，
+	// 管理列表里同一个人重复 N 次（0.19.0-rc.1 线上实测）
 	rows, err := d.Query(`
 		SELECT u.user_id, u.name, u.is_admin, u.disabled, u.created_at, COALESCE(u.last_seen_at, 0),
-		       COALESCE(m.vault_id, '')
+		       COALESCE((SELECT m.vault_id FROM memberships m
+		                   JOIN vaults v ON v.vault_id = m.vault_id
+		                  WHERE m.user_id = u.user_id AND m.role = 'owner'
+		                  ORDER BY v.created_at ASC LIMIT 1), '')
 		  FROM users u
-		  LEFT JOIN memberships m ON m.user_id = u.user_id AND m.role = 'owner'
 		 ORDER BY u.created_at ASC`)
 	if err != nil {
 		return nil, err

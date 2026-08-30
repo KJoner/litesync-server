@@ -122,6 +122,23 @@ func TestMultiVaultLifecycleAndIsolation(t *testing.T) {
 		t.Fatal("device upload should land in its bound (default) vault")
 	}
 
+	// 管理列表不因多仓库重复（0.19.0-rc.1 线上实测：admin 有 2 个仓库时
+	// 在 Users 页出现 2 行——LEFT JOIN memberships 每仓库一行）
+	adminReq, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/api/v1/admin/users", nil)
+	adminReq.Header.Set("Authorization", "Bearer "+testToken)
+	_, adminList := e.do(t, adminReq)
+	seen := map[string]int{}
+	for _, raw := range adminList["users"].([]any) {
+		u := raw.(map[string]any)
+		name, _ := u["name"].(string)
+		seen[name]++
+	}
+	for name, n := range seen {
+		if n > 1 {
+			t.Fatalf("user %q appears %d times in admin list (multi-vault duplication)", name, n)
+		}
+	}
+
 	// 重命名（v0.19.x）：成功且列表反映；撞默认仓库名 → 409；外人 → 404
 	ren, _ := json.Marshal(map[string]any{"name": "项目笔记"})
 	if resp, _ := vaultReq(t, e, http.MethodPatch, "/api/v1/vaults/"+second, testToken, "", ren); resp.StatusCode != http.StatusOK {

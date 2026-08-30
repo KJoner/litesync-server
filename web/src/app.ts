@@ -1711,6 +1711,41 @@ function showAccount(): void {
 	who.append(el("p", "", `${S!.me?.name ?? "（未知）"} · ${role}`));
 	box.append(who);
 
+	// 我的仓库（v0.19.x）：此前删除/新建只有 curl，用户找不到管理入口
+	const vc = el("div", "settings-card");
+	vc.append(el("h2", "", "My vaults"));
+	vc.append(el("p", "muted small",
+		"名下的远端仓库，彼此完全隔离。新建的仓库是空的：在 Obsidian 插件里" +
+		"重新运行接入向导并选择它，即可把本地笔记初始化上去（必须设置 E2EE）。" +
+		"切换查看用右上角的仓库切换器。"));
+	const vList = el("div", "settings-list");
+	vc.append(vList);
+	const vErr = el("p", "error", "");
+	const createWrap = el("div", "settings-item");
+	const createInput = el("input") as HTMLInputElement;
+	createInput.placeholder = "新仓库名（1–64 字符）";
+	const createBtn = el("button", "primary", "新建仓库");
+	createBtn.onclick = () => {
+		const n = createInput.value.trim();
+		if (!n) {
+			vErr.textContent = "请输入新仓库的名字。";
+			return;
+		}
+		createBtn.disabled = true;
+		void S!.api.createVault(n)
+			.then(() => {
+				createInput.value = "";
+				vErr.textContent = "";
+				return renderVaultList(vList, vErr);
+			})
+			.catch((e) => { vErr.textContent = e instanceof Error ? e.message : String(e); })
+			.finally(() => { createBtn.disabled = false; });
+	};
+	createWrap.append(createInput, createBtn);
+	vc.append(createWrap, vErr);
+	box.append(vc);
+	void renderVaultList(vList, vErr);
+
 	const card = el("div", "settings-card");
 	card.append(el("h2", "", "Reset API Token"));
 	card.append(el("p", "muted small",
@@ -1752,6 +1787,62 @@ function showAccount(): void {
 	};
 	card.append(btn, errEl);
 	box.append(card);
+}
+
+/**
+ * 账户页「我的仓库」列表（v0.19.x）：重命名 / 删除（输入仓库名确认；
+ * 默认仓库名为空串，删除前必须先起名——否则「输入名字确认」形同虚设）。
+ * 删除当前正在查看的仓库后整页重进（boot 的 404 兜底会回落默认仓库）。
+ */
+async function renderVaultList(listEl: HTMLElement, errEl: HTMLElement): Promise<void> {
+	listEl.innerHTML = "";
+	listEl.append(el("p", "muted small", "加载中…"));
+	const vaults = await S!.api.listVaults();
+	S!.vaults = vaults; // 同步给 header 切换器（下次整页渲染时生效）
+	listEl.innerHTML = "";
+	for (const v of vaults) {
+		const row = el("div", "settings-item");
+		const left = el("div", "");
+		left.append(el("strong", "", v.name || "默认仓库"));
+		left.append(el("p", "muted small",
+			`${v.fileCount} 个文件 · ${fmtBytes(v.bytesUsed)}` + (v.current ? " · 当前查看" : "")));
+		row.append(left);
+		const btns = el("div", "");
+		const rn = el("button", "ghost", "重命名");
+		rn.onclick = () => {
+			const name = prompt("新名字（1–64 字符）；只改显示名，不影响同步与加密：", v.name);
+			if (name === null || !name.trim()) return;
+			void S!.api.renameVault(v.id, name.trim())
+				.then(() => renderVaultList(listEl, errEl))
+				.catch((e) => { errEl.textContent = e instanceof Error ? e.message : String(e); });
+		};
+		const del = el("button", "danger", "删除");
+		del.onclick = () => {
+			if (!v.name) {
+				errEl.textContent = "此仓库尚未命名：请先重命名，删除确认需要输入仓库名。";
+				return;
+			}
+			const confirmName = prompt(
+				`删除不可逆：仓库「${v.name}」的全部内容、历史、分享与设备凭据将被清除。\n` +
+				`输入仓库名确认删除：`);
+			if (confirmName === null) return;
+			void S!.api.deleteVault(v.id, confirmName)
+				.then(() => {
+					if (v.current) {
+						try { localStorage.removeItem(VAULT_KEY); } catch { /* ignore */ }
+						location.hash = "";
+						location.reload();
+						return;
+					}
+					errEl.textContent = "";
+					return renderVaultList(listEl, errEl);
+				})
+				.catch((e) => { errEl.textContent = e instanceof Error ? e.message : String(e); });
+		};
+		btns.append(rn, del);
+		row.append(btns);
+		listEl.append(row);
+	}
 }
 
 function renderNewToken(

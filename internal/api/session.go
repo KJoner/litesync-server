@@ -307,6 +307,17 @@ func webSessionAllowed(r *http.Request) bool {
 	if r.Method == http.MethodPut && r.URL.Path == "/api/v1/vault/reset-auth" {
 		return true
 	}
+	// v0.19.x：仓库自助管理（新建/重命名/删除）进 Web——会话是用户级身份，
+	// handler 侧 owner/membership 校验兜底，删除另有 confirmName 与最后一个
+	// 保护。攻击面权衡与 token-reset 同级（那个能踢掉全部设备）；设备凭据
+	// 依然被 routeScope 的 rootOnly 拦住（D4 最小权限不变）。
+	if r.URL.Path == "/api/v1/vaults" && r.Method == http.MethodPost {
+		return true
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/v1/vaults/") &&
+		(r.Method == http.MethodPatch || r.Method == http.MethodDelete) {
+		return true
+	}
 	if r.Method != http.MethodGet {
 		return false
 	}

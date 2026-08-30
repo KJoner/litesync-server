@@ -131,6 +131,44 @@ export class Api {
 		return res.json();
 	}
 
+	/** 新建仓库（v0.19.x 账户页）。同名/超上限 → 服务端 409，message 直接可展示。 */
+	async createVault(name: string): Promise<string> {
+		const res = await this.req("/api/v1/vaults", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name }),
+		});
+		const body = await res.json();
+		if (!res.ok) throw new Error(body.message ?? `HTTP ${res.status}`);
+		return body.id as string;
+	}
+
+	/** 重命名仓库（只动展示名）。 */
+	async renameVault(id: string, name: string): Promise<void> {
+		const res = await this.req(`/api/v1/vaults/${encodeURIComponent(id)}`, {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name }),
+		});
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			throw new Error(body.message ?? `HTTP ${res.status}`);
+		}
+	}
+
+	/** 删除仓库：confirmName 必须与仓库名一致；不能删最后一个。 */
+	async deleteVault(id: string, confirmName: string): Promise<void> {
+		const res = await this.req(`/api/v1/vaults/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ confirmName }),
+		});
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			throw new Error(body.message ?? `HTTP ${res.status}`);
+		}
+	}
+
 	/**
 	 * 重置自己的 API Token（v0.18 / v11 设计 §4.3）。
 	 * resetAuth 是解锁 E2EE 时派生的重置凭证；已登记而不提交（或不符）→ 403。
