@@ -62,8 +62,7 @@ const staleDeviceDays = 30
 // MigrationPreflight 执行迁移前置检查（只读）。
 //
 // requiredClient 为空时跳过版本比对（只报告未知版本的设备数）。
-func (s *Service) MigrationPreflight(requiredClient string) (*PreflightReport, error) {
-	scope := s.scope()
+func (s *Service) MigrationPreflight(scope db.VaultScope, requiredClient string) (*PreflightReport, error) {
 	rep := &PreflightReport{}
 
 	rs, err := db.GetRepoState(s.db, scope)
@@ -126,7 +125,7 @@ func (s *Service) MigrationPreflight(requiredClient string) (*PreflightReport, e
 	}
 
 	// --- §15 第 7 步：历史、tombstone、Blob 的遗留问题 ---
-	rep.PlaintextTombstones, err = db.PlaintextTombstoneCount(s.db)
+	rep.PlaintextTombstones, err = db.PlaintextTombstoneCount(s.db, scope)
 	if err != nil {
 		return nil, err
 	}

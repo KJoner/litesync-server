@@ -16,7 +16,7 @@ import (
 
 func TestPreflightPassesOnCleanRepo(t *testing.T) {
 	s := newTenantEnv(t)
-	rep, err := s.MigrationPreflight("")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,11 +30,11 @@ func TestPreflightPassesOnCleanRepo(t *testing.T) {
 // 让它通过等于把检查变成安慰剂：那台设备可能正是那台没升级的。
 func TestPreflightBlocksOnUnknownClientVersion(t *testing.T) {
 	s := newTenantEnv(t)
-	if _, err := s.CreateDevice("从未上报版本的设备"); err != nil {
+	if _, err := s.CreateDevice("从未上报版本的设备", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
-	rep, err := s.MigrationPreflight("")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestPreflightBlocksOnUnknownClientVersion(t *testing.T) {
 // 上报了版本但版本不对 → 阻塞，并且要指名道姓说是哪一台。
 func TestPreflightBlocksOnOutdatedClient(t *testing.T) {
 	s := newTenantEnv(t)
-	cred, err := s.CreateDevice("旧笔记本")
+	cred, err := s.CreateDevice("旧笔记本", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestPreflightBlocksOnOutdatedClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := s.MigrationPreflight("0.17.0")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "0.17.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,14 +92,14 @@ func TestPreflightBlocksOnOutdatedClient(t *testing.T) {
 // 版本相符 → 放行。没有这条对照，上面两条可能只是「永远阻塞」。
 func TestPreflightPassesWhenAllClientsCurrent(t *testing.T) {
 	s := newTenantEnv(t)
-	cred, err := s.CreateDevice("已升级的设备")
+	cred, err := s.CreateDevice("已升级的设备", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AuthDeviceWithClient(cred.Token, "0.17.0", 6, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	rep, err := s.MigrationPreflight("0.17.0")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "0.17.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,14 +111,14 @@ func TestPreflightPassesWhenAllClientsCurrent(t *testing.T) {
 // 已撤销的设备不参与判断：一台被撤销的旧设备不该永远挡着迁移。
 func TestPreflightIgnoresRevokedDevices(t *testing.T) {
 	s := newTenantEnv(t)
-	cred, err := s.CreateDevice("已撤销的旧设备")
+	cred, err := s.CreateDevice("已撤销的旧设备", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RevokeDevice(cred.DeviceID); err != nil {
 		t.Fatal(err)
 	}
-	rep, err := s.MigrationPreflight("0.17.0")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "0.17.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestPreflightIgnoresRevokedDevices(t *testing.T) {
 // 阻塞会让一台早就不用的旧手机永久卡住迁移。
 func TestPreflightWarnsButDoesNotBlockOnStaleDevices(t *testing.T) {
 	s := newTenantEnv(t)
-	cred, err := s.CreateDevice("半年没开机的设备")
+	cred, err := s.CreateDevice("半年没开机的设备", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestPreflightWarnsButDoesNotBlockOnStaleDevices(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := s.MigrationPreflight("0.17.0")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "0.17.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestPreflightBlocksWhenMigrationInProgress(t *testing.T) {
 		"mig-1", "dev-1", time.Now().Add(time.Hour).Unix(), 100, 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	rep, err := s.MigrationPreflight("")
+	rep, err := s.MigrationPreflight(db.LegacyDefaultScope(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

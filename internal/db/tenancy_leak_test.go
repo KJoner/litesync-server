@@ -28,7 +28,7 @@ func TestChangesAreScopedPerVault(t *testing.T) {
 		}
 	}
 
-	changes, err := db.ListChanges(d, 0, 100)
+	changes, err := db.ListChanges(d, db.LegacyDefaultScope(), 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

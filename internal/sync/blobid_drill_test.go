@@ -141,7 +141,7 @@ func TestBlobIDMigrationDrillKeepsEveryFileReadable(t *testing.T) {
 	}
 
 	// 历史版本也要能取回（迁移只改 HEAD 的话这里会失败）
-	if _, rc, err := s.OpenVersion("note.md", 1); err != nil {
+	if _, rc, err := s.OpenVersion(db.LegacyDefaultScope(), "note.md", 1); err != nil {
 		t.Fatalf("迁移后历史版本应当仍可取回: %v", err)
 	} else {
 		got, _ := io.ReadAll(rc)
@@ -182,7 +182,7 @@ func TestBlobIDMigrationDrillKeepsEveryFileReadable(t *testing.T) {
 	files["after-copy.md"] = fresh
 	assertAllReadable(t, s, files)
 
-	id, err := s.BlobIDOf(sha256HexT(fresh))
+	id, err := s.BlobIDOf(db.LegacyDefaultScope(), sha256HexT(fresh))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestBlobIDMigrationDrillKeepsEveryFileReadable(t *testing.T) {
 func assertAllReadable(t *testing.T, s *syncsvc.Service, files map[string][]byte) {
 	t.Helper()
 	for p, want := range files {
-		_, rc, err := s.OpenFile(p)
+		_, rc, err := s.OpenFile(db.LegacyDefaultScope(), p)
 		if err != nil {
 			t.Fatalf("%s 读不出来了: %v", p, err)
 		}

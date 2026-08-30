@@ -25,7 +25,7 @@ import (
 func plantOrphan(t *testing.T, s *syncsvc.Service, blobDir string, content []byte) (hash, path string) {
 	t.Helper()
 	hash = sha256HexT(content)
-	id, err := s.BlobIDOf(hash)
+	id, err := s.BlobIDOf(db.LegacyDefaultScope(), hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestGCCandidateClearedWhenReferencedAgain(t *testing.T) {
 	}
 
 	// 期间这份内容被真正上传（去重命中同一个 blob）
-	if _, err := s.Upload(syncsvc.UploadParams{
+	if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "note.md", BaseRevision: 0, ClaimedHash: hash,
 		DeviceID: "test-device", Action: "upsert",
 	}, bytes.NewReader(content)); err != nil {

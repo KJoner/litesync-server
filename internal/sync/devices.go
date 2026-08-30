@@ -38,6 +38,11 @@ var DefaultDeviceScopes = []string{ScopeSync, ScopeShare, ScopeKeyAdmin, ScopePa
 
 var ErrEnrollmentInvalid = errors.New("enrollment secret invalid, expired, or already used")
 
+// ErrDeviceRevoked：凭据曾经有效、已被撤销（单独撤销或 Token 重置的连带撤销）。
+// 与「查无此凭据」分开返回，客户端才能给出「请填入新 Token 重新接入」而不是
+// 含糊的「认证失败」（v11 设计 §4.2）。
+var ErrDeviceRevoked = errors.New("device credential has been revoked")
+
 const enrollmentDefaultTTL = 900 * time.Second
 
 func randomHex(n int) (string, error) {
@@ -66,14 +71,16 @@ func HasScope(scopes, want string) bool {
 	return false
 }
 
-// CreateDevice 直接创建设备凭据（根 Token 专用：首台设备自注册）。
-func (s *Service) CreateDevice(name string) (*DeviceCredential, error) {
+// CreateDevice 直接创建设备凭据（用户 Token 专用：首台设备自注册）。
+// vaultID / userID 是新设备的归属，来自认证上下文；空值落到 default 管理员
+//（单用户旧路径的正确语义，db.InsertDevice 兜底）。
+func (s *Service) CreateDevice(name, vaultID, userID string) (*DeviceCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.createDeviceLocked(name, strings.Join(DefaultDeviceScopes, ","))
+	return s.createDeviceLocked(name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID)
 }
 
-func (s *Service) createDeviceLocked(name, scopes string) (*DeviceCredential, error) {
+func (s *Service) createDeviceLocked(name, scopes, vaultID, userID string) (*DeviceCredential, error) {
 	id, err := randomHex(8)
 	if err != nil {
 		return nil, err
@@ -90,6 +97,8 @@ func (s *Service) createDeviceLocked(name, scopes string) (*DeviceCredential, er
 		Scopes:     scopes,
 		CreatedAt:  now,
 		LastSeenAt: now,
+		VaultID:    vaultID,
+		UserID:     userID,
 	}); err != nil {
 		return nil, err
 	}
@@ -98,7 +107,11 @@ func (s *Service) createDeviceLocked(name, scopes string) (*DeviceCredential, er
 }
 
 // CreateEnrollment 生成一次性注册凭据（配对流程；secret 明文只返回一次）。
-func (s *Service) CreateEnrollment(ttl time.Duration) (id, secret string, expiresAt int64, err error) {
+//
+// 归属在创建时定死：新设备将落到 (vaultID, userID)。userID 为空而
+// actorDeviceID 非空时，继承该设备的归属——配对包由某台设备生成，
+// 新设备自然属于同一个人。
+func (s *Service) CreateEnrollment(ttl time.Duration, vaultID, userID, actorDeviceID string) (id, secret string, expiresAt int64, err error) {
 	if ttl <= 0 || ttl > 2*enrollmentDefaultTTL {
 		ttl = enrollmentDefaultTTL
 	}
@@ -115,8 +128,13 @@ func (s *Service) CreateEnrollment(ttl time.Duration) (id, secret string, expire
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if userID == "" && actorDeviceID != "" {
+		if _, ownerID, terr := db.DeviceTenant(s.db, actorDeviceID); terr == nil && ownerID != "" {
+			userID = ownerID
+		}
+	}
 	err = db.InsertEnrollment(s.db, id, sha256Hex([]byte(secret)),
-		strings.Join(DefaultDeviceScopes, ","), now.Unix(), expiresAt)
+		strings.Join(DefaultDeviceScopes, ","), now.Unix(), expiresAt, vaultID, userID)
 	if err != nil {
 		return "", "", 0, err
 	}
@@ -124,17 +142,18 @@ func (s *Service) CreateEnrollment(ttl time.Duration) (id, secret string, expire
 }
 
 // EnrollDevice 用一次性注册凭据换取设备凭据（公开接口，secret 即认证）。
+// 新设备的归属来自 enrollment 自身（创建时定死），不来自请求。
 func (s *Service) EnrollDevice(secret, name string) (*DeviceCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	scopes, ok, err := db.ConsumeEnrollment(s.db, sha256Hex([]byte(secret)), time.Now().Unix())
+	grant, err := db.ConsumeEnrollment(s.db, sha256Hex([]byte(secret)), time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
+	if grant == nil {
 		return nil, ErrEnrollmentInvalid
 	}
-	return s.createDeviceLocked(name, scopes)
+	return s.createDeviceLocked(name, grant.Scopes, grant.VaultID, grant.UserID)
 }
 
 // AuthDevice 校验设备 token；有效则返回设备并更新 last_seen（节流到 5 分钟一次）。
@@ -151,8 +170,11 @@ func (s *Service) AuthDeviceWithClient(token, clientVersion string, protocol int
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, err := db.GetDeviceByTokenHash(s.db, sha256Hex([]byte(token)))
-	if err != nil || d == nil || d.Revoked {
+	if err != nil || d == nil {
 		return nil, err
+	}
+	if d.Revoked {
+		return nil, ErrDeviceRevoked
 	}
 	now := time.Now().Unix()
 	// 版本/平台/IP 任一变化就立刻记，否则沿用 5 分钟节流：升级完（或换了网络）

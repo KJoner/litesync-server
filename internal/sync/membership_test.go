@@ -48,7 +48,7 @@ func seedTenant(t *testing.T, s *syncsvc.Service, members map[string]db.Role) ma
 		}); err != nil {
 			t.Fatal(err)
 		}
-		cred, err := s.CreateDevice(userID + "-laptop")
+		cred, err := s.CreateDevice(userID + "-laptop", "", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -71,7 +71,7 @@ func TestRemoveMemberRevokesDevicesAndRotatesKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := s.RemoveMember(syncsvc.Actor{DeviceID: devices["alice"]}, "bob")
+	rep, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{DeviceID: devices["alice"]}, "bob")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestRemoveMemberRevokesDevicesAndRotatesKey(t *testing.T) {
 		t.Fatalf("keyEpoch 应当 %d → %d，实际 %d", before, before+1, rep.NewKeyEpoch)
 	}
 	// 4) 待重新封装：服务器拿不到 Vault Key，只能记下待办
-	pending, err := s.PendingRewrapEpoch()
+	pending, err := s.PendingRewrapEpoch(db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestRemoveMemberRevokesDevicesAndRotatesKey(t *testing.T) {
 	}
 
 	// 6) 审计留痕：事后要能回答「这次轮换是因为谁被移除了」
-	events, err := s.AuditTrail(10)
+	events, err := s.AuditTrail(db.LegacyDefaultScope(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,23 +136,23 @@ func TestRemoveMemberRequiresAdminRole(t *testing.T) {
 		"carol": db.RoleReader,
 	})
 
-	if _, err := s.RemoveMember(syncsvc.Actor{DeviceID: devices["bob"]}, "carol"); err != syncsvc.ErrNotAuthorized {
+	if _, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{DeviceID: devices["bob"]}, "carol"); err != syncsvc.ErrNotAuthorized {
 		t.Fatalf("editor 移除成员应当被拒，得到 %v", err)
 	}
 	// carol 仍在，且没有发生任何轮换——被拒的操作不该有副作用
 	if _, ok, _ := db.RoleOf(s.DB(), db.LegacyDefaultScope(), "carol"); !ok {
 		t.Fatal("被拒的移除不该真的删掉成员")
 	}
-	if pending, _ := s.PendingRewrapEpoch(); pending != 0 {
+	if pending, _ := s.PendingRewrapEpoch(db.LegacyDefaultScope()); pending != 0 {
 		t.Fatal("被拒的移除不该触发密钥轮换")
 	}
 
 	// 未绑定任何用户的设备（存量单用户设备）同样没有管理权
-	cred, err := s.CreateDevice("unbound")
+	cred, err := s.CreateDevice("unbound", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RemoveMember(syncsvc.Actor{DeviceID: cred.DeviceID}, "carol"); err != syncsvc.ErrNotAuthorized {
+	if _, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{DeviceID: cred.DeviceID}, "carol"); err != syncsvc.ErrNotAuthorized {
 		t.Fatalf("未绑定用户的设备应当被拒，得到 %v", err)
 	}
 }
@@ -162,12 +162,12 @@ func TestCannotRemoveLastOwner(t *testing.T) {
 	s := newTenantEnv(t)
 	seedTenant(t, s, map[string]db.Role{"alice": db.RoleOwner})
 
-	if _, err := s.RemoveMember(syncsvc.Actor{Root: true}, "alice"); err != db.ErrLastOwner {
+	if _, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{Root: true}, "alice"); err != db.ErrLastOwner {
 		t.Fatalf("移除最后一个 owner 应当被拒，得到 %v", err)
 	}
 	// 有第二个 owner 时就可以了
 	seedTenant(t, s, map[string]db.Role{"dave": db.RoleOwner})
-	if _, err := s.RemoveMember(syncsvc.Actor{Root: true}, "alice"); err != nil {
+	if _, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{Root: true}, "alice"); err != nil {
 		t.Fatalf("还有其他 owner 时应当允许移除，得到 %v", err)
 	}
 }
@@ -176,10 +176,10 @@ func TestCannotRemoveLastOwner(t *testing.T) {
 func TestRemoveNonMemberFails(t *testing.T) {
 	s := newTenantEnv(t)
 	seedTenant(t, s, map[string]db.Role{"alice": db.RoleOwner})
-	if _, err := s.RemoveMember(syncsvc.Actor{Root: true}, "nobody"); err != db.ErrNotAMember {
+	if _, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{Root: true}, "nobody"); err != db.ErrNotAMember {
 		t.Fatalf("移除非成员应当报错，得到 %v", err)
 	}
-	if pending, _ := s.PendingRewrapEpoch(); pending != 0 {
+	if pending, _ := s.PendingRewrapEpoch(db.LegacyDefaultScope()); pending != 0 {
 		t.Fatal("失败的移除不该触发密钥轮换")
 	}
 }
@@ -191,22 +191,22 @@ func TestClearPendingRewrapRequiresMatchingEpoch(t *testing.T) {
 		"alice": db.RoleOwner,
 		"bob":   db.RoleEditor,
 	})
-	rep, err := s.RemoveMember(syncsvc.Actor{DeviceID: devices["alice"]}, "bob")
+	rep, err := s.RemoveMember(db.LegacyDefaultScope(), syncsvc.Actor{DeviceID: devices["alice"]}, "bob")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.ClearPendingRewrap(rep.NewKeyEpoch - 1); err == nil {
+	if err := s.ClearPendingRewrap(db.LegacyDefaultScope(), rep.NewKeyEpoch - 1); err == nil {
 		t.Fatal("旧 epoch 的文档不该算作完成轮换")
 	}
-	if pending, _ := s.PendingRewrapEpoch(); pending != rep.NewKeyEpoch {
+	if pending, _ := s.PendingRewrapEpoch(db.LegacyDefaultScope()); pending != rep.NewKeyEpoch {
 		t.Fatal("失败的清除不该改变待办状态")
 	}
 
-	if err := s.ClearPendingRewrap(rep.NewKeyEpoch); err != nil {
+	if err := s.ClearPendingRewrap(db.LegacyDefaultScope(), rep.NewKeyEpoch); err != nil {
 		t.Fatal(err)
 	}
-	if pending, _ := s.PendingRewrapEpoch(); pending != 0 {
+	if pending, _ := s.PendingRewrapEpoch(db.LegacyDefaultScope()); pending != 0 {
 		t.Fatal("对准 epoch 之后待办应当清除")
 	}
 }

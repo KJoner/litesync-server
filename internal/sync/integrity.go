@@ -135,9 +135,20 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 	seen := map[string]bool{}
 	var refs []ref
 
-	heads, err := db.ListHeads(s.db)
+	// v0.18：扫描覆盖全部 Vault 的引用。
+	// 顺序有讲究：HEAD 先登记——同一 blob 既是 HEAD 又是最新历史版本时，
+	// 应计为 head（原实现语义），否则 HeadsChecked 会被去重清零。
+	scopes, err := db.AllVaultScopes(s.db)
 	if err != nil {
 		return nil, err
+	}
+	var heads []db.ObjectHead
+	for _, sc := range scopes {
+		hs, herr := db.ListHeads(s.db, sc)
+		if herr != nil {
+			return nil, herr
+		}
+		heads = append(heads, hs...)
 	}
 	for i := range heads {
 		h := &heads[i]
@@ -148,24 +159,25 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 		refs = append(refs, ref{h.BlobID, h.Size, "head", h.ContentHash})
 		rep.HeadsChecked++
 	}
-
-	fileIDs, err := db.DistinctVersionFileIDs(s.db)
-	if err != nil {
-		return nil, err
-	}
-	for _, fid := range fileIDs {
-		versions, verr := db.ListVersions(s.db, fid)
-		if verr != nil {
-			return nil, verr
+	for _, sc := range scopes {
+		ids, ierr := db.DistinctVersionFileIDs(s.db, sc)
+		if ierr != nil {
+			return nil, ierr
 		}
-		for i := range versions {
-			v := &versions[i]
-			if v.BlobID == "" || seen[v.BlobID] {
-				continue
+		for _, fid := range ids {
+			versions, verr := db.ListVersions(s.db, sc, fid)
+			if verr != nil {
+				return nil, verr
 			}
-			seen[v.BlobID] = true
-			refs = append(refs, ref{v.BlobID, v.Size, "version", v.ContentHash})
-			rep.VersionsChecked++
+			for i := range versions {
+				v := &versions[i]
+				if v.BlobID == "" || seen[v.BlobID] {
+					continue
+				}
+				seen[v.BlobID] = true
+				refs = append(refs, ref{v.BlobID, v.Size, "version", v.ContentHash})
+				rep.VersionsChecked++
+			}
 		}
 	}
 
@@ -205,7 +217,7 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 	}
 
 	// 分享 blob：内容独立存放，同样不能在损坏后继续对外返回
-	shares, err := db.ListShares(s.db)
+	shares, err := db.AdminListShares(s.db)
 	if err != nil {
 		return nil, err
 	}

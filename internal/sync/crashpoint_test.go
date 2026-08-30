@@ -28,7 +28,7 @@ import (
 // assertNoDanglingHeads 检查核心不变量：每个 live HEAD 都必须有一个真实存在的 blob。
 func assertNoDanglingHeads(t *testing.T, s *syncsvc.Service, blobDir string) {
 	t.Helper()
-	heads, err := db.ListHeads(s.DB())
+	heads, err := db.ListHeads(s.DB(), db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func assertNoDanglingHeads(t *testing.T, s *syncsvc.Service, blobDir string) {
 }
 
 func uploadOnce(s *syncsvc.Service, path string, base int64, content []byte) (*syncsvc.UploadResult, error) {
-	return s.Upload(syncsvc.UploadParams{
+	return s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: path, BaseRevision: base, ClaimedHash: sha256HexT(content),
 		DeviceID: "crash-test", Action: "upsert",
 	}, bytes.NewReader(content))
@@ -87,7 +87,7 @@ func TestServerCrashPointsLeaveNoHalfCommit(t *testing.T) {
 
 			// 验收 3：重启后不存在半提交 HEAD。
 			// 上传失败了，那么这个对象根本不应该存在
-			if h, herr := db.GetHeadByPseudonym(s.DB(), "note.md"); herr != nil {
+			if h, herr := db.GetHeadByPseudonym(s.DB(), db.LegacyDefaultScope(), "note.md"); herr != nil {
 				t.Fatal(herr)
 			} else if h != nil {
 				t.Fatalf("上传失败却留下了 HEAD（revision %d）—— 半提交", h.Revision)
@@ -105,7 +105,7 @@ func TestServerCrashPointsLeaveNoHalfCommit(t *testing.T) {
 			}
 			// 验收 1：成功响应对应的数据一定存在
 			assertNoDanglingHeads(t, s, blobDir)
-			meta, rc, oerr := s.OpenFile("note.md")
+			meta, rc, oerr := s.OpenFile(db.LegacyDefaultScope(), "note.md")
 			if oerr != nil {
 				t.Fatalf("成功响应之后必须能读到内容: %v", oerr)
 			}
@@ -139,7 +139,7 @@ func TestServerCrashAfterCommitBeforeResponse(t *testing.T) {
 	}
 
 	// 数据其实已经落地了
-	h, herr := db.GetHeadByPseudonym(s.DB(), "note.md")
+	h, herr := db.GetHeadByPseudonym(s.DB(), db.LegacyDefaultScope(), "note.md")
 	if herr != nil || h == nil {
 		t.Fatalf("提交后的数据必须存在: %v", herr)
 	}
@@ -154,7 +154,7 @@ func TestServerCrashAfterCommitBeforeResponse(t *testing.T) {
 	var conflict *syncsvc.ConflictError
 	if retryErr == nil {
 		// 相同内容被判定为幂等重复也是可以接受的收敛方式
-		h2, _ := db.GetHeadByPseudonym(s.DB(), "note.md")
+		h2, _ := db.GetHeadByPseudonym(s.DB(), db.LegacyDefaultScope(), "note.md")
 		if h2.Revision != 1 {
 			t.Fatalf("相同内容重试不应产生新 revision，得到 %d", h2.Revision)
 		}
@@ -210,14 +210,14 @@ func TestServerCrashBetweenMigrationObjects(t *testing.T) {
 	}
 
 	cancel := failpoint.EnableError(failpoint.MigrationEachObj, 1)
-	_, err := s.MigrateObjectMeta("note.md", "", "", "dev-1")
+	_, err := s.MigrateObjectMeta(db.LegacyDefaultScope(), "note.md", "", "", "dev-1")
 	cancel()
 	if err == nil {
 		t.Fatal("注入点没有生效")
 	}
 
 	// 崩溃点在任何状态改动之前 → 对象必须完好无损
-	h, herr := db.GetHeadByPseudonym(s.DB(), "note.md")
+	h, herr := db.GetHeadByPseudonym(s.DB(), db.LegacyDefaultScope(), "note.md")
 	if herr != nil || h == nil {
 		t.Fatalf("迁移中断不得损坏对象: %v", herr)
 	}
@@ -239,7 +239,7 @@ func TestServerCrashBeforeMigrationComplete(t *testing.T) {
 	}
 
 	cancel := failpoint.EnableError(failpoint.MigrationBeforeDone, 1)
-	_, cerr := s.CompleteMetaMigration("some-migration", "dev-1")
+	_, cerr := s.CompleteMetaMigration(db.LegacyDefaultScope(), "some-migration", "dev-1")
 	cancel()
 	if cerr == nil {
 		t.Fatal("注入点没有生效")

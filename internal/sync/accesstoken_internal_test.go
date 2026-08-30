@@ -99,7 +99,7 @@ func newTokenEnv(t *testing.T) (*Service, string) {
 	s := New(database, store, blobs, shares, Options{},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	cred, err := s.CreateDevice("test-device")
+	cred, err := s.CreateDevice("test-device", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,7 +13,7 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudf
 > 同步只保护多设备一致性；灾难恢复请启用内置的 R2 异地备份（见下），
 > 或自行定期备份整个 `/data` 目录。
 
-## 架构（v0.7）
+## 架构
 
 ```text
 一个 Go Binary + 一个 SQLite 文件 + 一个内容寻址 Blob 目录（+ restic 备份旁路）
@@ -21,8 +21,11 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudf
 
 ```text
 /data
-├── sync.db      # 元数据：files（HEAD）/ file_versions（历史）/ changes / shares
-├── blobs/       # 唯一内容存储：SHA-256 寻址、不可变、跨版本跨文件去重
+├── sync.db      # 元数据：file_heads（HEAD）/ object_versions（历史）/
+│                #   object_changes / tombstones / devices / shares /
+│                #   users / vaults / memberships / audit_events
+├── blobs/       # 唯一内容存储：不可变、Vault 内跨版本跨文件去重
+│   └── _quarantine/   # 被判定损坏的副本（取证用，默认不自动删）
 ├── shares/      # 分享密文（服务器无解密密钥）
 └── vaults/      # 旧版本遗留目录（v0.5 起 HEAD 不再单独落盘，启动时自动收编）
 ```
@@ -40,6 +43,12 @@ Obsidian 私有同步服务器，内嵌 Web 只读客户端与 Restic → Cloudf
   存在/尺寸校验 + 随机全量 hash 抽查，位腐坏检出即告警隔离）
 - 备份是**服务器旁路能力**（v0.6）：不改动 revision / changes / E2EE / merge
   任何协议；restic 仅在备份任务执行时 fork，无常驻内存开销
+- **租户隔离（0.16.0）**：所有按仓库划分的数据（HEAD / 历史 / changes /
+  tombstones / repo 状态 / 写锁 / 保留策略）都带 `vault_id`，由类型层
+  （`VaultScope`）与源码扫描双重强制；blobID 按 Vault 域化，跨租户去重
+  不可能发生。单实例目前仍只服务一个 Vault，隔离先在结构上成立
+- **设备可信度（0.15.0）**：服务器转发由**设备**签名的 checkpoint，
+  自己不参与签名——它无法给不同设备编造不同的仓库状态而不被发现
 
 ## 一键部署 / 更新
 
@@ -89,6 +98,26 @@ docker compose pull
 docker compose up -d
 ```
 
+数据库结构升级在 `db.Open` 时自动完成、幂等、可续跑，**但不可回滚到旧版**
+（重建后的表旧代码读不了）。因此跨大版本升级前请先
+`obsync backup create`，或至少完整拷贝一次 `./data`。
+
+**从 0.15 及更早升级到 0.16+ 时的一步手工迁移**：blobID 从裸内容哈希
+改为按 Vault 域化（见[租户隔离](#租户隔离0160)），存量 blob 需要改名。
+这**不是启动硬门槛**——混合状态读写都正确，服务器只会告警不会拒绝启动，
+但在迁移完成前老数据上的隔离尚未成立：
+
+```bash
+obsync backup create              # 先备份，下一步不可逆
+obsync blobid status              # 还有多少停留在旧格式
+obsync blobid migrate             # dry-run，不动任何文件
+obsync blobid migrate --confirm   # 真正执行
+```
+
+**升级到 0.17.x 时**：服务端与插件都要升到 0.17（协议 v6 不变，但 Web 端的
+LSE4 解密、设备平台/IP 记录、运维页都在服务端资产里）。如果部署时固定了
+镜像标签，记得一并更新——「网页端显示乱码」这类现象多半是 Web 资产还是旧版。
+
 ## 配置（全部通过环境变量）
 
 | 变量 | 默认值 | 说明 |
@@ -129,7 +158,8 @@ Compose 额外变量：`LITESYNC_ETC_DIR`（宿主机密钥目录，默认 `./et
 | 单文件历史版本数 | 100（Markdown）、10（附件） | 由 `OBSYNC_HISTORY_MAX_PER_FILE` 等配置约束并强制生效 |
 | 单文件大小 | 100 MB | `OBSYNC_MAX_FILE_SIZE`；移动端超过 50 MB 会有内存告警 |
 | 客户端待推送变更数 | 10 000 | 超过时同步仍然正确，但单轮耗时会明显变长 |
-| 设备数 | 10 | 单用户阶段的实际使用形态；多人协作见 v0.16 路线 |
+| 设备数 | 10 | 单用户阶段的实际使用形态 |
+| 单实例 Vault 数 | 1 | 0.16.0 起数据模型与隔离已按多租户建立，但 HTTP 层尚未放开多 Vault 路由（见[租户隔离](#租户隔离0160)） |
 | 最长离线时间 | 90 天 | 由 `OBSYNC_CHANGES_DAYS` 决定；超过后客户端自动走 snapshot 全量对账，不会漏变更 |
 
 一台普通 SSD 机器上的实测（这些数字随磁盘差异很大，仅供量级参考）：
@@ -183,6 +213,89 @@ v5 把 path 当作主键，导致元数据迁移重置 revision、历史撞唯�
 并把旧表重命名为 `v5_files` / `v5_changes` / `v5_file_versions` **只读保留**作为回滚窗口。
 设计与取舍见插件仓库的 `docs/开发计划/v10/adr/`（ADR-001/002/003/006/008）。
 
+## 租户隔离（0.16.0）
+
+服务器从「一个人的仓库」变成「可以装下多个互不可见的仓库」。
+0.16.0 先让隔离在结构上成立（数据模型、类型强制、越权矩阵），**0.18.0 放开了
+多 Vault 路由**：管理员在网页端生成一次性邀请链接，受邀者自助注册即获得自己的
+API Token 与完全独立的仓库（见下方「多用户」一节）。隔离性质由类型系统
+和测试守着，而不是靠每个新接口的作者记得带条件。
+
+- **类型层强制**：所有按租户划分的查询都要求一个 `VaultScope`，它的字段不可
+  导出、唯一构造入口在认证层，业务代码造不出指向别人 Vault 的范围；零值一律
+  硬拒（`ErrVaultScopeMissing`），**绝不退化为默认租户**；
+- **CI 期源码扫描**：禁止业务包自行构造 scope，也禁止在 db 包之外手写
+  `vault_id = ?`；
+- **每 Vault 独立状态**：`repo_state`（含 repoEpoch / headSequence /
+  迁移状态）、**写锁**、历史保留策略都按 Vault 划分——共用一把写锁的话，
+  一个租户的慢速大附件上传会挡住所有租户，而那不只是慢，它让一个租户的负载
+  变成另一个租户可观测的信号；
+- **blobID 域化**：`blobID = HMAC-SHA256(vaultSecret, contentHash)`。全局内容
+  寻址去重是一个**存在性预言机**——上传一份文件看它是「秒传」还是真传，
+  就能判断别的租户是否持有同一份内容。域化之后跨租户去重不可能发生，
+  Vault 内部的去重完全保留；E2EE 下不同 Vault 用不同密钥，跨租户去重本来
+  也命中不了，这个取舍几乎没有成本；
+- **越权矩阵按路由表自动生成**：测试直接扫 `router.go` 抽路由，新增一条路由
+  立刻被纳入覆盖；确实要公开的必须在 `publicRoutes` 里显式登记。矩阵覆盖
+  60+ 路由，验证无凭据 / 已撤销设备 / 外租户凭据 / 零 scope 一律被拒。
+
+**成员移除**（`DELETE /api/v1/members/{userId}`）在同一个事务里按固定顺序
+执行：删成员关系 → **先**撤销该用户全部设备 → 推进 keyEpoch → 标记 Vault Key
+待重新封装。响应里原样带回一句 `localPlaintextNotice`，客户端 UI 必须原样展示：
+**移除成员不能收回他已经下载到本地的明文**。让用户以为「移除 = 对方再也看不到
+任何东西」是危险的误导。
+
+## 多用户与 API Token 重置（0.18.0）
+
+**邀请制多用户**（不开放注册）：管理员在网页端「用户管理」生成邀请链接
+（32 字节随机后缀、一次性、默认 24 小时过期、可撤销）；受邀者打开链接、
+输入用户名，即获得自己的 API Token 与全中文分步接入教程。每个用户是一个
+独立 Vault 的 owner：文件、变更流、历史、分享、设备、E2EE 密钥文档全部
+按 Vault 隔离。管理员看得到用户名/设备数/用量，**拿不到任何人的 API Token**
+（`users` 表只存 SHA-256）或 E2EE 密码（从不上传）。用户可被禁用（数据保留、
+凭据即时失效）或删除（输入用户名确认；级联清库并回收 blob）。Token 丢失
+**没有找回流程**（刻意：无恢复流程即无社工面），只能删除后重新邀请。
+
+**API Token 重置**：网页端「账户」页一键轮换自己的 Token——旧 Token 立即
+失效、该账户全部设备凭据连带撤销、其他网页会话下线；设备端填新 Token →
+「测试连接」即无损恢复。三个关键性质：
+
+- `OBSYNC_TOKEN` 环境变量从 0.18 起只是**首次初始化的种子**：认证一律查库，
+  网页轮换后以库为准（启动日志会提示 env 已失效的状态）；
+- **E2EE 重置凭证**：启用 E2EE 的 Vault 会在客户端解锁时自动登记
+  `HKDF(VMK, "litesync/v1/token-reset-auth")` 的哈希；此后重置端点要求提交
+  该派生值——只拿到 Token 的攻击者无法抢先重置把主人锁在门外。存量 Vault
+  从升级到首次解锁之间存在一个抢注窗口，救济是 CLI（如实披露，见下）；
+- **SSH 兜底**：`obsync token reset`（改库即时生效，无需重启；
+  `--user <名>` 指定用户、`--from-env` 回到环境变量值）。
+
+## 单用户多仓库（0.19.0）
+
+一个 API Token 名下可以有多个互相隔离的仓库。目标仓库由请求头 `X-Vault-ID`
+显式选择：**头只是「选择」，授权永远由服务端成员关系裁决**——他人仓库一律
+404（不泄露存在性）；设备凭据与短期票已绑定仓库，带头无效（被盗设备不能
+横向进入主人的其他仓库）。无头 = 默认仓库，0.18 客户端零感知。
+
+- `GET /api/v1/vaults` 列表（含统计与 current 标记）；`POST /api/v1/vaults`
+  新建（同用户内唯一名、上限 20）；`PATCH /api/v1/vaults/{id}` 重命名
+  （只动展示名）；`DELETE /api/v1/vaults/{id}`（body `confirmName` 必须
+  等于仓库名；不能删最后一个；级联清库 + blob GC）
+- 每仓库独立：identity / blobID 域密钥 / repo_state / E2EE 密钥文档（同一
+  密码在不同仓库派生完全不同的密钥）/ 重置凭证
+- 重置 Token 的 E2EE 门禁升级为「名下任一仓库的凭证均可验证」，撤销范围为
+  该用户全部仓库的全部设备
+- Web 端登录后有仓库切换器（多于一个才显示），各仓库独立解锁
+
+## 设备可信度：签名 checkpoint（0.15.0）
+
+服务器转发的 checkpoint 由**设备**签名，服务器自己不参与签名，因此无法长期
+给不同设备看不同的仓库状态而不被发现：设备之间对不上时同步会**停下来**，
+而不是自动挑一边。新设备不信任服务器给出的第一份清单——信任锚通过设备配对
+传入（密钥只走链接的 `#fragment`）。
+
+相关接口：`POST /api/v1/checkpoint`、`GET /api/v1/checkpoints`、
+`PUT /api/v1/device/signing-key`。
+
 ## API 一览
 
 认证方式（`/api/*`，0.10.0 起设备级凭据）：
@@ -194,6 +307,13 @@ v5 把 path 当作主键，导致元数据迁移重置 revision、历史撞唯�
   （vault-key 写、E2EE 状态机、历史清理）、`pairing`（添加新设备）。
   备份 admin 与设备管理**不授予任何设备**；历史记录中的设备身份取自
   服务器侧凭据（客户端自报的 `X-Device-ID` 不再作为审计身份）
+- **短期 access token**（0.16.0，`POST /api/v1/token`）→ 用长期设备凭据换一张
+  分钟级票据（`lst1.<payload>.<HMAC>`，无状态、不落表，TTL 上限 **15 分钟**）。
+  长期凭据会留在配置文件、日志、抓包和备份里，而那些地方的生命周期远长于任何
+  一次使用。三条性质：**票不能换票**（否则一张泄露的票可以无限续期）、
+  **scope 只能收窄**（申请集合必须是设备 scope 的子集）、**撤销不因此变弱**
+  （校验时回查设备是否仍然有效，撤销一台被盗设备立刻让它所有在途的票失效）。
+  设备 Token 与 access token 走**同一份** scope 判定实现
 - Web 只读会话 Cookie（`POST /web/session` 登录换取，HttpOnly +
   SameSite=Strict，7 天）→ **仅白名单 GET**（info / snapshot / file /
   history / version / vault-key），写操作一律 403
@@ -232,10 +352,19 @@ v5 把 path 当作主键，导致元数据迁移重置 revision、历史撞唯�
 | POST | `/api/v1/admin/backup/run` | 立即备份（异步；任务互斥，运行中返回 409） |
 | POST | `/api/v1/admin/backup/check` | restic check 完整性校验（异步） |
 | GET | `/api/v1/admin/backup/snapshots` | 快照列表 |
+| GET | `/api/v1/admin/backup/restore-plan` | 灾备恢复**预检**（0.17.0）：核对快照、算出会失效的东西，并给出可粘贴的命令；带 `whyNotAButton` 说明为什么最后一步必须停机用 CLI 做 |
+| GET / DELETE | `/api/v1/admin/devices` · `/api/v1/admin/devices/{id}` | 运维页设备列表 / 撤销（0.17.0）：含设备名、平台、客户端版本、最近来源 IP；**已撤销的设备仍然列出**（否则「它最后一次活动是什么时候」永远答不了） |
+| GET | `/api/v1/admin/migration/status` | 三件会卡住人的事放在一起：元数据迁移状态、blobID 域化、待重新封装 |
+| GET | `/api/v1/admin/migration/preflight` | 迁移前置检查（只读，任何时候跑都安全） |
+| GET / DELETE | `/api/v1/admin/shares` · `/api/v1/admin/shares/{id}` | 运维页分享列表 / 撤销 |
+| POST | `/api/v1/admin/shares/{id}/recover` | 设置新的到期时间。**只能延长有效期**：密文被过期回收后就真的没了（`410 Gone`），主动撤销过的也不能靠它复活（`409 Conflict`） |
+| GET | `/api/v1/admin/integrity/scan` · `/events` | 完整性巡检与告警事件（root Token 或 admin 会话） |
+| POST | `/api/v1/admin/integrity/purge-quarantine` | 清理隔离区 |
 | GET | `/api/v1/file/meta` | 轻量读取对象元数据（改名变更无需下载内容） |
 | POST | `/api/v1/meta/migrate` | 单对象伪名化（幂等，断点续传安全） |
 | GET | `/api/v1/meta/status` | 迁移状态与 journal 进度（0.13.0） |
 | POST | `/api/v1/meta/begin` / `verify` / `complete` / `abort` | 四态迁移状态机（0.13.0）：验证与不可逆擦除分离 |
+| POST | `/api/v1/meta/renew` / `takeover` | 迁移租约续期 / 接管（持锁设备离线后由另一台续做） |
 | GET | `/api/v1/meta/validate` | 只跑 11 项验证器不改状态（complete 前预检） |
 | GET / POST | `/api/v1/meta/tombstones` · `/api/v1/meta/migrate-tombstone` | 删除记录转隐私格式（**转换而不是删除**） |
 | GET | `/api/v1/admin/migration/report` | 最近一次擦除报告 |
@@ -247,7 +376,20 @@ v5 把 path 当作主键，导致元数据迁移重置 revision、历史撞唯�
 | DELETE | `/api/v1/devices/{id}` | **根 Token 专属**：撤销设备（下一个请求即 401） |
 | POST | `/api/v1/enrollments` | 生成一次性注册凭据（配对包 v2 携带；secret 只返回一次） |
 | POST | `/enroll` | **公开**（0.10.0）：一次性注册凭据换设备凭据（secret 即认证） |
-| GET | `/api/v1/whoami` | 当前凭据身份（root / device + scopes） |
+| GET | `/api/v1/whoami` | 当前凭据身份（root / device + scopes；不泄露别的租户的存在） |
+| POST | `/api/v1/token` | 用设备凭据换短期 access token（0.16.0；TTL ≤ 15 分钟，拒绝用票换票） |
+| DELETE | `/api/v1/members/{userId}` | 移除成员（0.16.0）：撤销其全部设备 + 推进 keyEpoch，响应带 `localPlaintextNotice` |
+| POST | `/api/v1/account/token-reset` | 重置自己的 API Token（0.18.0）：作废旧 Token + 撤销全部设备 + 踢其他会话；E2EE Vault 需提交重置凭证 |
+| PUT | `/api/v1/vault/reset-auth` | 登记重置凭证（0.18.0）：首登记或持旧值更新；会话拿不到覆盖权 |
+| POST/GET | `/api/v1/admin/invites`、DELETE `/api/v1/admin/invites/{id}` | 邀请管理（0.18.0，管理员） |
+| GET | `/join/{secret}`、`/join/{secret}/info`、POST `/join/{secret}/register` | 注册落地页与消费（0.18.0，公开：secret 即凭证、一次性、404 无差别） |
+| GET/POST | `/api/v1/vaults` | 名下仓库列表 / 新建（0.19.0；`X-Vault-ID` 选择目标仓库，授权由成员关系裁决，非成员 404，设备凭据忽略此头） |
+| PATCH/DELETE | `/api/v1/vaults/{id}` | 重命名（0.19.x，只动展示名）/ 删除（confirmName 确认、不能删最后一个）——均为用户 Token 专属 |
+| GET | `/api/v1/admin/users` | 用户列表（0.18.0）：用户名/设备数/用量，绝不含凭据材料 |
+| POST | `/api/v1/admin/users/{id}/disable`、`/enable`、DELETE `/api/v1/admin/users/{id}` | 禁用/解禁/删除（0.18.0；删除需 body 带 `confirmName`） |
+| GET | `/api/v1/audit` | 审计事件（成员变更、密钥世代推进等） |
+| POST / GET | `/api/v1/checkpoint` · `/api/v1/checkpoints` | 设备签名 checkpoint 的存储与转发（0.15.0） |
+| PUT | `/api/v1/device/signing-key` | 注册本设备的 checkpoint 签名公钥 |
 | POST | `/api/v1/pairing` | 创建一次性加密配对包（0.8.0；只存密文，默认 5 分钟过期） |
 | DELETE | `/api/v1/pairing/{id}` | 撤销配对包（配对窗口关闭时调用） |
 | POST | `/pair/{id}/consume` | **公开**消费配对包（一次性；密文仍需链接 fragment 中的密钥解密） |
@@ -360,6 +502,15 @@ E2EE 下改名走原子 MOVE、无需重新加密内容。旧 LSE1/LSE2 密文�
 插件命令「升级加密信封」可把存量密文批量升级到 LSE3。
 迁移期间服务器冻结一切明文写入（状态机见 e2ee 接口）。
 
+**LSE4（0.17.0，大小混淆）**：客户端开启「混淆文件大小」后，新写入使用把明文
+填充到桶边界的 LSE4 信封（帧内自带真实长度），服务器只看得到大小区间而不是
+精确字节数。服务端要做的只有三件事：识别这个版本、按仓库信封下限判定
+（4 > 3，因此**不需要迁移**，存量 LSE3 继续可读）、按双格式解析头部并拒绝截断。
+Web 只读端与分享查看页同样实现了 LSE4 解密（含 flags 认证与去填充）。
+
+> 服务器**不决定**谁开启填充，也不知道某个对象是否被填充过——`flags` 进 AAD，
+> 抹掉 padded 位会导致认证失败。
+
 ### 离线分享查看器（0.10.0）
 
 分享查看页的 JS 由同步服务器下发——理论上「已控制服务器的攻击者」可以
@@ -374,6 +525,45 @@ Obsidian 风格阅读器（文件树 / Markdown / Outline / 文件名搜索 /
 版本历史 / Diff），E2EE 在浏览器本地解密（密钥只存内存，刷新需重新解锁）。
 前端源码在仓库 `web/`，构建产物已提交（`internal/web/dist`），
 部署无需 Node；改前端后 `cd web && npm run build` 再重新编译服务器。
+
+### 运维页（0.17.0）
+
+设备撤销、迁移状态、完整性告警、备份恢复、分享恢复——这五件事的共同点是
+**出事的时候才会用到**，而它们最常见的失败不是写错了，是「只能 SSH 上服务器
+敲命令」。事故当天，能不能在手机上撤销一台丢失的设备，和这个功能写得优不优雅
+是完全不同量级的问题。
+
+Web 端 **🛠 入口**（与备份页并列，不是塞进去——出事时要能一眼找到），
+共用 30 分钟 admin 会话（`POST /web/session` 带 `"admin":true`）：
+
+| 卡片 | 内容 |
+|---|---|
+| 完整性告警 | 排在最上面：它是唯一一类「已经有内容读不出来了」的信号 |
+| 设备 | 名称 / 平台 / 客户端版本 / 最近来源 IP；一键撤销，撤销后下一个请求即 401。**已撤销的设备仍然列出** |
+| 迁移 | 元数据迁移状态、blobID 域化进度、待重新封装——「现在到底卡在哪」一眼可答 |
+| 分享 | 列表、撤销、设置新的到期时间（预设或自定义） |
+| 灾备预检 | 核对快照、算出会失效的东西、给出可粘贴的命令 |
+
+**IP 只在直连方是可信代理（`OBSYNC_TRUSTED_PROXIES`）时才采信转发头**，
+客户端伪造的 `X-Forwarded-For` 不进库。
+
+**灾备恢复刻意不是一个网页按钮**：恢复要替换正在运行的进程打开着的文件
+（sync.db / WAL / blob），在进程内做这件事意味着先静默请求、关库、换目录、
+再重开，中途任何一步失败都会留下既不是旧库也不是新库的半成品——而这一步发生
+在你已经出过一次事之后。所以只做能安全做的部分，真正的切换停机后由 CLI 执行。
+响应里带 `whyNotAButton` 并由 UI 原样展示，免得看起来像功能没做完。
+
+### 分享（服务端视角）
+
+- 分享密文由客户端用**独立 Share Key** 加密后上传，密钥只在链接的 `#fragment`
+  里，服务器从头到尾拿不到；
+- 0.17.0 起笔记内嵌的图片会被客户端**一起加密进同一个包**——服务器看到的
+  仍然只是一个密文 blob，附件的数量、名字、内容都在密文里；
+- 有效期由客户端设置（预设或自定义），过期分享由资源治理任务清理；
+- 查看页有严格 CSP，**不加载任何外部资源**：笔记里的外链图片不会把查看者的
+  IP 报给第三方；
+- 运维页可以撤销分享或设置新的到期时间，但**救不回已经过期回收的密文**，
+  也不能推翻一次主动撤销（见上面的 410 / 409）。
 
 ### 异地备份（Restic → Cloudflare R2，v0.6）
 
@@ -463,18 +653,31 @@ curl http://127.0.0.1:8080/health
 建议按 `obsync backup create` → 破坏测试副本 → `obsync backup restore --new-epoch`
 的顺序至少完整走一次。
 
-## 运维命令（v0.13.3）
+## 运维命令
 
-服务停止时对着同一个数据目录运行（`OBSYNC_DATA_DIR` 指向它）：
+服务停止时对着同一个数据目录运行（`OBSYNC_DATA_DIR` 指向它）；
+`obsync ops` 可以随时打印这份清单：
 
 ```bash
 obsync backup create                         # 立即创建一次备份
 obsync backup verify                         # restic check
 obsync backup restore --new-epoch <snapshot> # 恢复 + 旋转 repoEpoch（见下）
 obsync integrity scan [--full]               # 完整性巡检；--full 重算每个 blob 的 hash
+
+obsync migration preflight                   # 迁移前置检查（只读，任何时候跑都安全）
 obsync migration status                      # 元数据迁移状态与 journal 进度
-obsync migration resume                      # 释放已过期的迁移租约
-obsync migration abort                       # 中止迁移并回到 plain
+obsync migration resume                      # 释放已过期的迁移租约，任一设备可接管续做
+obsync migration abort                       # 中止迁移并回到 plain（已迁移对象保持可读）
+
+obsync token reset                           # 重置管理员 API Token（打印一次，只存哈希）
+obsync token reset --user <名>               # 重置指定用户的 Token
+obsync token reset --from-env                # 把管理员 Token 重设为 OBSYNC_TOKEN 的值
+
+obsync blobid status                         # 还有多少 blob 停留在裸 contentHash 上
+obsync blobid migrate                        # dry-run：只报告要改名多少个
+obsync blobid migrate --confirm              # 真正执行（**不可逆**，先 backup create）
+
+obsync rotate-epoch [--vault <id> | --all]   # 手工旋转 repoEpoch（restore 会自动做；多用户实例灾备恢复后用 --all）
 ```
 
 `restore` **强制要求 `--new-epoch`**：不旋转 repoEpoch 的话，客户端会带着
@@ -491,6 +694,8 @@ obsync migration abort                       # 中止迁移并回到 plain
 `POST /api/v1/admin/integrity/purge-quarantine`。
 
 ## 开发与源码构建
+
+架构约定、不变量与改动这份代码时的注意事项见 [AGENTS.md](AGENTS.md)。
 
 本地直接运行（不使用 Docker）：
 
@@ -528,6 +733,17 @@ changes 顺序/分页/裁剪与 resync、路径穿越（含 URL encoded）、中
 HEAD→blob 迁移、CSP 响应头、双设备协议场景，以及备份专项
 （加密配置往返与防泄露、staging 一致性快照、restic 调用参数/env 隔离、
 任务互斥、Secret 永不出现在 API 响应）。
+
+另有几组「不靠人记得」的结构性测试：
+
+- **崩溃点注入**：在 blob 落盘前后、事务提交前后强制中断，验证不留半成品；
+- **跨租户越权矩阵**：按 `router.go` 自动生成，新增路由立刻被纳入覆盖；
+- **去重不得短路**：命中去重的上传必须和全新上传读走同样多的请求体
+  （存在性预言机最常见的形态就是「秒传」与「真传」在耗时和流量上判若两物）；
+- **不变量标注**：`TestInvariantsAreAnnotated` 检查 INV-01/02/06/07/08/11/12
+  每一条都有测试认领；
+- **规模测试**：`LITESYNC_SCALE=20000 go test ./internal/sync/ -run TestScale`；
+- **灾备演练**：真实 restic 仓库上跑 create → 破坏 → restore 全流程。
 
 ## 许可（License）
 

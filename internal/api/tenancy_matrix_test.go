@@ -41,6 +41,11 @@ var publicRoutes = map[string]string{
 	"GET /api/v1/whoami":      "任何有效凭据均可；无凭据时仍然 401",
 	"POST /api/v1/token":      "换票：由长期设备凭据认证，authGate 内处理",
 	"GET /":                   "静态资源",
+	// v0.18 邀请注册（v11 设计 §5.5）：与 /pair 同模式，secret（32B CSPRNG）即凭证；
+	// 无效 secret 一律 404 + 300ms 减速，不区分原因
+	"GET /join/{secret}":           "注册落地页：内容由一次性邀请 secret 保护",
+	"GET /join/{secret}/info":      "邀请可用性查询：secret 即凭证",
+	"POST /join/{secret}/register": "消费邀请注册：secret 即凭证，一次性",
 }
 
 // parseRoutes 从 router.go 抽出全部注册的路由。

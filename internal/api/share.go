@@ -24,8 +24,8 @@ type apiShare struct {
 
 // snapshot 返回当前所有未删除文件的元数据。
 // GET /api/v1/snapshot
-func (h *handlers) snapshot(w http.ResponseWriter, _ *http.Request) {
-	snap, err := h.svc.Snapshot()
+func (h *handlers) snapshot(w http.ResponseWriter, r *http.Request) {
+	snap, err := h.svc.Snapshot(scopeOf(r))
 	if err != nil {
 		h.internalError(w, "snapshot", err)
 		return
@@ -90,7 +90,7 @@ func (h *handlers) createShare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
-	share, err := h.svc.CreateShare(name, expiresAt, body)
+	share, err := h.svc.CreateShare(scopeOf(r), name, expiresAt, body)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -108,8 +108,8 @@ func (h *handlers) createShare(w http.ResponseWriter, r *http.Request) {
 
 // listShares 列出全部分享（含已撤销/过期，供管理界面）。
 // GET /api/v1/shares
-func (h *handlers) listShares(w http.ResponseWriter, _ *http.Request) {
-	shares, err := h.svc.ListShares()
+func (h *handlers) listShares(w http.ResponseWriter, r *http.Request) {
+	shares, err := h.svc.ListShares(scopeOf(r))
 	if err != nil {
 		h.internalError(w, "share list", err)
 		return
@@ -134,7 +134,7 @@ func (h *handlers) revokeShare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	if err := h.svc.RevokeShare(id); err != nil {
+	if err := h.svc.RevokeShare(scopeOf(r), id); err != nil {
 		if errors.Is(err, syncsvc.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not found")
 			return

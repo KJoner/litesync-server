@@ -17,8 +17,8 @@ const maxVaultKeySize = 64 << 10
 // getVaultKey 返回客户端存放的加密 vault key（服务器不理解其内容）。
 // GET /api/v1/vault-key
 // v9：响应携带 X-Vault-Key-Fingerprint，replace 时作为 CAS 凭据传回。
-func (h *handlers) getVaultKey(w http.ResponseWriter, _ *http.Request) {
-	doc, err := h.svc.GetVaultKey()
+func (h *handlers) getVaultKey(w http.ResponseWriter, r *http.Request) {
+	doc, err := h.svc.GetVaultKey(scopeOf(r))
 	if err != nil {
 		h.internalError(w, "vault-key get", err)
 		return
@@ -51,7 +51,7 @@ func (h *handlers) putVaultKey(w http.ResponseWriter, r *http.Request) {
 	}
 	replace := r.URL.Query().Get("replace") == "true"
 	expected := r.Header.Get("X-Expected-Fingerprint")
-	if err := h.svc.SetVaultKey(string(raw), replace, expected); err != nil {
+	if err := h.svc.SetVaultKey(scopeOf(r), string(raw), replace, expected); err != nil {
 		switch {
 		case errors.Is(err, syncsvc.ErrVaultKeyExists):
 			writeErr(w, http.StatusConflict, "vault key already exists; pass replace=true to overwrite")
@@ -72,7 +72,7 @@ func (h *handlers) putVaultKey(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "invalid X-Key-Epoch")
 			return
 		}
-		if cerr := h.svc.ClearPendingRewrap(epoch); cerr != nil {
+		if cerr := h.svc.ClearPendingRewrap(scopeOf(r), epoch); cerr != nil {
 			if errors.Is(cerr, syncsvc.ErrRewrapRequired) {
 				writeErr(w, http.StatusConflict, cerr.Error())
 				return
@@ -99,7 +99,7 @@ func (h *handlers) purgeHistory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid beforeRevision")
 		return
 	}
-	removed, err := h.svc.PruneHistoryBefore(path, before)
+	removed, err := h.svc.PruneHistoryBefore(scopeOf(r), path, before)
 	if err != nil {
 		if errors.Is(err, storage.ErrInvalidPath) {
 			writeErr(w, http.StatusBadRequest, "invalid path")

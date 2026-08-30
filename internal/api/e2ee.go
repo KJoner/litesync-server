@@ -39,8 +39,8 @@ func (h *handlers) e2eeError(w http.ResponseWriter, op string, err error) {
 
 // envelopeComplete 验证全部 live HEAD 均为 LSE3 后把仓库信封下限提升到 3。
 // 提升之后**任何**写入路径（含新建与删除后重建）都不再接受旧信封（ADR-006 §2.1）。
-func (h *handlers) envelopeComplete(w http.ResponseWriter, _ *http.Request) {
-	rs, err := h.svc.CompleteEnvelopeUpgrade()
+func (h *handlers) envelopeComplete(w http.ResponseWriter, r *http.Request) {
+	rs, err := h.svc.CompleteEnvelopeUpgrade(scopeOf(r))
 	if err != nil {
 		h.e2eeError(w, "envelope complete", err)
 		return
@@ -48,8 +48,8 @@ func (h *handlers) envelopeComplete(w http.ResponseWriter, _ *http.Request) {
 	h.writeEncryptionState(w, rs)
 }
 
-func (h *handlers) e2eeBegin(w http.ResponseWriter, _ *http.Request) {
-	rs, err := h.svc.BeginE2eeMigration()
+func (h *handlers) e2eeBegin(w http.ResponseWriter, r *http.Request) {
+	rs, err := h.svc.BeginE2eeMigration(scopeOf(r))
 	if err != nil {
 		h.e2eeError(w, "e2ee begin", err)
 		return
@@ -57,8 +57,8 @@ func (h *handlers) e2eeBegin(w http.ResponseWriter, _ *http.Request) {
 	h.writeEncryptionState(w, rs)
 }
 
-func (h *handlers) e2eeComplete(w http.ResponseWriter, _ *http.Request) {
-	rs, err := h.svc.CompleteE2eeMigration()
+func (h *handlers) e2eeComplete(w http.ResponseWriter, r *http.Request) {
+	rs, err := h.svc.CompleteE2eeMigration(scopeOf(r))
 	if err != nil {
 		h.e2eeError(w, "e2ee complete", err)
 		return
@@ -66,8 +66,8 @@ func (h *handlers) e2eeComplete(w http.ResponseWriter, _ *http.Request) {
 	h.writeEncryptionState(w, rs)
 }
 
-func (h *handlers) e2eeAbort(w http.ResponseWriter, _ *http.Request) {
-	rs, err := h.svc.AbortE2eeMigration()
+func (h *handlers) e2eeAbort(w http.ResponseWriter, r *http.Request) {
+	rs, err := h.svc.AbortE2eeMigration(scopeOf(r))
 	if err != nil {
 		h.e2eeError(w, "e2ee abort", err)
 		return

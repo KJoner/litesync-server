@@ -185,7 +185,7 @@ func TestQuarantinePurgeRespectsRetention(t *testing.T) {
 func TestScrubMarksCorruptBlobUnservable(t *testing.T) {
 	s, blobDir := newServiceAt(t, syncsvc.Options{HistoryEnabled: true, HistoryDays: 90, HistoryMaxPerFile: 10})
 	content := []byte("this content will be corrupted on disk")
-	if _, err := s.Upload(syncsvc.UploadParams{
+	if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "note.md", BaseRevision: 0, ClaimedHash: sha256HexT(content),
 		DeviceID: "test-device", Action: "upsert",
 	}, bytes.NewReader(content)); err != nil {
@@ -193,7 +193,7 @@ func TestScrubMarksCorruptBlobUnservable(t *testing.T) {
 	}
 
 	// 下载此刻是正常的
-	if _, rc, err := s.OpenFile("note.md"); err != nil {
+	if _, rc, err := s.OpenFile(db.LegacyDefaultScope(), "note.md"); err != nil {
 		t.Fatalf("上传后应当可下载: %v", err)
 	} else {
 		rc.Close()
@@ -201,7 +201,7 @@ func TestScrubMarksCorruptBlobUnservable(t *testing.T) {
 
 	// 制造磁盘损坏
 	h := sha256HexT(content)
-	blobID, err := s.BlobIDOf(h)
+	blobID, err := s.BlobIDOf(db.LegacyDefaultScope(), h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestScrubMarksCorruptBlobUnservable(t *testing.T) {
 	}
 
 	// 核心断言：损坏之后绝不能继续返回内容
-	_, rc, err := s.OpenFile("note.md")
+	_, rc, err := s.OpenFile(db.LegacyDefaultScope(), "note.md")
 	if err == nil {
 		rc.Close()
 		t.Fatal("发现损坏后仍然返回了内容——这正是 §7.2 明确禁止的")
@@ -242,7 +242,7 @@ func TestScrubCleanRepository(t *testing.T) {
 	s, _ := newServiceAt(t, syncsvc.Options{HistoryEnabled: true, HistoryDays: 90, HistoryMaxPerFile: 10})
 	for _, body := range []string{"one", "two", "three"} {
 		content := []byte(body)
-		if _, err := s.Upload(syncsvc.UploadParams{
+		if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 			Path: body + ".md", BaseRevision: 0, ClaimedHash: sha256HexT(content),
 			DeviceID: "test-device", Action: "upsert",
 		}, bytes.NewReader(content)); err != nil {

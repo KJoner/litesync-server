@@ -21,8 +21,8 @@ import (
 func (h *handlers) issueAccessToken(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r)
 	if id == nil || id.DeviceID == "" {
-		// 根 Token 不换票：它本来就是全权限的长期凭据，换成短期票没有意义，
-		// 反而会让「根 Token 只应存在于服务器与首台设备」这条约束变模糊
+		// 用户 Token 不换票：它本来就是全权限的长期凭据，换成短期票没有意义，
+		// 反而会让「用户 Token 只应存在于用户手里与首台设备」这条约束变模糊
 		writeErr(w, http.StatusForbidden, "access tokens are issued to devices only")
 		return
 	}
@@ -68,10 +68,10 @@ func (h *handlers) removeMember(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r)
 	var actor syncsvc.Actor
 	if id != nil {
-		actor = syncsvc.Actor{Root: id.Root, DeviceID: id.DeviceID}
+		actor = syncsvc.Actor{Root: id.IsAdmin, UserID: id.UserID, DeviceID: id.DeviceID}
 	}
 
-	rep, err := h.svc.RemoveMember(actor, target)
+	rep, err := h.svc.RemoveMember(scopeOf(r), actor, target)
 	switch {
 	case errors.Is(err, syncsvc.ErrNotAuthorized):
 		writeErr(w, http.StatusForbidden, "owner or admin role required")
@@ -102,7 +102,7 @@ func (h *handlers) removeMember(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/audit?limit=100
 func (h *handlers) auditTrail(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit")) //nolint:errcheck
-	events, err := h.svc.AuditTrail(limit)
+	events, err := h.svc.AuditTrail(scopeOf(r), limit)
 	if err != nil {
 		h.internalError(w, "audit trail", err)
 		return

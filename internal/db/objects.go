@@ -126,23 +126,23 @@ func scanHead(row interface{ Scan(...any) error }) (*ObjectHead, error) {
 }
 
 // GetHead 按身份取当前 HEAD；对象不存在或已删除返回 (nil, nil)。
-func GetHead(q dbtx, fileID string) (*ObjectHead, error) {
+func GetHead(q dbtx, s VaultScope, fileID string) (*ObjectHead, error) {
 	return scanHead(q.QueryRow(
 		`SELECT `+headColumns+` FROM file_heads WHERE vault_id = ? AND file_id = ?`,
-		DefaultVaultID, fileID))
+		s.ID(), fileID))
 }
 
 // GetHeadByPseudonym 按服务器可见寻址名取当前 HEAD。
-func GetHeadByPseudonym(q dbtx, pseudonym string) (*ObjectHead, error) {
+func GetHeadByPseudonym(q dbtx, s VaultScope, pseudonym string) (*ObjectHead, error) {
 	return scanHead(q.QueryRow(
 		`SELECT `+headColumns+` FROM file_heads WHERE vault_id = ? AND pseudonym = ?`,
-		DefaultVaultID, pseudonym))
+		s.ID(), pseudonym))
 }
 
 // ListHeads 返回全部 live 对象（snapshot 用），按 pseudonym 升序。
-func ListHeads(q dbtx) ([]ObjectHead, error) {
+func ListHeads(q dbtx, s VaultScope) ([]ObjectHead, error) {
 	rows, err := q.Query(
-		`SELECT ` + headColumns + ` FROM file_heads WHERE vault_id = '` + DefaultVaultID + `' ORDER BY pseudonym ASC`)
+		`SELECT ` + headColumns + ` FROM file_heads WHERE vault_id = ? ORDER BY pseudonym ASC`, s.ID())
 	if err != nil {
 		return nil, err
 	}
@@ -159,10 +159,9 @@ func ListHeads(q dbtx) ([]ObjectHead, error) {
 }
 
 // UpsertHead 写入/更新 HEAD。
-func UpsertHead(q dbtx, h *ObjectHead) error {
-	if h.VaultID == "" {
-		h.VaultID = DefaultVaultID
-	}
+func UpsertHead(q dbtx, s VaultScope, h *ObjectHead) error {
+	// 归属强制取认证范围：调用方结构体里写什么都不算数（T-1 的写入侧）
+	h.VaultID = s.ID()
 	_, err := q.Exec(
 		`INSERT INTO file_heads (`+headColumns+`)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -187,14 +186,14 @@ func UpsertHead(q dbtx, h *ObjectHead) error {
 }
 
 // DeleteHead 移除 HEAD 行（删除流程：先取出内容写 tombstone，再删这行）。
-func DeleteHead(q dbtx, fileID string) error {
-	_, err := q.Exec(`DELETE FROM file_heads WHERE vault_id = ? AND file_id = ?`, DefaultVaultID, fileID)
+func DeleteHead(q dbtx, s VaultScope, fileID string) error {
+	_, err := q.Exec(`DELETE FROM file_heads WHERE vault_id = ? AND file_id = ?`, s.ID(), fileID)
 	return err
 }
 
 // FindCanonicalCollision 返回与 canonicalKey 冲突的其他 live 对象的 pseudonym；
 // 无冲突返回 ""。meta 模式下 canonicalKey 是客户端 HMAC——服务器不知路径仍能拒绝同名并存。
-func FindCanonicalCollision(q dbtx, canonicalKey, excludeFileID string) (string, error) {
+func FindCanonicalCollision(q dbtx, s VaultScope, canonicalKey, excludeFileID string) (string, error) {
 	if canonicalKey == "" {
 		return "", nil
 	}
@@ -202,7 +201,7 @@ func FindCanonicalCollision(q dbtx, canonicalKey, excludeFileID string) (string,
 	err := q.QueryRow(
 		`SELECT pseudonym FROM file_heads
 		 WHERE vault_id = ? AND canonical_path_hmac = ? AND file_id != ? LIMIT 1`,
-		DefaultVaultID, canonicalKey, excludeFileID,
+		s.ID(), canonicalKey, excludeFileID,
 	).Scan(&pseudonym)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -213,35 +212,35 @@ func FindCanonicalCollision(q dbtx, canonicalKey, excludeFileID string) (string,
 // ---------- 对象台账 ----------
 
 // UpsertObject 写入/更新对象生命周期状态。
-func UpsertObject(q dbtx, fileID, state string, createdAt, deletedAt int64) error {
+func UpsertObject(q dbtx, s VaultScope, fileID, state string, createdAt, deletedAt int64) error {
 	_, err := q.Exec(
 		`INSERT INTO file_objects (vault_id, file_id, created_at, deleted_at, object_state)
 		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id, file_id) DO UPDATE SET
 		   deleted_at = excluded.deleted_at,
 		   object_state = excluded.object_state`,
-		DefaultVaultID, fileID, createdAt, deletedAt, state)
+		s.ID(), fileID, createdAt, deletedAt, state)
 	return err
 }
 
 // ObjectState 返回对象的生命周期状态；对象不存在返回 ""。
-func ObjectState(q dbtx, fileID string) (string, error) {
-	var s string
+func ObjectState(q dbtx, s VaultScope, fileID string) (string, error) {
+	var state string
 	err := q.QueryRow(
 		`SELECT object_state FROM file_objects WHERE vault_id = ? AND file_id = ?`,
-		DefaultVaultID, fileID).Scan(&s)
+		s.ID(), fileID).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
-	return s, err
+	return state, err
 }
 
 // FileIDInUse 判断某 file_id 是否已被任何对象（live 或 deleted）占用。
-func FileIDInUse(q dbtx, fileID string) (bool, error) {
+func FileIDInUse(q dbtx, s VaultScope, fileID string) (bool, error) {
 	var n int64
 	err := q.QueryRow(
 		`SELECT COUNT(*) FROM file_objects WHERE vault_id = ? AND file_id = ?`,
-		DefaultVaultID, fileID).Scan(&n)
+		s.ID(), fileID).Scan(&n)
 	return n > 0, err
 }
 
@@ -268,17 +267,16 @@ func scanTombstone(row interface{ Scan(...any) error }) (*Tombstone, error) {
 }
 
 // DeleteProofOf 计算不可逆删除证明（仅用于擦除报告与审计，不参与任何安全判断）。
-func DeleteProofOf(fileID string, deletionRevision int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("litesync/v6/tombstone:%s:%s:%d", DefaultVaultID, fileID, deletionRevision)))
+func DeleteProofOf(s VaultScope, fileID string, deletionRevision int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("litesync/v6/tombstone:%s:%s:%d", s.ID(), fileID, deletionRevision)))
 	return hex.EncodeToString(sum[:])
 }
 
-func UpsertTombstone(q dbtx, t *Tombstone) error {
-	if t.VaultID == "" {
-		t.VaultID = DefaultVaultID
-	}
+func UpsertTombstone(q dbtx, s VaultScope, t *Tombstone) error {
+	// 归属强制取认证范围：调用方结构体里写什么都不算数（T-1 的写入侧）
+	t.VaultID = s.ID()
 	if t.DeleteProof == "" {
-		t.DeleteProof = DeleteProofOf(t.FileID, t.DeletionRevision)
+		t.DeleteProof = DeleteProofOf(s, t.FileID, t.DeletionRevision)
 	}
 	needsReview := 0
 	if t.NeedsReview {
@@ -306,36 +304,36 @@ func UpsertTombstone(q dbtx, t *Tombstone) error {
 	return err
 }
 
-func GetTombstone(q dbtx, fileID string) (*Tombstone, error) {
+func GetTombstone(q dbtx, s VaultScope, fileID string) (*Tombstone, error) {
 	return scanTombstone(q.QueryRow(
 		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND file_id = ?`,
-		DefaultVaultID, fileID))
+		s.ID(), fileID))
 }
 
 // GetTombstoneByPseudonym 按最后可见寻址名查 tombstone（旧设备按旧名字上传时用）。
-func GetTombstoneByPseudonym(q dbtx, pseudonym string) (*Tombstone, error) {
+func GetTombstoneByPseudonym(q dbtx, s VaultScope, pseudonym string) (*Tombstone, error) {
 	// 同一个名字可能对应多条删除记录（删除后经改名重用、再删除）：
 	// 取删除 revision 最大的一条——base-0 冲突要锚定的是最近一次删除
 	return scanTombstone(q.QueryRow(
 		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND last_pseudonym = ?
 		 ORDER BY deletion_revision DESC LIMIT 1`,
-		DefaultVaultID, pseudonym))
+		s.ID(), pseudonym))
 }
 
 // GetTombstoneByCanonical 按同名判定键查 tombstone（防止用不同大小写复活已删文件）。
-func GetTombstoneByCanonical(q dbtx, canonicalKey string) (*Tombstone, error) {
+func GetTombstoneByCanonical(q dbtx, s VaultScope, canonicalKey string) (*Tombstone, error) {
 	if canonicalKey == "" {
 		return nil, nil
 	}
 	return scanTombstone(q.QueryRow(
 		`SELECT `+tombstoneColumns+` FROM tombstones WHERE vault_id = ? AND canonical_path_hmac = ?
 		 ORDER BY deletion_revision DESC LIMIT 1`,
-		DefaultVaultID, canonicalKey))
+		s.ID(), canonicalKey))
 }
 
 // ListTombstones 返回全部删除记录。
-func ListTombstones(q dbtx) ([]Tombstone, error) {
-	rows, err := q.Query(`SELECT ` + tombstoneColumns + ` FROM tombstones WHERE vault_id = '` + DefaultVaultID + `'`)
+func ListTombstones(q dbtx, s VaultScope) ([]Tombstone, error) {
+	rows, err := q.Query(`SELECT ` + tombstoneColumns + ` FROM tombstones WHERE vault_id = ?`, s.ID())
 	if err != nil {
 		return nil, err
 	}
@@ -353,18 +351,18 @@ func ListTombstones(q dbtx) ([]Tombstone, error) {
 
 // PlaintextTombstoneCount 返回仍带明文寻址名的 tombstone 数量
 // （`last_pseudonym != file_id` 即尚未转换为隐私格式）。
-func PlaintextTombstoneCount(q dbtx) (int64, error) {
+func PlaintextTombstoneCount(q dbtx, s VaultScope) (int64, error) {
 	var n int64
 	err := q.QueryRow(
 		`SELECT COUNT(*) FROM tombstones WHERE vault_id = ? AND last_pseudonym != file_id`,
-		DefaultVaultID).Scan(&n)
+		s.ID()).Scan(&n)
 	return n, err
 }
 
 // ConvertTombstoneToPrivate 把 tombstone 转成隐私格式（ADR-002 §3.2）：
 // 明文寻址名换成 file_id，归一化路径换成客户端 HMAC。删除屏障本身完全保留。
-func ConvertTombstoneToPrivate(q dbtx, fileID, canonicalHash string) error {
-	t, err := GetTombstone(q, fileID)
+func ConvertTombstoneToPrivate(q dbtx, s VaultScope, fileID, canonicalHash string) error {
+	t, err := GetTombstone(q, s, fileID)
 	if err != nil {
 		return err
 	}
@@ -377,13 +375,13 @@ func ConvertTombstoneToPrivate(q dbtx, fileID, canonicalHash string) error {
 		        canonical_path_hmac = ?,
 		        delete_proof = ?
 		  WHERE vault_id = ? AND file_id = ?`,
-		canonicalHash, DeleteProofOf(fileID, t.DeletionRevision), DefaultVaultID, fileID)
+		canonicalHash, DeleteProofOf(s, fileID, t.DeletionRevision), s.ID(), fileID)
 	return err
 }
 
 // RemoveTombstone 删除一条 tombstone（仅用于恢复流程与经双条件确认的清理）。
-func RemoveTombstone(q dbtx, fileID string) error {
-	_, err := q.Exec(`DELETE FROM tombstones WHERE vault_id = ? AND file_id = ?`, DefaultVaultID, fileID)
+func RemoveTombstone(q dbtx, s VaultScope, fileID string) error {
+	_, err := q.Exec(`DELETE FROM tombstones WHERE vault_id = ? AND file_id = ?`, s.ID(), fileID)
 	return err
 }
 
@@ -411,10 +409,9 @@ const versionSelect = `SELECT id, vault_id, file_id, revision, content_generatio
 
 // InsertVersion 追加历史版本。同 (file_id, revision) 重复插入是幂等的
 // （重试与响应丢失后的重放不会产生重复历史，ADR-001 §4）。
-func InsertVersion(q dbtx, v *ObjectVersion) error {
-	if v.VaultID == "" {
-		v.VaultID = DefaultVaultID
-	}
+func InsertVersion(q dbtx, s VaultScope, v *ObjectVersion) error {
+	// 归属强制取认证范围：调用方结构体里写什么都不算数（T-1 的写入侧）
+	v.VaultID = s.ID()
 	_, err := q.Exec(
 		`INSERT INTO object_versions (`+versionColumns+`)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -425,9 +422,9 @@ func InsertVersion(q dbtx, v *ObjectVersion) error {
 }
 
 // ListVersions 按 revision 降序返回某对象的全部历史版本。
-func ListVersions(q dbtx, fileID string) ([]ObjectVersion, error) {
+func ListVersions(q dbtx, s VaultScope, fileID string) ([]ObjectVersion, error) {
 	rows, err := q.Query(versionSelect+` WHERE vault_id = ? AND file_id = ? ORDER BY revision DESC`,
-		DefaultVaultID, fileID)
+		s.ID(), fileID)
 	if err != nil {
 		return nil, err
 	}
@@ -444,18 +441,18 @@ func ListVersions(q dbtx, fileID string) ([]ObjectVersion, error) {
 }
 
 // GetVersion 返回某对象某 revision 的版本；不存在返回 (nil, nil)。
-func GetVersion(q dbtx, fileID string, revision int64) (*ObjectVersion, error) {
+func GetVersion(q dbtx, s VaultScope, fileID string, revision int64) (*ObjectVersion, error) {
 	return scanVersion(q.QueryRow(versionSelect+` WHERE vault_id = ? AND file_id = ? AND revision = ?`,
-		DefaultVaultID, fileID, revision))
+		s.ID(), fileID, revision))
 }
 
 // PriorContentHash 返回该对象最近一个有内容版本的 hash（陈旧副本复活判定用）。
-func PriorContentHash(q dbtx, fileID string) (string, error) {
+func PriorContentHash(q dbtx, s VaultScope, fileID string) (string, error) {
 	var h string
 	err := q.QueryRow(
 		`SELECT content_hash FROM object_versions
 		 WHERE vault_id = ? AND file_id = ? AND action != 'delete' AND COALESCE(content_hash,'') != ''
-		 ORDER BY revision DESC LIMIT 1`, DefaultVaultID, fileID,
+		 ORDER BY revision DESC LIMIT 1`, s.ID(), fileID,
 	).Scan(&h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -475,8 +472,8 @@ func BlobReferenced(q dbtx, blobID string) (bool, error) {
 }
 
 // DistinctVersionFileIDs 返回拥有历史版本的全部对象身份（维护任务用）。
-func DistinctVersionFileIDs(q dbtx) ([]string, error) {
-	rows, err := q.Query(`SELECT DISTINCT file_id FROM object_versions WHERE vault_id = ?`, DefaultVaultID)
+func DistinctVersionFileIDs(q dbtx, s VaultScope) ([]string, error) {
+	rows, err := q.Query(`SELECT DISTINCT file_id FROM object_versions WHERE vault_id = ?`, s.ID())
 	if err != nil {
 		return nil, err
 	}
@@ -528,14 +525,13 @@ func OldestNonHeadVersions(q dbtx, limit int) ([]ObjectVersion, error) {
 
 // InsertChange 追加一条变更并返回其 sequence。
 // sequence 由 repo_state.head_sequence 在同一事务内分配（全局时钟，INV-02）。
-func InsertChange(q dbtx, c *ObjectChange) (int64, error) {
-	seq, err := NextSequence(q, LegacyDefaultScope())
+func InsertChange(q dbtx, s VaultScope, c *ObjectChange) (int64, error) {
+	seq, err := NextSequence(q, s)
 	if err != nil {
 		return 0, err
 	}
-	if c.VaultID == "" {
-		c.VaultID = DefaultVaultID
-	}
+	// 归属强制取认证范围：调用方结构体里写什么都不算数（T-1 的写入侧）
+	c.VaultID = s.ID()
 	_, err = q.Exec(
 		`INSERT INTO object_changes (sequence, vault_id, file_id, action, revision, content_generation,
 			meta_generation, pseudonym, content_hash, operation_id, created_at)
@@ -549,12 +545,12 @@ func InsertChange(q dbtx, c *ObjectChange) (int64, error) {
 }
 
 // ListChanges 返回 sequence > since 的变更，升序，最多 limit 条。
-func ListChanges(q dbtx, since, limit int64) ([]ObjectChange, error) {
+func ListChanges(q dbtx, s VaultScope, since, limit int64) ([]ObjectChange, error) {
 	rows, err := q.Query(
 		`SELECT sequence, vault_id, file_id, action, revision, content_generation, meta_generation,
 		        pseudonym, COALESCE(content_hash,''), COALESCE(operation_id,''), created_at
 		 FROM object_changes WHERE vault_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?`,
-		DefaultVaultID, since, limit)
+		s.ID(), since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -573,16 +569,16 @@ func ListChanges(q dbtx, since, limit int64) ([]ObjectChange, error) {
 }
 
 // LastSequenceForFile 返回某对象最近一次变更的 sequence，没有记录时为 0。
-func LastSequenceForFile(q dbtx, fileID string) (int64, error) {
+func LastSequenceForFile(q dbtx, s VaultScope, fileID string) (int64, error) {
 	var seq int64
 	err := q.QueryRow(
 		`SELECT COALESCE(MAX(sequence), 0) FROM object_changes WHERE vault_id = ? AND file_id = ?`,
-		DefaultVaultID, fileID).Scan(&seq)
+		s.ID(), fileID).Scan(&seq)
 	return seq, err
 }
 
 // FindChangeByOperation 按幂等键查已提交的变更（响应丢失后重试用）。
-func FindChangeByOperation(q dbtx, fileID, operationID string) (*ObjectChange, error) {
+func FindChangeByOperation(q dbtx, s VaultScope, fileID, operationID string) (*ObjectChange, error) {
 	if operationID == "" {
 		return nil, nil
 	}
@@ -591,7 +587,7 @@ func FindChangeByOperation(q dbtx, fileID, operationID string) (*ObjectChange, e
 		`SELECT sequence, vault_id, file_id, action, revision, content_generation, meta_generation,
 		        pseudonym, COALESCE(content_hash,''), COALESCE(operation_id,''), created_at
 		 FROM object_changes WHERE vault_id = ? AND file_id = ? AND operation_id = ? LIMIT 1`,
-		DefaultVaultID, fileID, operationID).Scan(&c.Sequence, &c.VaultID, &c.FileID, &c.Action,
+		s.ID(), fileID, operationID).Scan(&c.Sequence, &c.VaultID, &c.FileID, &c.Action,
 		&c.Revision, &c.ContentGeneration, &c.MetaGeneration, &c.Pseudonym, &c.ContentHash,
 		&c.OperationID, &c.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {

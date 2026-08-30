@@ -57,10 +57,10 @@ func seedBlobs(t *testing.T, d *sql.DB, blobs *storage.BlobStore, n int) (secret
 			t.Fatal(err)
 		}
 		fileID := fmt.Sprintf("%032x", i+1)
-		if err := db.UpsertObject(d, fileID, db.ObjectLive, 0, 0); err != nil {
+		if err := db.UpsertObject(d, db.LegacyDefaultScope(), fileID, db.ObjectLive, 0, 0); err != nil {
 			t.Fatal(err)
 		}
-		if err := db.UpsertHead(d, &db.ObjectHead{
+		if err := db.UpsertHead(d, db.LegacyDefaultScope(), &db.ObjectHead{
 			VaultID: db.DefaultVaultID, FileID: fileID, Pseudonym: fileID,
 			Revision: 1, BlobID: h, ContentHash: h, Size: int64(len(content)),
 		}); err != nil {

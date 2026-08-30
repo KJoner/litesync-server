@@ -69,11 +69,14 @@ func InsertDevice(q dbtx, d *Device) error {
 	if d.Revoked {
 		revoked = 1
 	}
+	// 归属兜底：单用户语境下「未指明归属的设备属于 default vault 的管理员」
+	// 是正确语义；多用户路径（v0.18 起）都会显式带上 (vault, user)。
+	// 没有这条绑定，「重置 Token / 移除成员时撤销他的设备」无从谈起。
 	_, err := q.Exec(
 		`INSERT INTO devices (id, name, token_hash, scopes, created_at, last_seen_at, revoked, vault_id, user_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.DeviceID, d.Name, d.TokenHash, d.Scopes, d.CreatedAt, d.LastSeenAt, revoked,
-		defaultIfEmpty(d.VaultID, DefaultVaultID), d.UserID,
+		defaultIfEmpty(d.VaultID, DefaultVaultID), defaultIfEmpty(d.UserID, AdminUserID),
 	)
 	return err
 }
@@ -89,6 +92,35 @@ func GetDeviceByTokenHash(q dbtx, tokenHash string) (*Device, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+// MinAckedSequence 返回某 Vault 全部未撤销设备中最小的已确认 sequence，
+// 以及设备数量（tombstone 双条件清理用；0 台设备时无法证明安全，调用方跳过）。
+func MinAckedSequence(q dbtx, s VaultScope) (int64, int, error) {
+	if !s.Valid() {
+		return 0, 0, ErrVaultScopeMissing
+	}
+	rows, err := q.Query(`SELECT last_acked_sequence FROM devices WHERE revoked = 0 AND vault_id = ?`, s.ID())
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	minAcked := int64(-1)
+	count := 0
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			return 0, 0, err
+		}
+		count++
+		if minAcked < 0 || v < minAcked {
+			minAcked = v
+		}
+	}
+	if minAcked < 0 {
+		minAcked = 0
+	}
+	return minAcked, count, rows.Err()
 }
 
 func ListDevices(q dbtx) ([]Device, error) {
@@ -124,31 +156,47 @@ func TouchDevice(q dbtx, deviceID string, now int64) error {
 }
 
 // InsertEnrollment 保存一次性注册凭据（只存 hash）。
-func InsertEnrollment(q dbtx, id, secretHash, scopes string, now, expiresAt int64) error {
+func InsertEnrollment(q dbtx, id, secretHash, scopes string, now, expiresAt int64, vaultID, userID string) error {
 	_, err := q.Exec(
-		`INSERT INTO enrollments (id, secret_hash, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO enrollments (id, secret_hash, scopes, created_at, expires_at, vault_id, user_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		id, secretHash, scopes, now, expiresAt,
+		defaultIfEmpty(vaultID, DefaultVaultID), defaultIfEmpty(userID, AdminUserID),
 	)
 	return err
 }
 
-// ConsumeEnrollment 原子消费注册凭据（一次性）：有效则标记 consumed 并返回 scopes。
-// 不存在 / 已消费 / 已过期返回 ("", false, nil)。
-func ConsumeEnrollment(q dbtx, secretHash string, now int64) (string, bool, error) {
-	var scopes string
+// EnrollmentGrant 是一次性注册凭据兑现的内容：新设备将获得的 scopes 与归属。
+// 归属在**创建邀请/配对包时**就定死（v0.18）——消费方无法声称自己属于别的租户。
+type EnrollmentGrant struct {
+	Scopes  string
+	VaultID string
+	UserID  string
+}
+
+// ConsumeEnrollment 原子消费注册凭据（一次性）：有效则标记 consumed 并返回授予内容。
+// 不存在 / 已消费 / 已过期返回 (nil, nil)。
+func ConsumeEnrollment(q dbtx, secretHash string, now int64) (*EnrollmentGrant, error) {
+	g := &EnrollmentGrant{}
 	err := q.QueryRow(
 		`UPDATE enrollments SET consumed_at = ?
 		 WHERE secret_hash = ? AND consumed_at = 0 AND expires_at > ?
-		 RETURNING scopes`,
+		 RETURNING scopes, vault_id, user_id`,
 		now, secretHash, now,
-	).Scan(&scopes)
+	).Scan(&g.Scopes, &g.VaultID, &g.UserID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
-	return scopes, true, nil
+	if g.VaultID == "" {
+		g.VaultID = DefaultVaultID
+	}
+	if g.UserID == "" {
+		g.UserID = AdminUserID
+	}
+	return g, nil
 }
 
 // PruneEnrollments 清理已过期或已消费超过一天的注册凭据。

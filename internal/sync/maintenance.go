@@ -61,6 +61,9 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 	if _, err := s.maintainEnrollments(now); err != nil {
 		s.log.Warn("maintenance: enrollments", "error", err)
 	}
+	if _, err := db.PruneInvites(s.db, now); err != nil {
+		s.log.Warn("maintenance: invites", "error", err)
+	}
 	// tombstone 清理走双条件（时间 + 全部未撤销设备已确认越过删除点）；
 	// 默认配置下 TombstoneRetentionDays = 0，这里永远是 no-op（ADR-002 §3.4）
 	if n, err := s.PurgeTombstones(now); err != nil {
@@ -114,12 +117,22 @@ func (s *Service) maintainIntegrity() (int, error) {
 		s.log.Error("integrity: sqlite quick_check failed", "result", check)
 	}
 
-	s.mu.Lock()
-	heads, err := db.ListHeads(s.db)
-	s.mu.Unlock()
+	// v0.18：scrub 覆盖全部 Vault 的 HEAD
+	scopes, err := db.AllVaultScopes(s.db)
 	if err != nil {
 		return issues, err
 	}
+	var heads []db.ObjectHead
+	s.mu.Lock()
+	for _, sc := range scopes {
+		hs, herr := db.ListHeads(s.db, sc)
+		if herr != nil {
+			s.mu.Unlock()
+			return issues, herr
+		}
+		heads = append(heads, hs...)
+	}
+	s.mu.Unlock()
 
 	// 日志隐私（ADR-008 §3.5）：只输出截断的 fileId，绝不输出路径
 	for i := range heads {
@@ -169,11 +182,28 @@ func (s *Service) maintainHistoryRetention(now int64) (int, error) {
 	if !s.opts.HistoryEnabled {
 		return 0, nil
 	}
-	fileIDs, err := db.DistinctVersionFileIDs(s.db)
+	// v0.18：按 Vault 遍历——保留策略与 meta 状态都是每个租户自己的
+	scopes, err := db.AllVaultScopes(s.db)
 	if err != nil {
 		return 0, err
 	}
-	rs, err := db.GetRepoState(s.db, s.scope())
+	pruned := 0
+	for _, scope := range scopes {
+		n, err := s.maintainHistoryRetentionVault(scope, now)
+		pruned += n
+		if err != nil {
+			return pruned, err
+		}
+	}
+	return pruned, nil
+}
+
+func (s *Service) maintainHistoryRetentionVault(scope db.VaultScope, now int64) (int, error) {
+	fileIDs, err := db.DistinctVersionFileIDs(s.db, scope)
+	if err != nil {
+		return 0, err
+	}
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -189,11 +219,11 @@ func (s *Service) maintainHistoryRetention(now int64) (int, error) {
 		// 注意：这里必须用 tx 而不是 s.db——连接池上限是 1，事务开着时
 		// 任何走 s.db 的查询都会永远等待那条被占用的连接（死锁）
 		pseudonym := fileID
-		if h, herr := db.GetHead(tx, fileID); herr == nil && h != nil {
+		if h, herr := db.GetHead(tx, scope, fileID); herr == nil && h != nil {
 			pseudonym = h.Pseudonym
 		}
-		days, maxPerFile := s.retentionFor(tx, rs.MetaState, pseudonym)
-		blobs, err := s.pruneVersionsTx(tx, fileID, now, days, maxPerFile)
+		days, maxPerFile := s.retentionFor(tx, scope, rs.MetaState, pseudonym)
+		blobs, err := s.pruneVersionsTx(tx, scope, fileID, now, days, maxPerFile)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck
 			s.mu.Unlock()
@@ -345,11 +375,12 @@ func (s *Service) gcBlockedReason() (bool, string) {
 	if n := s.busyOps.Load(); n > 0 {
 		return true, "scrub-or-backup-running"
 	}
-	rs, err := db.GetRepoState(s.db, s.scope())
+	// v0.18：任何一个 Vault 在迁移中，全实例的「无引用」判断都不可信
+	migrating, err := db.AnyVaultMigrating(s.db)
 	if err != nil {
 		return true, "repo-state-unavailable" // 读不到状态就别动数据
 	}
-	if rs.MetaState != db.MetaPlain && rs.MetaState != db.MetaEncrypted {
+	if migrating {
 		return true, "migration-in-progress"
 	}
 	return false, ""
@@ -357,7 +388,7 @@ func (s *Service) gcBlockedReason() (bool, string) {
 
 // maintainShares：删除已过期分享的密文；清理 30 天前失效（撤销/过期）的元数据。
 func (s *Service) maintainShares(now int64) (int, error) {
-	shares, err := db.ListShares(s.db)
+	shares, err := db.AdminListShares(s.db)
 	if err != nil {
 		return 0, err
 	}
@@ -394,59 +425,48 @@ func (s *Service) maintainChanges(now int64) (int64, error) {
 	if s.opts.ChangesDays <= 0 && s.opts.ChangesMax <= 0 {
 		return 0, nil
 	}
+	// v0.18：sequence 空间是每 Vault 独立的（repo_state 按 Vault 分行），
+	// 裁剪与水位线推进必须按 Vault 进行——按全表 sequence 裁剪会拿着一个
+	// 租户的水位线删掉别人的低序号变更
+	scopes, err := db.AllVaultScopes(s.db)
+	if err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	deleteUpTo := int64(0)
+	total := int64(0)
+	cutoff := int64(0)
 	if s.opts.ChangesDays > 0 {
-		cutoff := now - int64(s.opts.ChangesDays)*86400
-		var seq int64
-		if err := s.db.QueryRow(
-			`SELECT COALESCE(MAX(sequence), 0) FROM object_changes WHERE created_at < ?`, cutoff,
-		).Scan(&seq); err != nil {
-			return 0, err
+		cutoff = now - int64(s.opts.ChangesDays)*86400
+	}
+	for _, scope := range scopes {
+		deleteUpTo, err := db.ChangesPruneCandidate(s.db, scope, cutoff, int64(s.opts.ChangesMax))
+		if err != nil {
+			return total, err
 		}
-		deleteUpTo = seq
-	}
-	if s.opts.ChangesMax > 0 {
-		var count int64
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM object_changes`).Scan(&count); err != nil {
-			return 0, err
+		if deleteUpTo == 0 {
+			continue
 		}
-		if count > int64(s.opts.ChangesMax) {
-			var seq int64
-			if err := s.db.QueryRow(
-				`SELECT sequence FROM object_changes ORDER BY sequence DESC LIMIT 1 OFFSET ?`, s.opts.ChangesMax,
-			).Scan(&seq); err != nil {
-				return 0, err
-			}
-			if seq > deleteUpTo {
-				deleteUpTo = seq
-			}
+		tx, err := s.db.Begin()
+		if err != nil {
+			return total, err
 		}
+		n, err := db.DeleteChangesUpTo(tx, scope, deleteUpTo)
+		if err != nil {
+			tx.Rollback() //nolint:errcheck
+			return total, err
+		}
+		// 水位线记录在 repo_state（v9），与删除同一事务提交，且只增不减
+		if err := db.SetMinRetainedSequence(tx, scope, deleteUpTo); err != nil {
+			tx.Rollback() //nolint:errcheck
+			return total, err
+		}
+		if err := tx.Commit(); err != nil {
+			return total, err
+		}
+		total += n
 	}
-	if deleteUpTo == 0 {
-		return 0, nil
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback() //nolint:errcheck
-	res, err := tx.Exec(`DELETE FROM object_changes WHERE sequence <= ?`, deleteUpTo)
-	if err != nil {
-		return 0, err
-	}
-	// 水位线记录在 repo_state（v9），与删除同一事务提交，且只增不减
-	if err := db.SetMinRetainedSequence(tx, s.scope(), deleteUpTo); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected() //nolint:errcheck
-	return n, nil
+	return total, nil
 }
 
 // maintainSQLite：WAL checkpoint；freelist 明显偏大时低频 VACUUM。

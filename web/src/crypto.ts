@@ -250,6 +250,28 @@ export async function deriveMetaKeys(vmkRaw: Uint8Array): Promise<MetaKeys> {
 	return { enc };
 }
 
+/**
+ * 从 VMK 派生重置凭证（v0.18 / v11 设计 §3.1，与插件同源参数）。
+ *
+ * 它把「知道 E2EE 密码」从前端关卡升级为**重置 Token 端点的服务端硬关卡**：
+ * 服务端存 SHA-256(该值)，重置请求必须提交原值。只持有 API Token 的攻击者
+ * 派生不出它，抢不走重置权。HKDF 单向：服务端拿到它也推不回 VMK。
+ */
+export async function deriveResetAuth(vmkRaw: Uint8Array): Promise<string> {
+	const master = await crypto.subtle.importKey("raw", vmkRaw as BufferSource, "HKDF", false, ["deriveBits"]);
+	const bits = await crypto.subtle.deriveBits(
+		{
+			name: "HKDF",
+			hash: "SHA-256",
+			salt: new Uint8Array(32) as BufferSource,
+			info: new TextEncoder().encode("litesync/v1/token-reset-auth") as BufferSource,
+		},
+		master,
+		256,
+	);
+	return Array.from(new Uint8Array(bits)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** LSM1 解密：返回 { path, metaGeneration }；失败返回 null。 */
 export async function decryptMeta(
 	keys: MetaKeys,

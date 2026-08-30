@@ -55,12 +55,36 @@ export async function login(token: string, admin = false): Promise<boolean> {
 	return res.ok;
 }
 
+/** 名下仓库（v0.19 多仓库）。 */
+export interface WebVault {
+	id: string;
+	name: string;
+	fileCount: number;
+	bytesUsed: number;
+	encryptionState: string;
+	current: boolean;
+}
+
+/** 当前会话的身份（v0.18 多用户）：前端据此渲染角色相关 UI；硬关卡在服务端。 */
+export interface Whoami {
+	role: "admin" | "user";
+	name: string;
+	userId?: string;
+}
+
 export async function logout(): Promise<void> {
 	await fetch("/web/session", { method: "DELETE" }).catch(() => undefined);
 }
 
 export class Api {
+	/** 目标仓库（v0.19 多仓库；空 = 默认仓库）。设置后所有请求携带 X-Vault-ID */
+	vaultId = "";
+
 	private async req(path: string, init?: RequestInit): Promise<Response> {
+		if (this.vaultId) {
+			init = init ?? {};
+			init.headers = { ...(init.headers as Record<string, string> | undefined), "X-Vault-ID": this.vaultId };
+		}
 		const res = await fetch(path, init);
 		if (res.status === 401 || res.status === 403) throw new AuthError();
 		// §7.2 / §7.5：服务器明确说「这份内容坏了」时要单独成一类错误。
@@ -82,10 +106,62 @@ export class Api {
 		metaState?: string;
 		formatEpoch?: number;
 		repoEpoch?: string;
+		/** 重置凭证是否已登记（v0.18）：false 时解锁后自动补登记 */
+		resetAuthConfigured?: boolean;
 	}> {
 		const res = await this.req("/api/v1/info");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		return res.json();
+	}
+
+	/** 名下仓库列表（v0.19 多仓库）。旧服务器无此端点时返回空数组。 */
+	async listVaults(): Promise<WebVault[]> {
+		try {
+			const res = await this.req("/api/v1/vaults");
+			if (!res.ok) return [];
+			return ((await res.json()).vaults ?? []) as WebVault[];
+		} catch {
+			return [];
+		}
+	}
+
+	async whoami(): Promise<Whoami> {
+		const res = await this.req("/api/v1/whoami");
+		if (!res.ok) throw new Error(`whoami: HTTP ${res.status}`);
+		return res.json();
+	}
+
+	/**
+	 * 重置自己的 API Token（v0.18 / v11 设计 §4.3）。
+	 * resetAuth 是解锁 E2EE 时派生的重置凭证；已登记而不提交（或不符）→ 403。
+	 * 成功后旧 Token 全线失效、全部设备凭据被撤销；发起会话由服务端保活。
+	 */
+	async resetToken(resetAuth: string): Promise<{
+		token: string;
+		revokedDevices: number;
+		resetAuthEnforced: boolean;
+	}> {
+		const res = await this.req("/api/v1/account/token-reset", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ resetAuth }),
+		});
+		const body = await res.json();
+		if (!res.ok) {
+			throw new Error(body.code === "RESET_AUTH_MISMATCH"
+				? "重置凭证不匹配：请先用正确的 E2EE 密码解锁后再试"
+				: (body.message ?? `HTTP ${res.status}`));
+		}
+		return body;
+	}
+
+	/** 登记重置凭证（幂等；已登记不同值时服务端 409，忽略即可）。 */
+	async putResetAuth(resetAuth: string): Promise<void> {
+		await this.req("/api/v1/vault/reset-auth", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ resetAuth }),
+		}).catch(() => undefined);
 	}
 
 	async snapshot(): Promise<{ sequence: number; files: FileEntry[] }> {
@@ -249,6 +325,81 @@ export class Api {
 	backupSnapshots(): Promise<{ snapshots: BackupSnapshot[]; initialized: boolean }> {
 		return this.adminReq("snapshots") as Promise<{ snapshots: BackupSnapshot[]; initialized: boolean }>;
 	}
+
+	// ---------- 多用户管理（v0.18，仅管理员） ----------
+
+	async createInvite(expiresHours: number, serverUrl: string): Promise<AdminInvite & { secret: string; path: string }> {
+		const res = await this.req("/api/v1/admin/invites", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ expiresHours, serverUrl }),
+		});
+		if (!res.ok) throw new Error(`invite: HTTP ${res.status}`);
+		return res.json();
+	}
+
+	async listInvites(): Promise<AdminInvite[]> {
+		const res = await this.req("/api/v1/admin/invites");
+		if (!res.ok) throw new Error(`invites: HTTP ${res.status}`);
+		return (await res.json()).invites ?? [];
+	}
+
+	async revokeInvite(id: string): Promise<void> {
+		const res = await this.req(`/api/v1/admin/invites/${encodeURIComponent(id)}`, { method: "DELETE" });
+		if (!res.ok) throw new Error(`revoke invite: HTTP ${res.status}`);
+	}
+
+	async listUsers(): Promise<AdminUser[]> {
+		const res = await this.req("/api/v1/admin/users");
+		if (!res.ok) throw new Error(`users: HTTP ${res.status}`);
+		return (await res.json()).users ?? [];
+	}
+
+	async setUserDisabled(userId: string, disabled: boolean): Promise<void> {
+		const res = await this.req(
+			`/api/v1/admin/users/${encodeURIComponent(userId)}/${disabled ? "disable" : "enable"}`,
+			{ method: "POST" });
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({} as { message?: string }));
+			throw new Error(body.message ?? `HTTP ${res.status}`);
+		}
+	}
+
+	async deleteUser(userId: string, confirmName: string): Promise<void> {
+		const res = await this.req(`/api/v1/admin/users/${encodeURIComponent(userId)}`, {
+			method: "DELETE",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ confirmName }),
+		});
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({} as { message?: string }));
+			throw new Error(body.message ?? `HTTP ${res.status}`);
+		}
+	}
+}
+
+/** 邀请（v0.18）：secret 只在创建响应里出现一次。 */
+export interface AdminInvite {
+	id: string;
+	serverUrl: string;
+	createdAt: number;
+	expiresAt: number;
+	usedAt?: number;
+	usedBy?: string;
+	revoked?: boolean;
+}
+
+/** 用户概要（v0.18）：不含任何凭据材料。 */
+export interface AdminUser {
+	userId: string;
+	name: string;
+	isAdmin: boolean;
+	disabled: boolean;
+	createdAt: number;
+	lastSeenAt: number;
+	devices: number;
+	objects: number;
+	bytesUsed: number;
 }
 
 export interface BackupStatus {

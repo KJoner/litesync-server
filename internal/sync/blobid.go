@@ -34,6 +34,8 @@ func (s *Service) NeedsBlobIDMigration() (bool, error) {
 // 全程持 s.mu 并计入 busyOps：迁移在移动 blob，此时跑 GC 或 scrub 会得出
 // 「blob 不见了」的错误结论。
 func (s *Service) MigrateBlobIDs(confirm bool) (*db.BlobIDMigrationReport, error) {
+	// 单用户遗留 CLI：blobid 迁移目前只作用于 default vault（多 Vault 版本要求 --vault）
+	scope := s.defaultScope()
 	secret, err := s.vaultSecret()
 	if err != nil {
 		return nil, err
@@ -44,7 +46,7 @@ func (s *Service) MigrateBlobIDs(confirm bool) (*db.BlobIDMigrationReport, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rep, err := db.MigrateBlobIDs(s.db, s.scope(), secret, s.blobs, confirm, s.log)
+	rep, err := db.MigrateBlobIDs(s.db, scope, secret, s.blobs, confirm, s.log)
 	if err != nil {
 		return rep, err
 	}
@@ -59,6 +61,6 @@ func (s *Service) MigrateBlobIDs(confirm bool) (*db.BlobIDMigrationReport, error
 // 给运维工具和测试用：域化之后不能再拿内容哈希拼路径了。
 // 它不泄露 secret 本身，但**绝不可以接到任何 HTTP 处理器上**——
 // 能问出别的 Vault 的 blobID，就等于把 §10.3 关掉的那个存在性预言机重新打开。
-func (s *Service) BlobIDOf(contentHash string) (string, error) {
-	return s.blobIDOf(contentHash)
+func (s *Service) BlobIDOf(scope db.VaultScope, contentHash string) (string, error) {
+	return s.blobIDOf(scope, contentHash)
 }

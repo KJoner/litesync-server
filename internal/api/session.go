@@ -2,7 +2,6 @@ package api
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -28,9 +27,20 @@ const (
 	adminTTL          = 30 * time.Minute // Admin 会话短期有效
 )
 
+// sessionInfo 记录一个网页会话的归属（v0.18 多用户化）。
+//
+// tokenGeneration 是会话创建时用户的 Token 世代：Token 轮换会把 users 表里的
+// 世代 +1，authGate 每次校验会话时比对——不一致即拒。这样「重置 Token 作废
+// 全部会话」不依赖遍历内存 map，CLI 兜底（另一个进程）改库同样立即生效。
 type sessionInfo struct {
 	expires time.Time
-	admin   bool
+	admin   bool // admin 提升会话（30 分钟 cookie），区别于「用户是管理员」
+	userID  string
+	name    string
+	isAdmin bool // 用户本身是否实例管理员
+	vaultID string
+	// tokenGeneration：创建会话时的用户 Token 世代
+	tokenGeneration int64
 }
 
 type sessionStore struct {
@@ -42,48 +52,70 @@ func newSessionStore() *sessionStore {
 	return &sessionStore{sessions: map[string]sessionInfo{}}
 }
 
-func (s *sessionStore) create(admin bool) string {
+func (s *sessionStore) create(info sessionInfo) string {
 	b := make([]byte, 32)
 	rand.Read(b) //nolint:errcheck
 	id := hex.EncodeToString(b)
 	ttl := sessionTTL
-	if admin {
+	if info.admin {
 		ttl = adminTTL
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 顺手清理过期会话
 	now := time.Now()
-	for k, info := range s.sessions {
-		if now.After(info.expires) {
+	for k, old := range s.sessions {
+		if now.After(old.expires) {
 			delete(s.sessions, k)
 		}
 	}
-	s.sessions[id] = sessionInfo{expires: now.Add(ttl), admin: admin}
+	info.expires = now.Add(ttl)
+	s.sessions[id] = info
 	return id
 }
 
-func (s *sessionStore) lookup(id string, wantAdmin bool) bool {
+// lookup 返回会话信息；过期或提升级别不符返回 ok=false。
+// 注意这里**不做** Token 世代校验——那需要查库，由 authGate 的
+// sessionGenerationValid 完成（认证顺序：先内存后数据库）。
+func (s *sessionStore) lookup(id string, wantAdmin bool) (sessionInfo, bool) {
 	if id == "" {
-		return false
+		return sessionInfo{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	info, ok := s.sessions[id]
 	if !ok || time.Now().After(info.expires) {
 		delete(s.sessions, id)
-		return false
+		return sessionInfo{}, false
 	}
-	return info.admin == wantAdmin
+	if info.admin != wantAdmin {
+		return sessionInfo{}, false
+	}
+	return info, true
 }
-
-func (s *sessionStore) valid(id string) bool      { return s.lookup(id, false) }
-func (s *sessionStore) validAdmin(id string) bool { return s.lookup(id, true) }
 
 func (s *sessionStore) revoke(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, id)
+}
+
+// adoptGeneration 把请求携带的会话迁移到新的 Token 世代。
+// 重置 Token 的世代 +1 会作废该用户全部会话；唯独**发起重置的这一个**要活下来，
+// 否则新 Token 还没来得及展示，页面就被登出了。
+func (s *sessionStore) adoptGeneration(r *http.Request, userID string, generation int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, name := range []string{sessionCookieName, adminCookieName} {
+		c, err := r.Cookie(name)
+		if err != nil {
+			continue
+		}
+		if info, ok := s.sessions[c.Value]; ok && info.userID == userID {
+			info.tokenGeneration = generation
+			s.sessions[c.Value] = info
+		}
+	}
 }
 
 // parseTrustedProxies 把 IP / CIDR 列表解析为前缀；非法条目忽略。
@@ -189,6 +221,9 @@ func (h *handlers) setSessionCookie(w http.ResponseWriter, r *http.Request, name
 
 // createSession 登录：POST /web/session，Body {"token":"...","admin":bool}
 // admin=true 时同时下发只读会话与短期 admin 会话（备份管理页需要两者）。
+//
+// v0.18：Token 从「与环境变量比对」改为查 users 表（管理员与普通用户共用
+// 这个入口）；普通用户请求 admin 提升一律 403——admin API 的门票只属于管理员。
 func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token string `json:"token"`
@@ -198,16 +233,47 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.opts.Token)) != 1 {
+	u, err := h.svc.AuthUserByToken(strings.TrimSpace(req.Token))
+	if err != nil {
+		h.internalError(w, "session login", err)
+		return
+	}
+	if u == nil {
 		time.Sleep(300 * time.Millisecond) // 轻量暴力破解减速
 		writeErr(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
-	h.setSessionCookie(w, r, sessionCookieName, h.web.create(false), int(sessionTTL.Seconds()))
-	if req.Admin {
-		h.setSessionCookie(w, r, adminCookieName, h.web.create(true), int(adminTTL.Seconds()))
+	if req.Admin && !u.IsAdmin {
+		writeErr(w, http.StatusForbidden, "admin privileges required")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "admin": req.Admin})
+	vaultID, err := h.svc.OwnerVaultOf(u.UserID)
+	if err != nil {
+		h.internalError(w, "session login", err)
+		return
+	}
+	if vaultID == "" {
+		// 账号存在却没有专属 Vault：数据不一致，不发会话
+		writeErr(w, http.StatusForbidden, "account has no vault")
+		return
+	}
+	base := sessionInfo{
+		userID: u.UserID, name: u.Name, isAdmin: u.IsAdmin, vaultID: vaultID,
+		tokenGeneration: u.TokenGeneration,
+	}
+	h.setSessionCookie(w, r, sessionCookieName, h.web.create(base), int(sessionTTL.Seconds()))
+	if req.Admin {
+		elevated := base
+		elevated.admin = true
+		h.setSessionCookie(w, r, adminCookieName, h.web.create(elevated), int(adminTTL.Seconds()))
+	}
+	role := "user"
+	if u.IsAdmin {
+		role = "admin"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "admin": req.Admin, "role": role, "name": u.Name,
+	})
 }
 
 // destroySession 登出：DELETE /web/session（同时撤销只读与 admin 会话）
@@ -228,19 +294,31 @@ func (h *handlers) destroySession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// webSessionAllowed：Web 只读会话允许访问的接口白名单（仅 GET）。
-// Web 出现漏洞时攻击面被限制在读取；所有写操作仍必须持根 Token 或 admin 会话。
+// webSessionAllowed：Web 普通会话允许访问的接口白名单。
+// Web 出现漏洞时攻击面被限制在这份清单里；其余写操作仍必须持用户 Token 或 admin 会话。
+//
+// v0.18 在纯只读之外放进两条账户自救操作（v11 设计 §4.3）：
+//   - 重置自己的 API Token（重置端点自身还有 E2EE 重置凭证这道硬关卡）；
+//   - 登记重置凭证（只能首登记或持旧值更新，会话拿不到覆盖权）。
 func webSessionAllowed(r *http.Request) bool {
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/account/token-reset" {
+		return true
+	}
+	if r.Method == http.MethodPut && r.URL.Path == "/api/v1/vault/reset-auth" {
+		return true
+	}
 	if r.Method != http.MethodGet {
 		return false
 	}
 	switch r.URL.Path {
 	case "/api/v1/info",
+		"/api/v1/vaults",
 		"/api/v1/snapshot",
 		"/api/v1/file",
 		"/api/v1/history",
 		"/api/v1/version",
-		"/api/v1/vault-key":
+		"/api/v1/vault-key",
+		"/api/v1/whoami":
 		return true
 	}
 	return false

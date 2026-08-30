@@ -19,12 +19,17 @@ import {
 	login,
 	logout,
 	VersionEntry,
+	WebVault,
+	Whoami,
+	AdminInvite,
+	AdminUser,
 } from "./api";
 import {
 	decryptFile,
 	lse3Header,
 	decryptMeta,
 	deriveMetaKeys,
+	deriveResetAuth,
 	FileKeyBinding,
 	importVmk,
 	isEncryptedFile,
@@ -37,6 +42,7 @@ import { DiffLine, diffLines } from "./diff";
 import { buildOutline, md, preprocessWiki } from "./markdown";
 
 const THEME_KEY = "litesync-theme";
+const VAULT_KEY = "litesync-vault";
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
@@ -50,6 +56,14 @@ interface State {
 	binding?: FileKeyBinding;
 	/** 元数据解密密钥（v9.3 三期，meta 模式；解锁时派生） */
 	metaKeys?: MetaKeys;
+	/** 当前会话身份（v0.18 多用户）：user 角色不渲染运维/设置/用户管理入口 */
+	me?: Whoami;
+	/** 名下仓库（v0.19 多仓库；单仓库时不渲染切换器） */
+	vaults: WebVault[];
+	/** 解锁 E2EE 时派生的重置凭证（v11 设计 §3.1）；重置 Token 时提交 */
+	resetAuth?: string;
+	/** 服务端是否已登记重置凭证（info.resetAuthConfigured） */
+	resetAuthConfigured?: boolean;
 	/**
 	 * 各对象已见过的最大 contentGeneration（v0.13.3 / 计划书 §7.5）。
 	 *
@@ -174,6 +188,13 @@ function resolveTarget(target: string): string | null {
 async function boot(): Promise<void> {
 	applyTheme();
 	const api = new Api();
+	// v0.19：还原本浏览器上次选择的仓库（服务端仍会按成员关系硬校验；
+	// 校验失败（404）会走到登录/错误分支，此时清掉记忆即可）
+	try {
+		api.vaultId = localStorage.getItem(VAULT_KEY) ?? "";
+	} catch {
+		/* 隐私模式等场景读不了 storage：用默认仓库 */
+	}
 	try {
 		const info = await api.info(); // 会话 Cookie 无效 → AuthError → 登录页
 		const vaultDoc = await api.vaultKey();
@@ -181,7 +202,11 @@ async function boot(): Promise<void> {
 			info.vaultId && (info.keyEpoch ?? 0) > 0
 				? { vaultId: info.vaultId, keyEpoch: info.keyEpoch! }
 				: undefined;
-		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null, binding, seenGeneration: new Map() };
+		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null, binding, seenGeneration: new Map(), vaults: [] };
+		S.resetAuthConfigured = info.resetAuthConfigured;
+		// 身份（v0.18）：角色决定导航渲染；服务端对 admin API 另有硬关卡
+		S.me = await api.whoami().catch(() => undefined);
+		S.vaults = await api.listVaults();
 		// §7.5：仓库处于迁移中等非常态时，必须让用户看到——
 		// 此时看到的内容可能是不完整或过渡态的，静默展示等于误导
 		showRepoStateBanner(info.metaState);
@@ -198,6 +223,17 @@ async function boot(): Promise<void> {
 	} catch (e) {
 		if (e instanceof AuthError) {
 			renderLogin();
+			return;
+		}
+		// v0.19：上次选择的仓库已不存在/无权限（404）→ 清掉记忆回默认仓库重试
+		if (api.vaultId && e instanceof Error && /404/.test(e.message)) {
+			try {
+				localStorage.removeItem(VAULT_KEY);
+			} catch {
+				/* ignore */
+			}
+			api.vaultId = "";
+			await boot();
 			return;
 		}
 		renderMessage(`无法连接服务器：${e instanceof Error ? e.message : String(e)}`);
@@ -271,19 +307,52 @@ function renderLogin(err?: string): void {
 }
 
 function renderUnlock(err?: string): void {
-	const sub = el("p", "muted", "输入 E2EE 密码解锁（在本地解密，密钥不会离开此设备）");
+	// 多仓库（v0.19）：解锁的对象是**当前选中的仓库**——把这一点讲明白，
+	// 并让「密码其实是另一个仓库的」当场就能切，而不是对着「密码错误」发呆
+	const multi = (S?.vaults.length ?? 0) > 1;
+	const cur = S?.vaults.find((v) => v.current);
+	const sub = el(
+		"p",
+		"muted",
+		multi
+			? `输入仓库「${cur?.name || cur?.id || "默认"}」的 E2EE 密码（在本地解密，密钥不会离开此设备）`
+			: "输入 E2EE 密码解锁（在本地解密，密钥不会离开此设备）",
+	);
 	const input = el("input") as HTMLInputElement;
 	input.type = "password";
 	input.placeholder = "E2EE Password";
 	const btn = el("button", "primary", "Unlock vault");
 	const errEl = el("p", "error", err ?? "");
 	const hint = el("p", "muted small", "🔒 Decrypted locally · 会话结束后需重新解锁");
+	const extras: HTMLElement[] = [];
+	if (multi) {
+		extras.push(el("p", "muted small", "每个仓库的 E2EE 密码相互独立；解锁另一个仓库请先切换："));
+		const sel = el("select", "vault-switch") as HTMLSelectElement;
+		for (const v of S!.vaults) {
+			const opt = el("option", "", v.name || v.id) as HTMLOptionElement;
+			opt.value = v.id;
+			if (v.current) opt.selected = true;
+			sel.append(opt);
+		}
+		sel.onchange = () => {
+			try {
+				localStorage.setItem(VAULT_KEY, sel.value);
+			} catch {
+				/* ignore */
+			}
+			location.hash = "";
+			location.reload(); // 与主界面切换器同一语义：整页重进，仓库间密钥/状态彻底隔离
+		};
+		extras.push(sel);
+	}
 	const submit = async () => {
 		btn.textContent = "解锁中…";
 		btn.disabled = true;
 		const raw = await unlockVaultKey(S!.vaultDoc!, input.value);
 		if (!raw) {
-			errEl.textContent = "密码错误";
+			errEl.textContent = multi
+				? "密码错误。若这是你另一个仓库的密码，请在上方切换到那个仓库再解锁。"
+				: "密码错误";
 			btn.textContent = "Unlock vault";
 			btn.disabled = false;
 			return;
@@ -292,14 +361,22 @@ function renderUnlock(err?: string): void {
 		S!.vmk = await importVmk(raw);
 		// 元数据密钥（v9.3）：派生后立即清零原始字节
 		S!.metaKeys = await deriveMetaKeys(raw);
+		// 重置凭证（v0.18）：解锁即派生；服务端未登记时自动补登记，
+		// 让「重置 Token 需要 E2EE 密码」这道关卡尽早立起来
+		S!.resetAuth = await deriveResetAuth(raw);
 		raw.fill(0);
+		if (S!.resetAuthConfigured === false && S!.resetAuth) {
+			void S!.api.putResetAuth(S!.resetAuth).then(() => {
+				S!.resetAuthConfigured = true;
+			});
+		}
 		await enterMain();
 	};
 	btn.onclick = () => void submit();
 	input.onkeydown = (e) => {
 		if (e.key === "Enter") void submit();
 	};
-	renderCentered([sub, input, btn, errEl, hint]);
+	renderCentered([sub, ...extras, input, btn, errEl, hint]);
 	input.focus();
 }
 
@@ -321,6 +398,27 @@ function renderMain(): void {
 	menuBtn.onclick = () => document.body.classList.toggle("sidebar-open");
 	const brand = el("a", "brand-small", "◈ LiteSync") as HTMLAnchorElement;
 	brand.href = "#/";
+	// 仓库切换器（v0.19 多仓库；名下只有一个仓库时不渲染）。
+	// 切换 = 换一个仓库重新进入（各仓库的 E2EE 独立解锁）
+	let vaultSel: HTMLSelectElement | null = null;
+	if (S!.vaults.length > 1) {
+		vaultSel = el("select", "vault-switch") as HTMLSelectElement;
+		for (const v of S!.vaults) {
+			const opt = el("option", "", v.name || v.id) as HTMLOptionElement;
+			opt.value = v.id;
+			if (v.current) opt.selected = true;
+			vaultSel.append(opt);
+		}
+		vaultSel.onchange = () => {
+			try {
+				localStorage.setItem(VAULT_KEY, vaultSel!.value);
+			} catch {
+				/* ignore */
+			}
+			location.hash = "";
+			location.reload(); // 仓库间的密钥/状态彻底隔离：整页重进最干净
+		};
+	}
 	const searchWrap = el("div", "search-wrap");
 	searchInput = el("input", "search") as HTMLInputElement;
 	searchInput.placeholder = "🔍 Search vault…";
@@ -331,8 +429,12 @@ function renderMain(): void {
 	searchInput.onfocus = () => renderSearch(searchInput.value.trim());
 	searchWrap.append(searchInput, searchResults);
 	const spacer = el("div", "spacer");
+	// v0.18 角色化导航：运维/设置/用户管理只属于管理员（服务端另有硬关卡，
+	// 这里只是别把用户点不动的按钮摆出来）；「账户」对所有人可见
+	const isAdmin = S!.me?.role !== "user";
 	const settingsBtn = el("button", "icon-btn", "⚙");
 	settingsBtn.title = "设置（备份管理）";
+	settingsBtn.hidden = !isAdmin;
 	settingsBtn.onclick = () => {
 		location.hash = "#/settings/backup";
 	};
@@ -340,8 +442,20 @@ function renderMain(): void {
 	// 单独一个入口而不是塞进备份页——出事时要能一眼找到
 	const opsBtn = el("button", "icon-btn", "🛠");
 	opsBtn.title = "运维（设备 / 迁移 / 完整性 / 恢复）";
+	opsBtn.hidden = !isAdmin;
 	opsBtn.onclick = () => {
 		location.hash = "#/settings/ops";
+	};
+	const usersBtn = el("button", "icon-btn", "👥");
+	usersBtn.title = "用户管理（邀请 / 禁用 / 删除）";
+	usersBtn.hidden = !isAdmin;
+	usersBtn.onclick = () => {
+		location.hash = "#/settings/users";
+	};
+	const accountBtn = el("button", "icon-btn", "👤");
+	accountBtn.title = "账户（重置 API Token）";
+	accountBtn.onclick = () => {
+		location.hash = "#/account";
 	};
 	const themeBtn = el("button", "icon-btn", "☀");
 	themeBtn.title = "切换主题";
@@ -362,7 +476,9 @@ function renderMain(): void {
 			location.reload();
 		});
 	};
-	header.append(menuBtn, brand, searchWrap, spacer, opsBtn, settingsBtn, themeBtn, lockBtn, outBtn);
+	header.append(menuBtn, brand);
+	if (vaultSel) header.append(vaultSel);
+	header.append(searchWrap, spacer, usersBtn, opsBtn, settingsBtn, accountBtn, themeBtn, lockBtn, outBtn);
 
 	// 三栏
 	treeEl = el("aside", "tree");
@@ -485,6 +601,10 @@ function onRoute(): void {
 		void showBackupSettings();
 	} else if (hash === "#/settings/ops") {
 		void showOpsSettings();
+	} else if (hash === "#/settings/users") {
+		void showUsersAdmin();
+	} else if (hash === "#/account") {
+		showAccount();
 	} else {
 		showHome();
 	}
@@ -1563,4 +1683,280 @@ async function renderRestoreCard(box: HTMLElement): Promise<void> {
 	const row = el("div", "settings-row");
 	row.append(select, btn);
 	card.append(row, planBox);
+}
+
+// ---------- 账户（v0.18 / v11 设计 §4.4）：重置 API Token ----------
+
+function showAccount(): void {
+	revokeAllBlobs();
+	markActive(null);
+	outlineEl.innerHTML = "";
+	contentEl.innerHTML = "";
+	const wrap = el("div", "note-wrap settings-wrap");
+	contentEl.append(wrap);
+	const head = el("div", "note-head");
+	head.append(el("h1", "note-title", "Account"));
+	const backBtn = el("button", "ghost", "← 返回");
+	backBtn.onclick = () => {
+		location.hash = "#/";
+	};
+	head.append(backBtn);
+	wrap.append(head);
+	const box = el("div", "settings-box");
+	wrap.append(box);
+
+	const who = el("div", "settings-card");
+	who.append(el("h2", "", "Identity"));
+	const role = S!.me?.role === "admin" ? "管理员" : "用户";
+	who.append(el("p", "", `${S!.me?.name ?? "（未知）"} · ${role}`));
+	box.append(who);
+
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Reset API Token"));
+	card.append(el("p", "muted small",
+		"怀疑 API Token 泄露时使用：立即作废旧 Token 并撤销你的全部设备凭据。" +
+		"之后每台设备只需在插件设置里填入新 Token → 点「测试连接」即可恢复同步，" +
+		"本地笔记、历史与端到端加密密钥都不受影响。"));
+	if (S!.vaultDoc?.enabled) {
+		card.append(el("p", "muted small",
+			S!.resetAuth
+				? "✓ 本次重置将附带 E2EE 密码证明（只拿到 Token 的人无法执行此操作）。"
+				: "⚠ 尚未解锁 E2EE：请先返回首页解锁，再执行重置。"));
+	} else {
+		card.append(el("p", "muted small",
+			"⚠ 此 Vault 未启用端到端加密：任何持有 Token 的人（包括取得它的攻击者）都能执行重置。" +
+			"启用 E2EE 后，重置将要求加密密码证明。"));
+	}
+	card.append(el("p", "muted small",
+		"注意：重置不能追回泄露期间已被下载的内容——那部分只由 E2EE 密码强度保护。"));
+	const btn = el("button", "danger", "重置 API Token");
+	const errEl = el("p", "error", "");
+	btn.onclick = () => {
+		if (S!.vaultDoc?.enabled && !S!.resetAuth) {
+			errEl.textContent = "请先解锁 E2EE 再重置。";
+			return;
+		}
+		if (!confirm("确认重置 API Token？\n\n· 旧 Token 立即失效，所有设备断开同步\n· 每台设备需填入新 Token 并点「测试连接」\n· 此操作不能追回已泄露窗口内被下载的密文")) {
+			return;
+		}
+		btn.disabled = true;
+		btn.textContent = "重置中…";
+		void S!.api
+			.resetToken(S!.resetAuth ?? "")
+			.then((res) => renderNewToken(box, res))
+			.catch((e) => {
+				errEl.textContent = e instanceof Error ? e.message : String(e);
+				btn.disabled = false;
+				btn.textContent = "重置 API Token";
+			});
+	};
+	card.append(btn, errEl);
+	box.append(card);
+}
+
+function renderNewToken(
+	box: HTMLElement,
+	res: { token: string; revokedDevices: number; resetAuthEnforced: boolean },
+): void {
+	box.innerHTML = "";
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "New API Token"));
+	card.append(el("p", "", `已撤销 ${res.revokedDevices} 台设备的凭据；旧 Token 与其他登录会话全部失效。`));
+	if (!res.resetAuthEnforced) {
+		card.append(el("p", "muted small", "（本次重置未经 E2EE 密码确认——该 Vault 尚未登记重置凭证。）"));
+	}
+	const tokenEl = el("code", "token-display", res.token);
+	card.append(tokenEl);
+	const copyBtn = el("button", "primary", "复制");
+	copyBtn.onclick = () => {
+		void navigator.clipboard.writeText(res.token).then(() => {
+			copyBtn.textContent = "已复制 ✓";
+			setTimeout(() => (copyBtn.textContent = "复制"), 1500);
+		});
+	};
+	card.append(copyBtn);
+	card.append(el("p", "muted small",
+		"明文只显示这一次（服务器只存哈希）。请立即抄写保存，然后在每台设备的" +
+		"插件设置里替换 API Token → 点「测试连接」，同步会自动恢复，其他设置都不用改。"));
+	box.append(card);
+}
+
+// ---------- 用户管理（v0.18 / v11 设计 §5.6–§5.7，仅管理员） ----------
+
+async function showUsersAdmin(): Promise<void> {
+	revokeAllBlobs();
+	markActive(null);
+	outlineEl.innerHTML = "";
+	contentEl.innerHTML = "";
+	const wrap = el("div", "note-wrap settings-wrap");
+	contentEl.append(wrap);
+	const head = el("div", "note-head");
+	head.append(el("h1", "note-title", "Users"));
+	const backBtn = el("button", "ghost", "← 返回");
+	backBtn.onclick = () => {
+		location.hash = "#/";
+	};
+	head.append(backBtn);
+	wrap.append(head);
+	wrap.append(el("p", "muted small",
+		"小范围多用户：生成邀请链接给对方自助注册；每个用户拥有完全独立的仓库，" +
+		"彼此不可见。你能看到用户名与用量，但拿不到任何人的 API Token 或加密密码。"));
+	const box = el("div", "settings-box");
+	wrap.append(box);
+	await renderUsersInto(box);
+}
+
+async function renderUsersInto(box: HTMLElement): Promise<void> {
+	box.textContent = "加载中…";
+	let invites: AdminInvite[];
+	let users: AdminUser[];
+	try {
+		[invites, users] = await Promise.all([S!.api.listInvites(), S!.api.listUsers()]);
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		if (/40[13]|unauthorized|admin/i.test(msg)) {
+			renderUsersUnlock(box);
+			return;
+		}
+		box.textContent = `加载失败：${msg}`;
+		return;
+	}
+	box.innerHTML = "";
+	renderInviteCard(box, invites);
+	renderUserListCard(box, users);
+}
+
+function renderUsersUnlock(box: HTMLElement): void {
+	box.innerHTML = "";
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Admin unlock"));
+	card.append(el("p", "muted small", "用户管理需要管理员权限：请输入 API Token 换取短期 admin 会话（30 分钟）。"));
+	const input = el("input") as HTMLInputElement;
+	input.type = "password";
+	input.placeholder = "API Token";
+	const btn = el("button", "primary", "解锁");
+	const errEl = el("p", "error", "");
+	const submit = async (): Promise<void> => {
+		btn.disabled = true;
+		if (await login(input.value.trim(), true)) {
+			await renderUsersInto(box);
+			return;
+		}
+		errEl.textContent = "Token 错误";
+		btn.disabled = false;
+	};
+	btn.onclick = () => void submit();
+	input.onkeydown = (e) => {
+		if (e.key === "Enter") void submit();
+	};
+	const row = el("div", "settings-row");
+	row.append(input, btn);
+	card.append(row, errEl);
+	box.append(card);
+	input.focus();
+}
+
+function renderInviteCard(box: HTMLElement, invites: AdminInvite[]): void {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Invites"));
+	card.append(el("p", "muted small",
+		"邀请链接后缀随机（32 字节）、一次性、默认 24 小时过期。" +
+		"对方打开链接，输入用户名即可注册并拿到自己的 API Token。"));
+
+	const row = el("div", "settings-row");
+	const ttlSel = el("select") as HTMLSelectElement;
+	for (const [label, hours] of [["1 小时", 1], ["24 小时", 24], ["7 天", 168]] as const) {
+		const opt = el("option", "", label) as HTMLOptionElement;
+		opt.value = String(hours);
+		if (hours === 24) opt.selected = true;
+		ttlSel.append(opt);
+	}
+	const urlInput = el("input") as HTMLInputElement;
+	urlInput.placeholder = `注册页展示的 Server URL（默认 ${location.origin}）`;
+	const genBtn = el("button", "primary", "生成邀请");
+	row.append(ttlSel, urlInput, genBtn);
+	card.append(row);
+	const out = el("div");
+	card.append(out);
+	genBtn.onclick = () => {
+		genBtn.disabled = true;
+		void S!.api
+			.createInvite(Number(ttlSel.value), urlInput.value.trim() || location.origin)
+			.then((inv) => {
+				out.innerHTML = "";
+				const link = `${location.origin}${inv.path}`;
+				const code = el("code", "token-display", link);
+				const copyBtn = el("button", "primary", "复制链接");
+				copyBtn.onclick = () => {
+					void navigator.clipboard.writeText(link).then(() => {
+						copyBtn.textContent = "已复制 ✓";
+						setTimeout(() => (copyBtn.textContent = "复制链接"), 1500);
+					});
+				};
+				out.append(code, copyBtn,
+					el("p", "muted small", "链接只显示这一次（服务器只存指纹）。请通过可信渠道发给对方。"));
+			})
+			.catch((e) => {
+				out.textContent = `生成失败：${e instanceof Error ? e.message : String(e)}`;
+			})
+			.finally(() => (genBtn.disabled = false));
+	};
+
+	const pending = invites.filter((i) => !i.usedAt && !i.revoked && i.expiresAt * 1000 > Date.now());
+	if (pending.length > 0) {
+		const list = el("div", "settings-list");
+		for (const inv of pending) {
+			const item = el("div", "settings-item");
+			item.append(el("span", "", `#${inv.id} · 过期 ${fmtTime(inv.expiresAt * 1000)}`));
+			const rv = el("button", "ghost", "撤销");
+			rv.onclick = () => {
+				void S!.api.revokeInvite(inv.id).then(() => renderUsersInto(box));
+			};
+			item.append(rv);
+			list.append(item);
+		}
+		card.append(el("p", "muted small", `未使用的邀请（${pending.length}）：`), list);
+	}
+	box.append(card);
+}
+
+function renderUserListCard(box: HTMLElement, users: AdminUser[]): void {
+	const card = el("div", "settings-card");
+	card.append(el("h2", "", "Accounts"));
+	const list = el("div", "settings-list");
+	for (const u of users) {
+		const item = el("div", "settings-item");
+		const label = u.isAdmin ? `${u.name}（管理员）` : u.name;
+		const meta = `${(u as { vaults?: number }).vaults ?? 1} 个仓库 · ${u.devices} 台设备 · ${u.objects} 个文件 · ${fmtBytes(u.bytesUsed)}` +
+			(u.lastSeenAt ? ` · 最近活动 ${fmtTime(u.lastSeenAt * 1000)}` : " · 从未活动") +
+			(u.disabled ? " · 已禁用" : "");
+		const info = el("div", "settings-item-main");
+		info.append(el("div", "", label), el("div", "muted small", meta));
+		item.append(info);
+		if (!u.isAdmin) {
+			const disBtn = el("button", "ghost", u.disabled ? "解禁" : "禁用");
+			disBtn.onclick = () => {
+				const verb = u.disabled ? "解禁" : "禁用";
+				if (!u.disabled && !confirm(`禁用 ${u.name}？其全部设备凭据与登录会话立即失效；数据保留，解禁后需重新接入设备。`)) return;
+				void S!.api
+					.setUserDisabled(u.userId, !u.disabled)
+					.then(() => renderUsersInto(box))
+					.catch((e) => alert(`${verb}失败：${e instanceof Error ? e.message : String(e)}`));
+			};
+			const delBtn = el("button", "danger", "删除");
+			delBtn.onclick = () => {
+				const typed = prompt(
+					`删除 ${u.name}？此操作不可逆：其全部笔记、历史、分享一并永久删除。\n\n请输入用户名确认：`);
+				if (typed === null) return;
+				void S!.api
+					.deleteUser(u.userId, typed)
+					.then(() => renderUsersInto(box))
+					.catch((e) => alert(`删除失败：${e instanceof Error ? e.message : String(e)}`));
+			};
+			item.append(disBtn, delBtn);
+		}
+		list.append(item);
+	}
+	card.append(list);
+	box.append(card);
 }

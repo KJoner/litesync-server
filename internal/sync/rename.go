@@ -44,7 +44,7 @@ type RenameParams struct {
 }
 
 // Rename 执行改名（元数据更新）。
-func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
+func (s *Service) Rename(scope db.VaultScope, p RenameParams) (*RenameResult, error) {
 	if err := storage.ValidatePath(p.FromPseudonym); err != nil {
 		return nil, err
 	}
@@ -55,7 +55,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 		}
 	}
 
-	cur, err := db.GetHeadByPseudonym(s.db, p.FromPseudonym)
+	cur, err := db.GetHeadByPseudonym(s.db, scope, p.FromPseudonym)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 
 	// 幂等：同一 operationId 已提交过 → 返回那次结果
 	if p.Client.OperationID != "" {
-		if prev, err := db.FindChangeByOperation(s.db, cur.FileID, p.Client.OperationID); err != nil {
+		if prev, err := db.FindChangeByOperation(s.db, scope, cur.FileID, p.Client.OperationID); err != nil {
 			return nil, err
 		} else if prev != nil {
 			return &RenameResult{
@@ -111,7 +111,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 	if !metaMode && p.ToPseudonym != p.FromPseudonym {
 		// 先查「目标名被占用」再查归一化碰撞：前者能给出对方的 revision/hash，
 		// 客户端可以直接据此走冲突流程；后者只能说「有个东西挡着」
-		if occupied, err := db.GetHeadByPseudonym(s.db, p.ToPseudonym); err != nil {
+		if occupied, err := db.GetHeadByPseudonym(s.db, scope, p.ToPseudonym); err != nil {
 			return nil, err
 		} else if occupied != nil {
 			return nil, &ConflictError{Path: p.ToPseudonym, Revision: occupied.Revision,
@@ -130,7 +130,7 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 		// 用户看到的是「改名后历史没被继承」（继承的是别人的坟墓）。
 	}
 	// 目标名与别的 live 对象归一化后同名 → 422（排除自己，允许纯大小写改名）
-	if other, err := db.FindCanonicalCollision(s.db, canonicalKey, cur.FileID); err != nil {
+	if other, err := db.FindCanonicalCollision(s.db, scope, canonicalKey, cur.FileID); err != nil {
 		return nil, err
 	} else if other != "" {
 		return nil, &PathCollisionError{Path: p.ToPseudonym, Existing: other}
@@ -153,11 +153,11 @@ func (s *Service) Rename(p RenameParams) (*RenameResult, error) {
 	if p.MetaEnc != "" {
 		head.EncryptedMetadata = p.MetaEnc
 	}
-	if err := db.UpsertHead(tx, &head); err != nil {
+	if err := db.UpsertHead(tx, scope, &head); err != nil {
 		return nil, err
 	}
 	// 内容未变：revision 与 contentGeneration 原样保留（INV-05）
-	seq, err := db.InsertChange(tx, &db.ObjectChange{
+	seq, err := db.InsertChange(tx, scope, &db.ObjectChange{
 		FileID: head.FileID, Action: "upsert", Revision: head.Revision,
 		ContentGeneration: head.ContentGeneration, MetaGeneration: newMetaGen,
 		Pseudonym: head.Pseudonym, ContentHash: head.ContentHash,

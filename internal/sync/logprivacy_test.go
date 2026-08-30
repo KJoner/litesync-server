@@ -58,13 +58,13 @@ func TestLogsNeverContainUserPathsOrContent(t *testing.T) {
 
 	content := []byte(secretContent + " 正文正文")
 	// 一整轮常见操作：上传、改名、删除、恢复、维护、scrub
-	if _, err := s.Upload(syncsvc.UploadParams{
+	if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: secretPath, BaseRevision: 0, ClaimedHash: sha256HexT(content),
 		DeviceID: "device-" + secretToken, Action: "upsert",
 	}, bytes.NewReader(content)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Delete(syncsvc.DeleteParams{Path: secretPath, BaseRevision: 1, DeviceID: "d1"}); err != nil {
+	if _, err := s.Delete(db.LegacyDefaultScope(), syncsvc.DeleteParams{Path: secretPath, BaseRevision: 1, DeviceID: "d1"}); err != nil {
 		t.Fatal(err)
 	}
 	s.RunMaintenance()
@@ -93,7 +93,7 @@ func TestLogsNeverContainUserPathsOrContent(t *testing.T) {
 func TestLogsKeepDiagnosticFields(t *testing.T) {
 	s, logs := newLoggingService(t)
 	content := []byte("some content")
-	if _, err := s.Upload(syncsvc.UploadParams{
+	if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "note.md", BaseRevision: 0, ClaimedHash: sha256HexT(content),
 		DeviceID: "dev-1", Action: "upsert",
 	}, bytes.NewReader(content)); err != nil {
@@ -113,7 +113,7 @@ func TestLogsKeepDiagnosticFields(t *testing.T) {
 func TestIdentifiersInLogsAreTruncated(t *testing.T) {
 	s, logs := newLoggingService(t)
 	content := []byte("content for id truncation test")
-	res, err := s.Upload(syncsvc.UploadParams{
+	res, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "id.md", BaseRevision: 0, ClaimedHash: sha256HexT(content),
 		DeviceID: "dev-1", Action: "upsert",
 	}, bytes.NewReader(content))
@@ -121,7 +121,7 @@ func TestIdentifiersInLogsAreTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 制造一条一定会打日志的完整性事件
-	if _, err := s.Delete(syncsvc.DeleteParams{Path: "id.md", BaseRevision: res.Revision, DeviceID: "dev-1"}); err != nil {
+	if _, err := s.Delete(db.LegacyDefaultScope(), syncsvc.DeleteParams{Path: "id.md", BaseRevision: res.Revision, DeviceID: "dev-1"}); err != nil {
 		t.Fatal(err)
 	}
 	s.RunMaintenance()

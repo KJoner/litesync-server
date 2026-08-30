@@ -706,3 +706,45 @@ pre.cmd {
 	font-size: 13px;
 	user-select: all;
 }
+
+/* ---------- v0.18 多用户与 Token 重置 ---------- */
+.token-display {
+	display: block;
+	word-break: break-all;
+	padding: 10px 12px;
+	margin: 8px 0;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--bg-alt);
+	font-size: 13px;
+	user-select: all;
+}
+.settings-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.settings-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+}
+.settings-item-main { flex: 1; min-width: 0; }
+.join-card { max-width: 560px; }
+.join-wide { max-width: 640px; text-align: left; }
+.join-row { display: flex; gap: 8px; margin: 4px 0 12px; }
+.join-gate { display: flex; align-items: center; gap: 8px; margin: 14px 0; cursor: pointer; }
+.join-steps h3 { margin: 14px 0 8px; }
+.join-list { padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
+.join-list p { margin: 2px 0 0; }
+
+/* v0.19 仓库切换器 */
+.vault-switch {
+	max-width: 160px;
+	margin-left: 8px;
+	padding: 4px 8px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--bg-alt);
+	color: inherit;
+	font-size: 13px;
+}

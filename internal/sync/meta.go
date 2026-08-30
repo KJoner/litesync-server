@@ -74,10 +74,10 @@ func newMigrationID() (string, error) {
 // 让任一在线设备可以正常接管续做。返回释放的数量（0 表示没有过期租约）。
 //
 // 只清**已过期**的：强行踢掉一个还活着的 owner，会让两台设备同时写迁移。
-func (s *Service) ExpireStaleMigrationLease(now time.Time) (int, error) {
+func (s *Service) ExpireStaleMigrationLease(scope db.VaultScope, now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -93,10 +93,10 @@ func (s *Service) ExpireStaleMigrationLease(now time.Time) (int, error) {
 }
 
 // MigrationStatusOf 返回当前迁移状态与 journal 汇总。
-func (s *Service) MigrationStatusOf() (*MigrationStatus, error) {
+func (s *Service) MigrationStatusOf(scope db.VaultScope) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +106,7 @@ func (s *Service) MigrationStatusOf() (*MigrationStatus, error) {
 			return nil, err
 		}
 	}
-	plain, err := db.PlaintextTombstoneCount(s.db)
+	plain, err := db.PlaintextTombstoneCount(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -121,11 +121,11 @@ func (s *Service) MigrationStatusOf() (*MigrationStatus, error) {
 
 // BeginMetaMigration：plain → migrating。
 // 同一 owner 重复调用 = 续租（幂等）；其他 owner 且租约未过期 → MIGRATION_LOCKED。
-func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) {
+func (s *Service) BeginMetaMigration(scope db.VaultScope, deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -149,20 +149,20 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 			return nil, ErrMigrationLocked
 		}
 		// 同一 owner → 续租并继续
-		if err := db.RenewMigrationLease(s.db, s.scope(), rs.MigrationID,
+		if err := db.RenewMigrationLease(s.db, scope, rs.MigrationID,
 			time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
 			return nil, err
 		}
 		if rs.MetaState == db.MetaVerifying {
 			// 回到 migrating 以便补迁移遗漏项
-			if err := db.SetMetaState(s.db, s.scope(), db.MetaMigrating); err != nil {
+			if err := db.SetMetaState(s.db, scope, db.MetaMigrating); err != nil {
 				return nil, err
 			}
 		}
-		if err := s.enqueueMigrationJournalLocked(rs.MigrationID); err != nil {
+		if err := s.enqueueMigrationJournalLocked(scope, rs.MigrationID); err != nil {
 			return nil, err
 		}
-		return s.statusLocked()
+		return s.statusLocked(scope)
 	}
 
 	migrationID, err := newMigrationID()
@@ -174,10 +174,10 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetMetaState(tx, s.scope(), db.MetaMigrating); err != nil {
+	if err := db.SetMetaState(tx, scope, db.MetaMigrating); err != nil {
 		return nil, err
 	}
-	if err := db.BeginMigrationRecord(tx, s.scope(), migrationID, deviceID,
+	if err := db.BeginMigrationRecord(tx, scope, migrationID, deviceID,
 		time.Now().Add(migrationLeaseDuration).Unix(), rs.HeadSequence,
 		rs.FormatEpoch+1, rs.KeyEpoch); err != nil {
 		return nil, err
@@ -185,17 +185,17 @@ func (s *Service) BeginMetaMigration(deviceID string) (*MigrationStatus, error) 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	if err := s.enqueueMigrationJournalLocked(migrationID); err != nil {
+	if err := s.enqueueMigrationJournalLocked(scope, migrationID); err != nil {
 		return nil, err
 	}
 	s.log.Info("meta migration begin", "migrationId", migrationID, "device", deviceID,
 		"cutoff", rs.HeadSequence, "targetFormatEpoch", rs.FormatEpoch+1)
-	return s.statusLocked()
+	return s.statusLocked(scope)
 }
 
 // enqueueMigrationJournalLocked 把全部待迁移对象与明文 tombstone 登记进 journal（幂等）。
-func (s *Service) enqueueMigrationJournalLocked(migrationID string) error {
-	heads, err := db.ListHeads(s.db)
+func (s *Service) enqueueMigrationJournalLocked(scope db.VaultScope, migrationID string) error {
+	heads, err := db.ListHeads(s.db, scope)
 	if err != nil {
 		return err
 	}
@@ -207,7 +207,7 @@ func (s *Service) enqueueMigrationJournalLocked(migrationID string) error {
 			return err
 		}
 	}
-	tombs, err := db.ListTombstones(s.db)
+	tombs, err := db.ListTombstones(s.db, scope)
 	if err != nil {
 		return err
 	}
@@ -222,8 +222,8 @@ func (s *Service) enqueueMigrationJournalLocked(migrationID string) error {
 	return nil
 }
 
-func (s *Service) statusLocked() (*MigrationStatus, error) {
-	rs, err := db.GetRepoState(s.db, s.scope())
+func (s *Service) statusLocked(scope db.VaultScope) (*MigrationStatus, error) {
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +233,7 @@ func (s *Service) statusLocked() (*MigrationStatus, error) {
 			return nil, err
 		}
 	}
-	plain, err := db.PlaintextTombstoneCount(s.db)
+	plain, err := db.PlaintextTombstoneCount(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -250,10 +250,10 @@ func (s *Service) statusLocked() (*MigrationStatus, error) {
 //
 // owner 在长时间迁移中必须周期性续租；租约到期后其他设备可以**显式接管**，
 // 但服务器绝不自动接管、也绝不自动 complete——迁移停在原地是安全的。
-func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error) {
+func (s *Service) RenewMigrationLease(scope db.VaultScope, deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -263,11 +263,11 @@ func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error)
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
 		return nil, ErrMigrationNotOwner
 	}
-	if err := db.RenewMigrationLease(s.db, s.scope(), rs.MigrationID,
+	if err := db.RenewMigrationLease(s.db, scope, rs.MigrationID,
 		time.Now().Add(migrationLeaseDuration).Unix()); err != nil {
 		return nil, err
 	}
-	return s.statusLocked()
+	return s.statusLocked(scope)
 }
 
 // TakeoverMigration 显式接管一个租约已过期的迁移（计划书 §5.4）。
@@ -275,10 +275,10 @@ func (s *Service) RenewMigrationLease(deviceID string) (*MigrationStatus, error)
 // 「租约到期就自动接管」会让两台设备同时认为自己是 owner；接管必须是单方、
 // 显式、且携带正确的 migrationId 的动作。owner 失联后迁移不会自动完成，
 // 也不会自动回滚——需要人来决定。
-func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationStatus, error) {
+func (s *Service) TakeoverMigration(scope db.VaultScope, migrationID, deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -289,19 +289,19 @@ func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationSta
 		return nil, ErrMigrationMismatch
 	}
 	if rs.MigrationOwnerDeviceID == deviceID {
-		return s.statusLocked() // 幂等：本来就是自己
+		return s.statusLocked(scope) // 幂等：本来就是自己
 	}
 	if rs.MigrationLeaseExpiresAt > time.Now().Unix() {
 		return nil, ErrLeaseActive
 	}
-	if err := db.BeginMigrationRecord(s.db, s.scope(), rs.MigrationID, deviceID,
+	if err := db.BeginMigrationRecord(s.db, scope, rs.MigrationID, deviceID,
 		time.Now().Add(migrationLeaseDuration).Unix(), rs.MigrationCutoffSequence,
 		rs.MigrationTargetFormatEpoch, rs.MigrationKeyEpoch); err != nil {
 		return nil, err
 	}
 	s.log.Warn("migration taken over", "migrationId", rs.MigrationID,
 		"previousOwner", rs.MigrationOwnerDeviceID, "newOwner", deviceID)
-	return s.statusLocked()
+	return s.statusLocked(scope)
 }
 
 // MigrateObjectMeta 把一个对象伪名化（真实路径 → fileId + LSM1 元数据）。
@@ -309,7 +309,7 @@ func (s *Service) TakeoverMigration(migrationID, deviceID string) (*MigrationSta
 // 与 v5 的 MigrateFileMeta 不同：这里**只是一次元数据更新**。
 // revision、contentGeneration、blob 全部不动，也不产生任何 tombstone——
 // 这正是 v0.12.1 死结（迁移必然留下明文 tombstone）消失的原因。
-func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID string) (*RenameResult, error) {
+func (s *Service) MigrateObjectMeta(scope db.VaultScope, pseudonym, metaEnc, canonicalHash, deviceID string) (*RenameResult, error) {
 	// §8.1 注入点：迁移逐对象推进。此刻崩溃 → journal 里这条仍是 pending，
 	// 续跑时会重做；重做必须幂等，绝不能产生第二个对象或第二条 change
 	if err := failpoint.Eval(failpoint.MigrationEachObj); err != nil {
@@ -322,7 +322,7 @@ func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +333,7 @@ func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID 
 		return nil, ErrMigrationNotOwner
 	}
 
-	cur, err := db.GetHeadByPseudonym(s.db, pseudonym)
+	cur, err := db.GetHeadByPseudonym(s.db, scope, pseudonym)
 	if err != nil {
 		return nil, err
 	}
@@ -372,10 +372,10 @@ func (s *Service) MigrateObjectMeta(pseudonym, metaEnc, canonicalHash, deviceID 
 	head.CanonicalPathHmac = "h:" + canonicalHash
 	head.MetaGeneration = metaGen
 	head.UpdatedAt = now
-	if err := db.UpsertHead(tx, &head); err != nil {
+	if err := db.UpsertHead(tx, scope, &head); err != nil {
 		return nil, err
 	}
-	seq, err := db.InsertChange(tx, &db.ObjectChange{
+	seq, err := db.InsertChange(tx, scope, &db.ObjectChange{
 		FileID: head.FileID, Action: "upsert", Revision: head.Revision,
 		ContentGeneration: head.ContentGeneration, MetaGeneration: metaGen,
 		Pseudonym: head.Pseudonym, ContentHash: head.ContentHash, CreatedAt: now,
@@ -405,10 +405,10 @@ type PlaintextTombstone struct {
 
 // ListPlaintextTombstones 列出仍带明文寻址名的删除记录（仅 migrating 态、仅 owner）。
 // 客户端本来就知道这些真实路径，返回给它不构成新的泄露面。
-func (s *Service) ListPlaintextTombstones(deviceID string) ([]PlaintextTombstone, error) {
+func (s *Service) ListPlaintextTombstones(scope db.VaultScope, deviceID string) ([]PlaintextTombstone, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +418,7 @@ func (s *Service) ListPlaintextTombstones(deviceID string) ([]PlaintextTombstone
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
 		return nil, ErrMigrationNotOwner
 	}
-	tombs, err := db.ListTombstones(s.db)
+	tombs, err := db.ListTombstones(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -437,14 +437,14 @@ func (s *Service) ListPlaintextTombstones(deviceID string) ([]PlaintextTombstone
 
 // MigrateTombstone 把一条 tombstone 转成隐私格式（ADR-002 §3.2）。
 // 明文寻址名换成 fileId、归一化路径换成客户端 HMAC；删除屏障完整保留。
-func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error {
+func (s *Service) MigrateTombstone(scope db.VaultScope, fileID, canonicalHash, deviceID string) error {
 	if !isHex32(fileID) || !isHex64(canonicalHash) {
 		return ErrMetaRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return err
 	}
@@ -454,7 +454,7 @@ func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error
 	if rs.MigrationOwnerDeviceID != "" && deviceID != rs.MigrationOwnerDeviceID {
 		return ErrMigrationNotOwner
 	}
-	t, err := db.GetTombstone(s.db, fileID)
+	t, err := db.GetTombstone(s.db, scope, fileID)
 	if err != nil {
 		return err
 	}
@@ -467,7 +467,7 @@ func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.ConvertTombstoneToPrivate(tx, fileID, "h:"+canonicalHash); err != nil {
+	if err := db.ConvertTombstoneToPrivate(tx, scope, fileID, "h:"+canonicalHash); err != nil {
 		return err
 	}
 	if err := db.MarkJournalDone(tx, rs.MigrationID, fileID, db.KindTombstone); err != nil {
@@ -479,15 +479,15 @@ func (s *Service) MigrateTombstone(fileID, canonicalHash, deviceID string) error
 // VerifyMetaMigration：migrating → verifying。
 // 前置：journal 中不存在 pending/failed 条目。进入 verifying 后不再接受迁移写入，
 // 只接受验证读取与 complete——**验证失败时数据一个字节都没被动过**。
-func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error) {
+func (s *Service) VerifyMetaMigration(scope db.VaultScope, deviceID string) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
 	if rs.MetaState == db.MetaVerifying {
-		return s.statusLocked() // 幂等
+		return s.statusLocked(scope) // 幂等
 	}
 	if rs.MetaState != db.MetaMigrating {
 		return nil, ErrEncryptionState
@@ -502,19 +502,19 @@ func (s *Service) VerifyMetaMigration(deviceID string) (*MigrationStatus, error)
 	if unfinished > 0 {
 		return nil, ErrMigrationIncomplete
 	}
-	if err := db.SetMetaState(s.db, s.scope(), db.MetaVerifying); err != nil {
+	if err := db.SetMetaState(s.db, scope, db.MetaVerifying); err != nil {
 		return nil, err
 	}
 	s.log.Info("meta migration verifying", "migrationId", rs.MigrationID)
-	return s.statusLocked()
+	return s.statusLocked(scope)
 }
 
 // AbortMetaMigration：migrating / verifying → plain。
 // 已伪名化的对象保持原样（混合态可正常同步），不做任何删除或改写。
-func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
+func (s *Service) AbortMetaMigration(scope db.VaultScope) (*MigrationStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -526,10 +526,10 @@ func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetMetaState(tx, s.scope(), db.MetaPlain); err != nil {
+	if err := db.SetMetaState(tx, scope, db.MetaPlain); err != nil {
 		return nil, err
 	}
-	if err := db.ClearMigrationRecord(tx, s.scope()); err != nil {
+	if err := db.ClearMigrationRecord(tx, scope); err != nil {
 		return nil, err
 	}
 	if err := db.ClearJournal(tx, rs.MigrationID); err != nil {
@@ -539,22 +539,23 @@ func (s *Service) AbortMetaMigration() (*MigrationStatus, error) {
 		return nil, err
 	}
 	s.log.Info("meta migration aborted", "migrationId", rs.MigrationID)
-	return s.statusLocked()
+	return s.statusLocked(scope)
 }
 
 // ValidateMetaMigration 执行 ADR-003 §3.5 的全部 11 项检查。
 // 返回的清单是**完整**的——用户需要一次看到所有问题。
-// scope 返回本 Service 当前操作的租户范围。
+// defaultScope 是 default vault 的范围（v0.18 多租户后的**受限**入口）。
 //
-// 单用户阶段固定是 default 租户；多租户上线后这里改为从调用方传入的
-// 认证上下文取值——届时 Service 的方法签名会带上 VaultScope 参数，
-// 这个临时方法随之删除。保留它是为了让 db 层**现在就**只接受
-// VaultScope，而不是等多租户那天再一次性改几十处调用。
-func (s *Service) scope() db.VaultScope { return db.LegacyDefaultScope() }
+// v0.16 的临时方法 scope() 已按原计划删除：业务方法的范围从认证上下文
+// 逐参传入。defaultScope 只允许出现在三类地方，每个调用点都应注释理由：
+//  1. 启动路径（对账、密钥预热）——那时还没有请求上下文；
+//  2. 实例级操作（备份快照点、跨租户维护的遍历起点）；
+//  3. 单用户遗留 CLI（多 Vault 版本会要求显式 --vault）。
+// 在请求处理路径上调用它 = 把别人的请求算到 default 头上，是隔离漏洞。
+func (s *Service) defaultScope() db.VaultScope { return db.LegacyDefaultScope() }
 
-func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
-	scope := s.scope()
-	rs, err := db.GetRepoState(s.db, s.scope())
+func (s *Service) ValidateMetaMigration(scope db.VaultScope) ([]ValidationFailure, error) {
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -565,7 +566,7 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 		}
 	}
 
-	heads, err := db.ListHeads(s.db)
+	heads, err := db.ListHeads(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -630,7 +631,7 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 	add("history rows all resolve to a known object", "ORPHAN_HISTORY", orphanHistory, "")
 
 	// 7) 所有 tombstone 已转为隐私格式
-	plainTombs, err := db.PlaintextTombstoneCount(s.db)
+	plainTombs, err := db.PlaintextTombstoneCount(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +678,7 @@ func (s *Service) ValidateMetaMigration() ([]ValidationFailure, error) {
 // 先跑完整验证器；任一项失败即返回**完整清单**并保持 verifying——
 // 不删除旧数据、不清空 changes、不执行任何擦除（INV-11）。
 // 全部通过后执行擦除流程（ADR-008）并递增 formatEpoch。
-func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*MigrationStatus, error) {
+func (s *Service) CompleteMetaMigration(scope db.VaultScope, migrationID, deviceID string) (*MigrationStatus, error) {
 	// §8.1 注入点：complete 之前。complete 会不可逆地抹掉明文寻址名，
 	// 因此这里崩溃必须让仓库停在 verifying，而不是半个 encrypted
 	if err := failpoint.Eval(failpoint.MigrationBeforeDone); err != nil {
@@ -686,12 +687,12 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
 	if rs.MetaState == db.MetaEncrypted {
-		return s.statusLocked() // 幂等
+		return s.statusLocked(scope) // 幂等
 	}
 	if rs.MetaState != db.MetaVerifying {
 		return nil, ErrEncryptionState
@@ -703,7 +704,7 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 		return nil, ErrMigrationNotOwner
 	}
 
-	failures, err := s.ValidateMetaMigration()
+	failures, err := s.ValidateMetaMigration(scope)
 	if err != nil {
 		return nil, err
 	}
@@ -713,7 +714,7 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 	}
 
 	// 擦除（ADR-008）：任一步失败保持 verifying，可修复后重试
-	report, err := s.erasePlaintextPathsLocked(rs)
+	report, err := s.erasePlaintextPathsLocked(scope, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -729,21 +730,21 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetMetaState(tx, s.scope(), db.MetaEncrypted); err != nil {
+	if err := db.SetMetaState(tx, scope, db.MetaEncrypted); err != nil {
 		return nil, err
 	}
-	if err := db.SetFormatEpoch(tx, s.scope(), rs.MigrationTargetFormatEpoch); err != nil {
+	if err := db.SetFormatEpoch(tx, scope, rs.MigrationTargetFormatEpoch); err != nil {
 		return nil, err
 	}
 	// 全量裁剪 changes：旧记录里还带着迁移前的明文寻址名，
 	// 且 formatEpoch 变化本来就要求所有客户端重新对账
-	if err := db.DeleteAllChanges(tx, s.scope()); err != nil {
+	if err := db.DeleteAllChanges(tx, scope); err != nil {
 		return nil, err
 	}
-	if err := db.SetMinRetainedSequence(tx, s.scope(), rs.HeadSequence); err != nil {
+	if err := db.SetMinRetainedSequence(tx, scope, rs.HeadSequence); err != nil {
 		return nil, err
 	}
-	if err := db.ClearMigrationRecord(tx, s.scope()); err != nil {
+	if err := db.ClearMigrationRecord(tx, scope); err != nil {
 		return nil, err
 	}
 	if err := db.ClearJournal(tx, rs.MigrationID); err != nil {
@@ -755,7 +756,7 @@ func (s *Service) CompleteMetaMigration(migrationID, deviceID string) (*Migratio
 
 	s.log.Info("meta migration complete", "migrationId", rs.MigrationID,
 		"formatEpoch", rs.MigrationTargetFormatEpoch)
-	return s.statusLocked()
+	return s.statusLocked(scope)
 }
 
 // isHex64 校验 32 字节 hex（canonical path HMAC）。

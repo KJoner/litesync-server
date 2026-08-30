@@ -32,7 +32,7 @@ func (h *handlers) publishCheckpoint(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
 		return
 	}
-	err := h.svc.PublishCheckpoint(syncsvc.PublishCheckpointParams{
+	err := h.svc.PublishCheckpoint(scopeOf(r), syncsvc.PublishCheckpointParams{
 		Hash:         req.Hash,
 		RepoEpoch:    req.RepoEpoch,
 		HeadSequence: req.HeadSequence,
@@ -63,7 +63,7 @@ func (h *handlers) publishCheckpoint(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/checkpoints?since=<headSequence>
 func (h *handlers) getCheckpoints(w http.ResponseWriter, r *http.Request) {
 	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
-	bundle, err := h.svc.Checkpoints(since, 200)
+	bundle, err := h.svc.Checkpoints(scopeOf(r), since, 200)
 	if err != nil {
 		h.internalError(w, "checkpoints", err)
 		return

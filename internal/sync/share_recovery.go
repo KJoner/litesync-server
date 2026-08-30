@@ -60,7 +60,7 @@ func (s *Service) ExtendShare(id string, expiresAt int64) error {
 	if err := db.UpdateShareExpiry(s.db, id, expiresAt); err != nil {
 		return err
 	}
-	if err := db.AppendAudit(s.db, s.scope(), "admin", "share-extended",
+	if err := db.AppendAudit(s.db, s.defaultScope(), "admin", "share-extended",
 		"share="+truncateID(id)); err != nil {
 		s.log.Warn("share extend: audit failed", "error", err)
 	}

@@ -49,7 +49,7 @@ func newService(t *testing.T, opts syncsvc.Options) *syncsvc.Service {
 
 func upload(t *testing.T, s *syncsvc.Service, path string, base int64, content []byte) *syncsvc.UploadResult {
 	t.Helper()
-	res, err := s.Upload(syncsvc.UploadParams{
+	res, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: path, BaseRevision: base, ClaimedHash: sha256HexT(content),
 		DeviceID: "test-device", Action: "upsert",
 	}, bytes.NewReader(content))
@@ -81,7 +81,7 @@ func TestSnapshotLinearizability(t *testing.T) {
 		defer close(done)
 		for i := 0; i < total; i++ {
 			content := []byte(fmt.Sprintf("content-%d", i))
-			if _, err := s.Upload(syncsvc.UploadParams{
+			if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 				Path: fmt.Sprintf("f-%04d.md", i), ClaimedHash: sha256HexT(content),
 				DeviceID: "w", Action: "upsert",
 			}, bytes.NewReader(content)); err != nil {
@@ -92,7 +92,7 @@ func TestSnapshotLinearizability(t *testing.T) {
 	}()
 
 	for {
-		snap, err := s.Snapshot()
+		snap, err := s.Snapshot(db.LegacyDefaultScope())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +104,7 @@ func TestSnapshotLinearizability(t *testing.T) {
 			if writeErr != nil {
 				t.Fatal(writeErr)
 			}
-			snap, err := s.Snapshot()
+			snap, err := s.Snapshot(db.LegacyDefaultScope())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestClockSurvivesChangesPrune(t *testing.T) {
 	}
 
 	// 旧游标 → resync，latest 仍是权威 head（修复前这里会回退成 0 造成死循环）
-	res, err := s.Changes(0, 100)
+	res, err := s.Changes(db.LegacyDefaultScope(), 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestClockSurvivesChangesPrune(t *testing.T) {
 		t.Fatalf("changes(0) = resync %v latest %d min %d", res.ResyncRequired, res.LatestSequence, res.MinSequence)
 	}
 	// 新游标正常增量
-	res2, err := s.Changes(3, 100)
+	res2, err := s.Changes(db.LegacyDefaultScope(), 3, 100)
 	if err != nil || res2.ResyncRequired || len(res2.Changes) != 0 {
 		t.Fatalf("changes(3) = %+v (%v)", res2, err)
 	}
@@ -155,7 +155,7 @@ func TestClockSurvivesChangesPrune(t *testing.T) {
 	}
 
 	// 快照 sequence 与 head 一致
-	snap, err := s.Snapshot()
+	snap, err := s.Snapshot(db.LegacyDefaultScope())
 	if err != nil || snap.Sequence != 4 {
 		t.Fatalf("snapshot sequence = %d (%v), want 4", snap.Sequence, err)
 	}
@@ -231,12 +231,12 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 	s := newService(t, syncsvc.Options{HistoryEnabled: true, HistoryDays: 90, HistoryMaxPerFile: 10})
 	old := []byte("sensitive old content")
 	upload(t, s, "secret.md", 0, old)
-	if _, err := s.Delete(syncsvc.DeleteParams{Path: "secret.md", BaseRevision: 1, DeviceID: "d1"}); err != nil {
+	if _, err := s.Delete(db.LegacyDefaultScope(), syncsvc.DeleteParams{Path: "secret.md", BaseRevision: 1, DeviceID: "d1"}); err != nil {
 		t.Fatal(err)
 	}
 
 	// 陈旧设备用 base 0 回传旧内容 → 409 + priorHash
-	_, err := s.Upload(syncsvc.UploadParams{
+	_, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "secret.md", ClaimedHash: sha256HexT(old), DeviceID: "stale-device", Action: "upsert",
 	}, bytes.NewReader(old))
 	var conflict *syncsvc.ConflictError
@@ -249,7 +249,7 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 
 	// v6：带任意 baseRevision 的普通上传都无法穿透墓碑——重建必须走显式 restore
 	newContent := []byte("brand new note")
-	_, err = s.Upload(syncsvc.UploadParams{
+	_, err = s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "secret.md", BaseRevision: conflict.Revision, ClaimedHash: sha256HexT(newContent),
 		DeviceID: "d2", Action: "upsert",
 	}, bytes.NewReader(newContent))
@@ -258,14 +258,14 @@ func TestTombstoneResurrectionGuard(t *testing.T) {
 	}
 
 	// 显式恢复：revision 连续（2 → 3），身份不变
-	rr, err := s.Restore(syncsvc.RestoreParams{
+	rr, err := s.Restore(db.LegacyDefaultScope(), syncsvc.RestoreParams{
 		FileID: conflict.FileID, ExpectedTombstoneRevision: conflict.Revision,
 		ContentGeneration: 1, Pseudonym: "secret.md", DeviceID: "d2",
 	})
 	if err != nil || rr.Revision != 3 {
 		t.Fatalf("restore = %v %v", err, rr)
 	}
-	res, err := s.Upload(syncsvc.UploadParams{
+	res, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 		Path: "secret.md", BaseRevision: rr.Revision, ClaimedHash: sha256HexT(newContent),
 		DeviceID: "d2", Action: "upsert",
 	}, bytes.NewReader(newContent))
@@ -304,7 +304,7 @@ func TestIntegrityScrubDetectsCorruption(t *testing.T) {
 
 	// 截断 bad.md 的 blob（尺寸不符必被检出，不依赖抽样）
 	hash := sha256HexT(bad)
-	blobID, err := s.BlobIDOf(hash)
+	blobID, err := s.BlobIDOf(db.LegacyDefaultScope(), hash)
 	if err != nil {
 		t.Fatal(err)
 	}

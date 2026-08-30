@@ -207,7 +207,7 @@ func opsMigration(args []string) error {
 	switch args[0] {
 	case "preflight":
 		// §15 第 3/6/7 步。--client 给出要求的客户端版本；不给则只报告未知版本数
-		rep, err := svc.MigrationPreflight(flagValue(args[1:], "--client"))
+		rep, err := svc.MigrationPreflight(db.LegacyDefaultScope(), flagValue(args[1:], "--client"))
 		if err != nil {
 			return err
 		}
@@ -235,7 +235,7 @@ func opsMigration(args []string) error {
 		return nil
 
 	case "status":
-		st, err := svc.MigrationStatusOf()
+		st, err := svc.MigrationStatusOf(db.LegacyDefaultScope())
 		if err != nil {
 			return err
 		}
@@ -246,7 +246,7 @@ func opsMigration(args []string) error {
 	case "resume":
 		// 「续做」不是服务端替客户端做迁移——迁移需要密钥，服务器没有。
 		// 这里能做的是把过期租约清掉，让任一在线设备可以接管
-		n, err := svc.ExpireStaleMigrationLease(time.Now())
+		n, err := svc.ExpireStaleMigrationLease(db.LegacyDefaultScope(), time.Now())
 		if err != nil {
 			return err
 		}
@@ -258,7 +258,7 @@ func opsMigration(args []string) error {
 		return nil
 
 	case "abort":
-		if _, err := svc.AbortMetaMigration(); err != nil {
+		if _, err := svc.AbortMetaMigration(db.LegacyDefaultScope()); err != nil {
 			return err
 		}
 		fmt.Println("迁移已中止，仓库回到 plain 状态；已迁移的对象仍然可读。")

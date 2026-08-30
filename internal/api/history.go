@@ -31,7 +31,7 @@ func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
-	versions, err := h.svc.History(path)
+	versions, err := h.svc.History(scopeOf(r), path)
 	if err != nil {
 		switch {
 		case errors.Is(err, storage.ErrInvalidPath):
@@ -73,7 +73,7 @@ func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid revision")
 		return
 	}
-	meta, rc, err := h.svc.OpenVersion(path, revision)
+	meta, rc, err := h.svc.OpenVersion(scopeOf(r), path, revision)
 	if err != nil {
 		switch {
 		case errors.Is(err, syncsvc.ErrCorrupted):

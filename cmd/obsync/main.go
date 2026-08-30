@@ -1,4 +1,4 @@
-// obsync：单用户 Obsidian 私有同步服务器。
+// obsync：自托管 Obsidian 私有同步服务器（v0.18 起支持小范围多用户）。
 package main
 
 import (
@@ -21,7 +21,7 @@ import (
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.17.1"
+const version = "0.19.0-rc.1"
 
 func main() {
 	// rotate-epoch：灾备恢复后的必要步骤（服务停止时执行）。
@@ -30,6 +30,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "rotate-epoch" {
 		if err := rotateEpoch(); err != nil {
 			fmt.Fprintln(os.Stderr, "obsync rotate-epoch:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// token reset：API Token 重置的 SSH 兜底（v0.18）。
+	// 网页端的重置受 E2EE 重置凭证保护；shell 权限即最终授权，这里不设门禁。
+	if len(os.Args) > 1 && os.Args[1] == "token" {
+		if err := runToken(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "obsync token:", err)
 			os.Exit(1)
 		}
 		return
@@ -62,13 +71,28 @@ func rotateEpoch() error {
 		return err
 	}
 	defer database.Close()
-	// rotate-epoch 是运维命令，没有 HTTP 认证上下文：显式作用于默认 Vault。
-	// 多 Vault 部署下它需要接受一个 --vault 参数，届时这里会硬失败而不是猜。
-	epoch, err := db.RotateEpoch(database, db.LegacyDefaultScope())
-	if err != nil {
-		return err
+	// rotate-epoch 是运维命令，没有 HTTP 认证上下文。
+	// v0.18 多 Vault：默认作用于 default；--vault <id> 指定其他租户；
+	// --all 逐个旋转（灾备恢复后应对所有 Vault 执行）。
+	var scopes []db.VaultScope
+	switch {
+	case len(os.Args) > 3 && os.Args[2] == "--vault":
+		scopes = []db.VaultScope{db.ScopeFromAuth(os.Args[3])}
+	case len(os.Args) > 2 && os.Args[2] == "--all":
+		var err error
+		if scopes, err = db.AllVaultScopes(database); err != nil {
+			return err
+		}
+	default:
+		scopes = []db.VaultScope{db.LegacyDefaultScope()}
 	}
-	fmt.Printf("repo epoch rotated: %s\n", epoch)
+	for _, scope := range scopes {
+		epoch, err := db.RotateEpoch(database, scope)
+		if err != nil {
+			return fmt.Errorf("vault %s: %w", scope.ID(), err)
+		}
+		fmt.Printf("repo epoch rotated (vault %s): %s\n", scope.ID(), epoch)
+	}
 	fmt.Println("clients will pause normal sync and enter recovery merge on next contact")
 	return nil
 }
@@ -152,6 +176,14 @@ func run() error {
 	if err := svc.InitVaultSecret(); err != nil {
 		return fmt.Errorf("init vault secret: %w", err)
 	}
+	// v0.18：管理员账号与 Token 哈希落库（幂等对账）。
+	// OBSYNC_TOKEN 从「唯一凭据」降级为「首次初始化的种子」；
+	// 网页端轮换过之后以库为准，环境变量失效（对账函数里会打醒目警告）。
+	if _, err := svc.EnsureAdminAccount(cfg.Token); err != nil {
+		return fmt.Errorf("reconcile admin account: %w", err)
+	}
+	// v0.18 实测事故的自检：残留的「enabled 密钥文档 + plaintext 仓库」矛盾会挡停新设备
+	svc.CheckE2eeConsistency()
 	// 存量数据的域化迁移是**告警**而不是硬门槛：混合状态读写都正确
 	// （每一行的 blob_id 自带「文件在哪」），只是老数据上还存在跨租户
 	// 存在性预言机。拒绝启动只会逼运维在没备份的情况下跑一个不可逆迁移。

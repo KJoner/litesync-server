@@ -72,6 +72,10 @@ func randomEpoch() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
+// EnsureRepoStateFor 保证某 Vault 的 repo_state 行存在（幂等）。
+// 注册流程在建完 Vault 后调用；新 Vault 的 head_sequence 从 0 起步。
+func EnsureRepoStateFor(d *sql.DB, s VaultScope) error { return initRepoState(d, s) }
+
 // initRepoState 初始化 repo_state（幂等，db.Open 时调用）。
 // 旧库迁移：head 取 MAX(sequence)、sqlite_sequence、旧水位线三者最大值，
 // 保证升级后 head 绝不小于任何客户端已见过的 sequence。
@@ -88,25 +92,31 @@ func initRepoState(d *sql.DB, s VaultScope) error {
 	}
 
 	var maxChanges, sqliteSeq, watermark int64
-	// v5 库升级时 changes 表可能还在；新库则只有 object_changes
-	for _, q := range []string{
-		`SELECT COALESCE(MAX(sequence), 0) FROM changes`,
-		`SELECT COALESCE(MAX(sequence), 0) FROM object_changes`,
-	} {
-		var v int64
-		if err := d.QueryRow(q).Scan(&v); err == nil && v > maxChanges {
-			maxChanges = v
+	// v5 库升级时 changes 表可能还在；新库则只有 object_changes。
+	// 这套兜底只属于 default（单用户升级路径）：新建的用户 Vault 必须从 0 起步——
+	// 从全实例最大值起步会把「别的租户写了多少」泄露进自己的 head_sequence。
+	if s.ID() == DefaultVaultID {
+		for _, q := range []string{
+			`SELECT COALESCE(MAX(sequence), 0) FROM changes`,
+			`SELECT COALESCE(MAX(sequence), 0) FROM object_changes`,
+		} {
+			var v int64
+			if err := d.QueryRow(q).Scan(&v); err == nil && v > maxChanges {
+				maxChanges = v
+			}
 		}
 	}
-	// AUTOINCREMENT 的历史最大值（changes 被整表裁剪后仍然保留）
-	err := d.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name = 'changes'`).Scan(&sqliteSeq)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if v, ok, err := GetMeta(d, "changes-watermark"); err != nil {
-		return err
-	} else if ok {
-		fmt.Sscanf(v, "%d", &watermark) //nolint:errcheck
+	if s.ID() == DefaultVaultID {
+		// AUTOINCREMENT 的历史最大值（changes 被整表裁剪后仍然保留）
+		err := d.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name = 'changes'`).Scan(&sqliteSeq)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if v, ok, err := GetMeta(d, "changes-watermark"); err != nil {
+			return err
+		} else if ok {
+			fmt.Sscanf(v, "%d", &watermark) //nolint:errcheck
+		}
 	}
 
 	head := max(maxChanges, sqliteSeq, watermark)

@@ -43,7 +43,7 @@ type PublishCheckpointParams struct {
 }
 
 // PublishCheckpoint 保存一个由设备签名的 checkpoint。
-func (s *Service) PublishCheckpoint(p PublishCheckpointParams) error {
+func (s *Service) PublishCheckpoint(scope db.VaultScope, p PublishCheckpointParams) error {
 	if p.Hash == "" || p.Body == "" || p.Signature == "" || p.DeviceID == "" {
 		return ErrCheckpointInvalid
 	}
@@ -54,7 +54,7 @@ func (s *Service) PublishCheckpoint(p PublishCheckpointParams) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return err
 	}
@@ -93,7 +93,7 @@ func (s *Service) PublishCheckpoint(p PublishCheckpointParams) error {
 	// 服务器悄悄拒掉第二份，等于替用户隐瞒了一次 equivocation。
 	return db.InsertCheckpoint(s.db, &db.Checkpoint{
 		Hash:            p.Hash,
-		VaultID:         db.DefaultVaultID,
+		VaultID:         scope.ID(),
 		RepoEpoch:       p.RepoEpoch,
 		HeadSequence:    p.HeadSequence,
 		PreviousHash:    p.PreviousHash,
@@ -131,27 +131,27 @@ type CheckpointBundle struct {
 }
 
 // Checkpoints 返回给定游标之后的 checkpoint 链与分叉证据。
-func (s *Service) Checkpoints(sinceSequence int64, limit int) (*CheckpointBundle, error) {
+func (s *Service) Checkpoints(scope db.VaultScope, sinceSequence int64, limit int) (*CheckpointBundle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
-	list, err := db.CheckpointsSince(s.db, db.DefaultVaultID, rs.RepoEpoch, sinceSequence, limit)
+	list, err := db.CheckpointsSince(s.db, scope.ID(), rs.RepoEpoch, sinceSequence, limit)
 	if err != nil {
 		return nil, err
 	}
 	out := &CheckpointBundle{RepoEpoch: rs.RepoEpoch, Checkpoints: list, SigningKeys: map[string]string{}}
 
 	// 同一 head 上的多份 checkpoint = equivocation 证据，原样带上
-	latest, err := db.LatestCheckpoint(s.db, db.DefaultVaultID, rs.RepoEpoch)
+	latest, err := db.LatestCheckpoint(s.db, scope.ID(), rs.RepoEpoch)
 	if err != nil {
 		return nil, err
 	}
 	if latest != nil {
-		at, aerr := db.CheckpointsAtSequence(s.db, db.DefaultVaultID, rs.RepoEpoch, latest.HeadSequence)
+		at, aerr := db.CheckpointsAtSequence(s.db, scope.ID(), rs.RepoEpoch, latest.HeadSequence)
 		if aerr != nil {
 			return nil, aerr
 		}

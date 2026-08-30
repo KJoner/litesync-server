@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KJoner/litesync-server/internal/db"
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
@@ -87,7 +88,7 @@ func (h *handlers) adminRevokeDevice(w http.ResponseWriter, r *http.Request) {
 // 把租约持有者、截止 sequence 与 journal 进度放在一个地方，
 // 是为了让「现在到底卡在哪」这个问题一眼能答。
 func (h *handlers) adminMigrationStatus(w http.ResponseWriter, _ *http.Request) {
-	st, err := h.svc.MigrationStatusOf()
+	st, err := h.svc.MigrationStatusOf(db.LegacyDefaultScope())
 	if err != nil {
 		h.internalError(w, "admin migration status", err)
 		return
@@ -96,7 +97,7 @@ func (h *handlers) adminMigrationStatus(w http.ResponseWriter, _ *http.Request) 
 	if berr != nil {
 		h.svc.Logf("admin: blobid migration check failed: %v", berr)
 	}
-	rewrap, rerr := h.svc.PendingRewrapEpoch()
+	rewrap, rerr := h.svc.PendingRewrapEpoch(db.LegacyDefaultScope())
 	if rerr != nil {
 		h.svc.Logf("admin: pending rewrap check failed: %v", rerr)
 	}
@@ -110,7 +111,7 @@ func (h *handlers) adminMigrationStatus(w http.ResponseWriter, _ *http.Request) 
 // adminShares 列出全部分享（含已撤销与已过期）。
 // GET /api/v1/admin/shares
 func (h *handlers) adminShares(w http.ResponseWriter, _ *http.Request) {
-	shares, err := h.svc.ListShares()
+	shares, err := h.svc.AdminListShares()
 	if err != nil {
 		h.internalError(w, "admin shares", err)
 		return
@@ -185,7 +186,7 @@ func (h *handlers) adminRevokeShare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing share id")
 		return
 	}
-	err := h.svc.RevokeShare(id)
+	err := h.svc.AdminRevokeShare(id)
 	switch {
 	case errors.Is(err, syncsvc.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "share not found")
@@ -253,7 +254,7 @@ func (h *handlers) adminRestorePlan(w http.ResponseWriter, r *http.Request) {
 // 与 CLI 的 `obsync migration preflight` 是同一份逻辑。放到 Web 上是因为
 // §15 的第 3 步要挨个核对设备，而那件事在浏览器里做比 SSH 上去做自然得多。
 func (h *handlers) adminPreflight(w http.ResponseWriter, r *http.Request) {
-	rep, err := h.svc.MigrationPreflight(r.URL.Query().Get("client"))
+	rep, err := h.svc.MigrationPreflight(db.LegacyDefaultScope(), r.URL.Query().Get("client"))
 	if err != nil {
 		h.internalError(w, "admin preflight", err)
 		return

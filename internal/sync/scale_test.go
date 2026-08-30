@@ -42,7 +42,7 @@ func TestScaleSnapshotChangesScrubGC(t *testing.T) {
 	start := time.Now()
 	for i := 0; i < n; i++ {
 		content := []byte(fmt.Sprintf("content of note %d", i))
-		if _, err := s.Upload(syncsvc.UploadParams{
+		if _, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 			Path:         fmt.Sprintf("notes/%04d/note-%06d.md", i%100, i),
 			BaseRevision: 0, ClaimedHash: sha256HexT(content),
 			DeviceID: "scale", Action: "upsert",
@@ -54,7 +54,7 @@ func TestScaleSnapshotChangesScrubGC(t *testing.T) {
 
 	// snapshot：必须一条不少。分页/截断类 bug 只有在大集合上才暴露
 	t0 := time.Now()
-	snap, err := s.Snapshot()
+	snap, err := s.Snapshot(db.LegacyDefaultScope())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestScaleSnapshotChangesScrubGC(t *testing.T) {
 	seen := map[string]bool{}
 	var cursor int64
 	for {
-		resp, cerr := s.Changes(cursor, 500)
+		resp, cerr := s.Changes(db.LegacyDefaultScope(), cursor, 500)
 		if cerr != nil {
 			t.Fatal(cerr)
 		}
@@ -116,12 +116,12 @@ func TestScaleSnapshotChangesScrubGC(t *testing.T) {
 }
 
 func assertAllHeadsReadable(s *syncsvc.Service) error {
-	heads, err := db.ListHeads(s.DB())
+	heads, err := db.ListHeads(s.DB(), db.LegacyDefaultScope())
 	if err != nil {
 		return err
 	}
 	for i := range heads {
-		_, rc, oerr := s.OpenFile(heads[i].Pseudonym)
+		_, rc, oerr := s.OpenFile(db.LegacyDefaultScope(), heads[i].Pseudonym)
 		if oerr != nil {
 			return fmt.Errorf("%s: %w", heads[i].Pseudonym, oerr)
 		}
@@ -140,7 +140,7 @@ func TestScaleHistoryRetentionHolds(t *testing.T) {
 	var rev int64
 	for i := 0; i < 60; i++ {
 		content := []byte(fmt.Sprintf("revision %d", i))
-		res, err := s.Upload(syncsvc.UploadParams{
+		res, err := s.Upload(db.LegacyDefaultScope(), syncsvc.UploadParams{
 			Path: "hot.md", BaseRevision: rev, ClaimedHash: sha256HexT(content),
 			DeviceID: "scale", Action: "upsert",
 		}, bytes.NewReader(content))
@@ -149,7 +149,7 @@ func TestScaleHistoryRetentionHolds(t *testing.T) {
 		}
 		rev = res.Revision
 	}
-	versions, err := s.History("hot.md")
+	versions, err := s.History(db.LegacyDefaultScope(), "hot.md")
 	if err != nil {
 		t.Fatal(err)
 	}

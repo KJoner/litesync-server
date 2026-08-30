@@ -79,10 +79,20 @@ func (r Role) CanWrite() bool { return r == RoleOwner || r == RoleAdmin || r == 
 func (r Role) CanAdmin() bool { return r == RoleOwner || r == RoleAdmin }
 
 // User 是一个账号。
+//
+// TokenHash / TokenGeneration / IsAdmin / Disabled / LastSeenAt 为 v0.18 新增
+// （用户 API Token 落库，见 internal/db/users.go 的包注释）。
 type User struct {
 	UserID    string
 	Name      string
 	CreatedAt int64
+	// TokenHash：API Token 的 SHA-256。明文永不落库。
+	TokenHash string
+	// TokenGeneration：会话世代。每次轮换 +1，旧世代的网页会话即拒。
+	TokenGeneration int64
+	IsAdmin         bool
+	Disabled        bool
+	LastSeenAt      int64
 }
 
 // Vault 是一个独立的同步仓库。

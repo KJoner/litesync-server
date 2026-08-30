@@ -15,6 +15,9 @@ import (
 )
 
 type Options struct {
+	// Token：OBSYNC_TOKEN 环境变量。v0.18 起只是**首次初始化的种子**——
+	// 认证一律查 users 表（EnsureAdminAccount 在启动时完成对账）；
+	// 网页端轮换过之后，这个值即失效（以库为准）。
 	Token       string
 	MaxFileSize int64
 	Version     string
@@ -36,6 +39,13 @@ type handlers struct {
 // /api/* 要求 Bearer Token（完整权限）或 Web 只读会话（白名单 GET）。
 func New(opts Options, svc *syncsvc.Service) http.Handler {
 	h := &handlers{svc: svc, opts: opts, web: newSessionStore(), trusted: parseTrustedProxies(opts.TrustedProxies)}
+
+	// v0.18 启动对账：管理员账号与 Token 哈希落库（幂等）。
+	// 失败不 panic——认证会自然拒绝一切请求，日志里有原因；
+	// main.go 里的显式调用才是致命路径。
+	if _, err := svc.EnsureAdminAccount(opts.Token); err != nil {
+		opts.Logger.Error("admin account reconcile failed", "error", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /web/session", h.createSession)
@@ -59,6 +69,17 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/token", h.issueAccessToken)
 	mux.HandleFunc("DELETE /api/v1/members/{userId}", h.removeMember)
 	mux.HandleFunc("GET /api/v1/audit", h.auditTrail)
+
+	// 账户自救（v0.18 / v11 设计 §4.3）：Token 重置与重置凭证登记
+	mux.HandleFunc("POST /api/v1/account/token-reset", h.tokenReset)
+	mux.HandleFunc("PUT /api/v1/vault/reset-auth", h.putResetAuth)
+
+	// 单用户多仓库（v0.19）：目标仓库由 X-Vault-ID 选择（authGate 解析），
+	// 这里是仓库生命周期
+	mux.HandleFunc("GET /api/v1/vaults", h.listVaults)
+	mux.HandleFunc("POST /api/v1/vaults", h.createVault)
+	mux.HandleFunc("PATCH /api/v1/vaults/{id}", h.renameVault)
+	mux.HandleFunc("DELETE /api/v1/vaults/{id}", h.deleteVault)
 
 	// E2EE 状态机（v9）：迁移期间冻结明文写，完成时验证全部 HEAD 均为密文
 	mux.HandleFunc("POST /api/v1/e2ee/begin", h.e2eeBegin)
@@ -122,6 +143,19 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /pair/{id}/consume", h.consumePairing)
 	mux.HandleFunc("GET /p/{id}", h.pairLanding)
 
+	// 多用户（v0.18 / v11 设计 §5.5–§5.7）：管理员生成邀请、用户经链接自助注册。
+	// /join/* 与 /pair/* 同模式：不带 /api/ 前缀 = 公开，secret 即凭证（32B CSPRNG）
+	mux.HandleFunc("POST /api/v1/admin/invites", h.adminCreateInvite)
+	mux.HandleFunc("GET /api/v1/admin/invites", h.adminListInvites)
+	mux.HandleFunc("DELETE /api/v1/admin/invites/{id}", h.adminRevokeInvite)
+	mux.HandleFunc("GET /api/v1/admin/users", h.adminListUsers)
+	mux.HandleFunc("POST /api/v1/admin/users/{id}/disable", h.adminSetUserDisabled(true))
+	mux.HandleFunc("POST /api/v1/admin/users/{id}/enable", h.adminSetUserDisabled(false))
+	mux.HandleFunc("DELETE /api/v1/admin/users/{id}", h.adminDeleteUser)
+	mux.HandleFunc("GET /join/{secret}", h.joinLanding)
+	mux.HandleFunc("GET /join/{secret}/info", h.joinInfo)
+	mux.HandleFunc("POST /join/{secret}/register", h.joinRegister)
+
 	// 设备级凭据（v9.2）：配对包 v2 传一次性注册凭据，根 Token 不再下发到新设备
 	mux.HandleFunc("POST /enroll", h.enrollDevice) // 公开：secret 即认证
 	mux.HandleFunc("POST /api/v1/devices", h.createDevice)
@@ -136,7 +170,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 		mux.Handle("GET /", http.FileServerFS(dist))
 	}
 
-	return requestLog(opts.Logger, securityHeaders(authGate(opts.Token, h.web, svc, h.trusted, mux)))
+	return requestLog(opts.Logger, securityHeaders(authGate(h.web, svc, h.trusted, mux)))
 }
 
 // 协议版本由服务层定义（逐请求校验发生在那里）；这里只做转发。
@@ -149,17 +183,26 @@ func (h *handlers) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (h *handlers) info(w http.ResponseWriter, _ *http.Request) {
+func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 	// vaultId：本仓库的稳定身份（v8）。客户端 Bootstrap 后保存，
 	// 发现同一 URL 上 vaultId 变化（服务器重装/换库）即停止自动同步重新接入。
 	// repoEpoch（v9）：sequence 空间的世代——从备份恢复后旋转，
 	// 客户端据此进入灾备合并而不是沿用旧游标漏掉变更。
-	ri, err := h.svc.RepoInfo()
+	ri, err := h.svc.RepoInfo(scopeOf(r))
+	if err != nil {
+		h.internalError(w, "info", err)
+		return
+	}
+	// resetAuthConfigured（v0.18）：重置凭证是否已登记。客户端解锁 E2EE 后
+	// 见 false 即自动补登记（PUT /api/v1/vault/reset-auth），
+	// 让「重置 Token 需要 E2EE 密码」这道关卡尽早立起来。
+	resetAuth, err := h.svc.ResetAuthConfigured(scopeOf(r))
 	if err != nil {
 		h.internalError(w, "info", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"resetAuthConfigured": resetAuth,
 		"version":            h.opts.Version,
 		"protocolVersion":    ProtocolVersion,
 		"minProtocolVersion": MinProtocolVersion,
@@ -234,6 +277,12 @@ const (
 	CodeForbidden           = "FORBIDDEN"
 	CodeTooLarge            = "TOO_LARGE"
 	CodeInternal            = "INTERNAL"
+	// --- v0.18 新增（v11 设计 §7） ---
+	// CodeTokenRevoked：凭据曾有效、已被撤销（Token 重置或设备撤销）。
+	// 客户端据此给「填新 Token 重新接入」的指引，而不是含糊的认证失败。
+	CodeTokenRevoked = "TOKEN_REVOKED"
+	// CodeResetAuthMismatch：重置凭证（E2EE 密码知识证明）不符。
+	CodeResetAuthMismatch = "RESET_AUTH_MISMATCH"
 )
 
 // writeCoded 统一错误响应体：{code, message, retryable}。

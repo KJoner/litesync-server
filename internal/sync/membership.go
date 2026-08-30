@@ -15,29 +15,37 @@ var ErrNotAuthorized = errors.New("not authorized: this action requires owner or
 
 // Actor 是发起治理动作的主体。
 //
-// 刻意不是一个裸字符串：把「根 Token」和「某台设备」揉进同一个 string 里，
-// 迟早会有人用一个恰好等于哨兵值的 deviceID 冒充根身份。
+// 刻意不是一个裸字符串：把「管理员」和「某台设备」揉进同一个 string 里，
+// 迟早会有人用一个恰好等于哨兵值的 deviceID 冒充管理身份。
 type Actor struct {
-	// Root：根 Token。服务器管理员，在所有角色之上，且不需要是成员。
+	// Root：实例管理员（users.is_admin，v0.18 前是环境变量根 Token）。
+	// 在所有角色之上，且不需要是成员。
 	Root bool
+	// UserID：用户级 Token 的账号身份（非管理员时按 membership 查角色）。
+	// 这个值来自认证层查库，不是请求里声称的。
+	UserID string
 	// DeviceID：设备凭据。服务器自己去查这台设备属于哪个用户——
 	// 请求里声称的用户身份一律不作数。
 	DeviceID string
 }
 
 // resolve 把 Actor 解析成 (用户 id, 是否有管理权限)。
-func (s *Service) resolve(a Actor) (string, bool, error) {
+func (s *Service) resolve(scope db.VaultScope, a Actor) (string, bool, error) {
 	if a.Root {
 		return db.RootActorID, true, nil
 	}
-	if a.DeviceID == "" {
-		return "", false, nil
+	userID := a.UserID
+	if userID == "" {
+		if a.DeviceID == "" {
+			return "", false, nil
+		}
+		var err error
+		_, userID, err = db.DeviceTenant(s.db, a.DeviceID)
+		if err != nil || userID == "" {
+			return "", false, err
+		}
 	}
-	_, userID, err := db.DeviceTenant(s.db, a.DeviceID)
-	if err != nil || userID == "" {
-		return "", false, err
-	}
-	role, ok, err := db.RoleOf(s.db, s.scope(), userID)
+	role, ok, err := db.RoleOf(s.db, scope, userID)
 	if err != nil {
 		return "", false, err
 	}
@@ -64,15 +72,14 @@ const LocalPlaintextNotice = "对方已经同步到本地的内容仍然留在�
 //
 // 服务器拿不到 Vault Key，因此第 4 步只能是「记下待办」——真正的重新封装
 // 由管理员设备用剩余成员的公钥完成，然后 PUT 新的 vault-key 文档。
-func (s *Service) RemoveMember(actor Actor, targetUserID string) (*db.MembershipRemoval, error) {
+func (s *Service) RemoveMember(scope db.VaultScope, actor Actor, targetUserID string) (*db.MembershipRemoval, error) {
 	if targetUserID == "" {
 		return nil, fmt.Errorf("target user is required")
 	}
-	scope := s.scope()
 	// 确保 Vault 记录存在：轮换要往 vaults 上写「待重新封装」，
 	// 而一台从未上传过内容的新服务器可能还没有这一行。
 	// vaultSecret 是这条记录的规范创建入口（它会读写数据库，所以必须在事务外调用）。
-	if _, err := s.vaultSecret(); err != nil {
+	if _, err := s.vaultSecretFor(scope); err != nil {
 		return nil, err
 	}
 
@@ -80,7 +87,7 @@ func (s *Service) RemoveMember(actor Actor, targetUserID string) (*db.Membership
 	defer s.mu.Unlock()
 
 	// 授权判断只看数据库里的成员关系，不看请求里的任何声明
-	actorUserID, canAdmin, err := s.resolve(actor)
+	actorUserID, canAdmin, err := s.resolve(scope, actor)
 	if err != nil {
 		return nil, err
 	}
@@ -156,8 +163,8 @@ func (s *Service) RemoveMember(actor Actor, targetUserID string) (*db.Membership
 }
 
 // PendingRewrapEpoch 返回等待重新封装的 keyEpoch；0 表示没有待办。
-func (s *Service) PendingRewrapEpoch() (int64, error) {
-	return db.PendingRewrap(s.db, s.scope())
+func (s *Service) PendingRewrapEpoch(scope db.VaultScope) (int64, error) {
+	return db.PendingRewrap(s.db, scope)
 }
 
 // ErrRewrapRequired：Vault Key 还没有为新 epoch 重新封装。
@@ -169,8 +176,7 @@ var ErrRewrapRequired = errors.New("vault key must be rewrapped for the new key 
 // ClearPendingRewrap 在管理员设备上传了新 epoch 的 Vault Key 之后清除待办。
 //
 // epoch 必须与待办的 epoch 一致：上传一份仍属于旧 epoch 的文档不算完成轮换。
-func (s *Service) ClearPendingRewrap(epoch int64) error {
-	scope := s.scope()
+func (s *Service) ClearPendingRewrap(scope db.VaultScope, epoch int64) error {
 	pending, err := db.PendingRewrap(s.db, scope)
 	if err != nil {
 		return err
@@ -193,8 +199,8 @@ func (s *Service) ClearPendingRewrap(epoch int64) error {
 }
 
 // AuditTrail 返回该 Vault 最近的治理审计记录。
-func (s *Service) AuditTrail(limit int) ([]db.AuditEvent, error) {
-	return db.ListAudit(s.db, s.scope(), limit)
+func (s *Service) AuditTrail(scope db.VaultScope, limit int) ([]db.AuditEvent, error) {
+	return db.ListAudit(s.db, scope, limit)
 }
 
 // ServedVaultID 返回这个实例所服务的租户标识（vaults.vault_id）。
@@ -205,4 +211,4 @@ func (s *Service) AuditTrail(limit int) ([]db.AuditEvent, error) {
 //
 // 认证层用它拒绝指向别的 Vault 的凭据（§10.6）。返回的是**服务端**认定的
 // 范围，不是请求里声称的——后者永远不作数。
-func (s *Service) ServedVaultID() string { return s.scope().ID() }
+func (s *Service) ServedVaultID() string { return s.defaultScope().ID() }

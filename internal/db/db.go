@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema + invitesSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -130,6 +130,28 @@ func migrateColumns(d *sql.DB) error {
 		// 只有设备名的列表回答不了这两个问题。
 		{"devices", "platform", `ALTER TABLE devices ADD COLUMN platform TEXT NOT NULL DEFAULT ''`, false},
 		{"devices", "last_ip", `ALTER TABLE devices ADD COLUMN last_ip TEXT NOT NULL DEFAULT ''`, false},
+
+		// --- v0.18 用户 API Token 落库与多用户（v11 设计 §4.1、§5.2） ---
+		// token_hash 只存 SHA-256；token_generation 是会话世代（轮换 +1，旧会话即拒）
+		{"users", "token_hash", `ALTER TABLE users ADD COLUMN token_hash TEXT`, false},
+		{"users", "token_generation", `ALTER TABLE users ADD COLUMN token_generation INTEGER NOT NULL DEFAULT 1`, false},
+		{"users", "is_admin", `ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`, false},
+		{"users", "disabled", `ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`, false},
+		{"users", "last_seen_at", `ALTER TABLE users ADD COLUMN last_seen_at INTEGER`, false},
+		// identity：/api/v1/info 返回的仓库稳定身份，多 Vault 后按 Vault 独立；
+		// default vault 的值由 migrateVaultIdentity 从 vault_meta 拷贝，保证升级
+		// 不会让现有客户端误判「服务器换库」而重新对账。
+		{"vaults", "identity", `ALTER TABLE vaults ADD COLUMN identity TEXT NOT NULL DEFAULT ''`, false},
+		// reset_auth_hash：重置凭证（E2EE 密码知识证明）的哈希，见 users.go
+		{"vaults", "reset_auth_hash", `ALTER TABLE vaults ADD COLUMN reset_auth_hash TEXT`, false},
+		// enrollments 的归属（v11 设计 §5.4）：一次性注册凭据在**创建时**就定死
+		// 新设备将落到哪个 (vault, user)——消费方无法声称自己属于别的租户
+		{"enrollments", "vault_id", `ALTER TABLE enrollments ADD COLUMN vault_id TEXT NOT NULL DEFAULT 'default'`, false},
+		{"enrollments", "user_id", `ALTER TABLE enrollments ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`, false},
+		// shares / pairings 的归属（v11 设计 §5.4）：创建/列表/撤销按 Vault 隔离；
+		// 公开读取路径（分享链接、配对落地页）仍按不可猜测的 id 寻址，行为不变
+		{"shares", "vault_id", `ALTER TABLE shares ADD COLUMN vault_id TEXT NOT NULL DEFAULT 'default'`, false},
+		{"pairings", "vault_id", `ALTER TABLE pairings ADD COLUMN vault_id TEXT NOT NULL DEFAULT 'default'`, false},
 	}
 
 	for _, m := range migrations {
@@ -151,6 +173,20 @@ func migrateColumns(d *sql.DB) error {
 			if _, err := d.Exec(m.ddl); err != nil {
 				return err
 			}
+		}
+	}
+
+	// v0.18：Token 哈希查找与用户名唯一性。
+	// name 的唯一性只约束非空名（v0.16 基座的测试用户 name 为空，不应互相冲突）。
+	for _, ddl := range []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token_hash ON users(token_hash) WHERE token_hash IS NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name) WHERE name != ''`,
+		// 存量设备归属回填（幂等）：v0.16 加列时的默认值是 ''，而单用户阶段的
+		// 全部设备事实上属于管理员。InsertDevice 已强制归属兜底，此后不会再有空值行。
+		`UPDATE devices SET user_id = 'default' WHERE user_id = ''`,
+	} {
+		if _, err := d.Exec(ddl); err != nil {
+			return err
 		}
 	}
 

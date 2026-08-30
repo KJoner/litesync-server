@@ -235,7 +235,7 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 
 	// ---- revision / generation 连续性（INV-05 / v10 计划 §4.2） ----
 	const idA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	head, err := db.GetHead(d, idA)
+	head, err := db.GetHead(d, db.LegacyDefaultScope(), idA)
 	if err != nil || head == nil {
 		t.Fatalf("head A = %v %v", head, err)
 	}
@@ -253,7 +253,7 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 	}
 
 	// ---- 历史按 fileId 归属，全部保留 ----
-	versions, err := db.ListVersions(d, idA)
+	versions, err := db.ListVersions(d, db.LegacyDefaultScope(), idA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 
 	// ---- 删除记录进台账，防复活锚点完整（INV-06） ----
 	const idDel = "dddddddddddddddddddddddddddddddd"
-	tomb, err := db.GetTombstone(d, idDel)
+	tomb, err := db.GetTombstone(d, db.LegacyDefaultScope(), idDel)
 	if err != nil || tomb == nil {
 		t.Fatalf("tombstone = %v %v", tomb, err)
 	}
@@ -281,7 +281,7 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 	if tomb.LastPseudonym != "gone.md" {
 		t.Fatalf("lastPseudonym = %q", tomb.LastPseudonym)
 	}
-	if state, _ := db.ObjectState(d, idDel); state != db.ObjectDeleted {
+	if state, _ := db.ObjectState(d, db.LegacyDefaultScope(), idDel); state != db.ObjectDeleted {
 		t.Fatalf("object state = %q, want deleted", state)
 	}
 	if tomb.NeedsReview {
@@ -289,7 +289,7 @@ func TestV6MigrationPreservesIdentityAndHistory(t *testing.T) {
 	}
 	// 疑似假删除同样被保留，但带上了 needs_review 标记
 	const idTomb = "cccccccccccccccccccccccccccccccc"
-	suspect, err := db.GetTombstone(d, idTomb)
+	suspect, err := db.GetTombstone(d, db.LegacyDefaultScope(), idTomb)
 	if err != nil || suspect == nil {
 		t.Fatalf("suspect tombstone must be kept, not dropped: %v %v", suspect, err)
 	}
@@ -374,14 +374,14 @@ func TestV6MigrationResumable(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 	const idA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	versions, err := db.ListVersions(d, idA)
+	versions, err := db.ListVersions(d, db.LegacyDefaultScope(), idA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(versions) != 3 {
 		t.Fatalf("resumed migration duplicated history: %d versions, want 3", len(versions))
 	}
-	head, _ := db.GetHead(d, idA)
+	head, _ := db.GetHead(d, db.LegacyDefaultScope(), idA)
 	if head == nil || head.Revision != 3 {
 		t.Fatalf("resumed migration changed the head: %+v", head)
 	}

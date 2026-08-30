@@ -102,6 +102,16 @@ const (
 
 const vaultKeyMetaKey = "vault-key"
 
+// vaultKeyMetaKeyFor 返回该 Vault 的 vault-key 文档在 vault_meta 里的键。
+// default 沿用无后缀的历史键（存量文档原位可读、回滚 v0.17 兼容）；
+// 其他 Vault 用 "vault-key:<vaultID>"——每个租户的 E2EE 密钥文档彻底分开。
+func vaultKeyMetaKeyFor(scope db.VaultScope) string {
+	if scope.ID() == db.DefaultVaultID {
+		return vaultKeyMetaKey
+	}
+	return vaultKeyMetaKey + ":" + scope.ID()
+}
+
 // LiteSync 加密文件格式头（客户端 crypto.ts 同源常量）。
 // LSE1：AAD 仅绑定 path；LSE2：AAD 绑定 vaultId+keyEpoch+path；
 // LSE3：AAD 绑定 vaultId+keyEpoch+fileId+contentGeneration——路径不入 AAD，
@@ -259,10 +269,9 @@ type Service struct {
 	shares  *storage.ShareStore
 	opts    Options
 	log     *slog.Logger
-	// blobID 域分隔密钥（§10.3）。只加载一次并缓存：换掉它会让去重失效。
-	secretOnce gosync.Once
-	secret     []byte
-	secretErr  error
+	// blobID 域分隔密钥（§10.3）。按 Vault 缓存（vaultID → []byte）：
+	// 密钥落库后不变，缓存永不失效；换掉它会让该 Vault 的去重失效。
+	secrets gosync.Map
 	// access token 的签名密钥（§10.5）。与上面的 blobID 密钥刻意分开：
 	// 共用一把会让「轮换签名密钥」这种日常运维动作顺带把所有 blob 的名字算错。
 	tokenSecretOnce gosync.Once
@@ -274,32 +283,43 @@ type Service struct {
 	vaultLocks gosync.Map
 }
 
-// vaultSecret 惰性加载本 Vault 的 blobID 域分隔密钥。
+// vaultSecretFor 惰性加载指定 Vault 的 blobID 域分隔密钥（per-vault 缓存，v0.18）。
 //
 // 注意：它会读/写数据库，因此**不能在事务里调用**（单连接下会死锁）。
-// 正常路径上 InitVaultSecret 已经在启动时把它填好了。
-func (s *Service) vaultSecret() ([]byte, error) {
-	s.secretOnce.Do(func() {
-		s.secret, s.secretErr = db.EnsureVaultSecret(s.db, s.scope(), db.DefaultVaultID)
-	})
-	return s.secret, s.secretErr
+// default vault 由 InitVaultSecret 在启动时预热；其他 Vault 的行在注册时
+// 已连同 secret 一起建立，这里的 Ensure 语义只是幂等兜底。
+func (s *Service) vaultSecretFor(scope db.VaultScope) ([]byte, error) {
+	if v, ok := s.secrets.Load(scope.ID()); ok {
+		return v.([]byte), nil
+	}
+	sec, err := db.EnsureVaultSecret(s.db, scope, db.AdminUserID)
+	if err != nil {
+		return nil, err
+	}
+	s.secrets.Store(scope.ID(), sec)
+	return sec, nil
 }
 
-// InitVaultSecret 在启动时预热密钥，让请求路径上永远走不到惰性加载。
+// vaultSecret 是 default vault 的便捷入口——仅限启动路径与单用户遗留 CLI。
+func (s *Service) vaultSecret() ([]byte, error) {
+	return s.vaultSecretFor(s.defaultScope())
+}
+
+// InitVaultSecret 在启动时预热 default vault 的密钥。
 func (s *Service) InitVaultSecret() error {
 	_, err := s.vaultSecret()
 	return err
 }
 
-// blobIDOf 把内容哈希映射成本 Vault 的存储 id（§10.3）。
+// blobIDOf 把内容哈希映射成该 Vault 的存储 id（§10.3）。
 //
 // 空哈希返回空——「没有内容」和「内容的 id」是两回事，
 // 对空串做 HMAC 会得到一个指向不存在文件的合法 id。
-func (s *Service) blobIDOf(contentHash string) (string, error) {
+func (s *Service) blobIDOf(scope db.VaultScope, contentHash string) (string, error) {
 	if contentHash == "" {
 		return "", nil
 	}
-	secret, err := s.vaultSecret()
+	secret, err := s.vaultSecretFor(scope)
 	if err != nil {
 		return "", err
 	}
@@ -354,10 +374,10 @@ func isMarkdownPath(path string) bool {
 // meta-encrypted 态下服务器只看得到伪名，**无法**再按后缀判断 Markdown 还是附件
 // （v10 计划 §4.6）。按伪名猜测会把笔记误判为附件、把三方合并需要的 base version
 // 提前裁掉。因此统一使用两种策略中**最长**的那一组，宁可多留。
-func (s *Service) retentionFor(q db.Queryer, metaState, pseudonym string) (days, maxPerFile int) {
+func (s *Service) retentionFor(q db.Queryer, scope db.VaultScope, metaState, pseudonym string) (days, maxPerFile int) {
 	// §10.2：保留策略按 Vault 取，允许每个租户覆盖实例默认值。
 	// q 必须是调用方的事务——这两处调用都在事务里，走 s.db 会死锁
-	r := s.retentionOf(q, s.scope())
+	r := s.retentionOf(q, scope)
 	if metaState == db.MetaEncrypted || metaState == db.MetaVerifying {
 		return maxInt(r.HistoryDays, r.AttachmentDays), maxInt(r.HistoryMaxPerFile, r.AttachmentMax)
 	}
@@ -413,7 +433,7 @@ type UploadParams struct {
 
 // Upload 处理内容上传。
 // 流程：收流 + SHA-256（锁外）→ 加锁 → 状态/信封/revision 校验 → blob 原子提交 → SQLite 事务。
-func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) {
+func (s *Service) Upload(scope db.VaultScope, p UploadParams, body io.Reader) (*UploadResult, error) {
 	if err := storage.ValidatePath(p.Path); err != nil {
 		return nil, err
 	}
@@ -446,7 +466,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +485,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 		return nil, ErrEnvelopeTooOld
 	}
 
-	cur, err := db.GetHeadByPseudonym(s.db, p.Path)
+	cur, err := db.GetHeadByPseudonym(s.db, scope, p.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -504,7 +524,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 
 	// 幂等 ②：同一 operationId 已经提交过 → 返回那次的结果，绝不产生第二个 revision
 	if cur != nil && p.Client.OperationID != "" {
-		if prev, err := db.FindChangeByOperation(s.db, cur.FileID, p.Client.OperationID); err != nil {
+		if prev, err := db.FindChangeByOperation(s.db, scope, cur.FileID, p.Client.OperationID); err != nil {
 			return nil, err
 		} else if prev != nil {
 			return &UploadResult{
@@ -535,7 +555,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 		// 防复活（ADR-002）必须**先于** baseRevision 判断：否则带着任意 base
 		// 撞上墓碑的请求会拿到一个不含 deleted/priorHash/fileId 的空洞冲突，
 		// 客户端无从判断「这是被删过的对象，要走 restore」
-		if tomb, err := s.findTombstone(p.Path, canonicalKey); err != nil {
+		if tomb, err := s.findTombstone(scope, p.Path, canonicalKey); err != nil {
 			return nil, err
 		} else if tomb != nil {
 			return nil, &ConflictError{
@@ -548,7 +568,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 			return nil, &ConflictError{Path: p.Path, Revision: 0}
 		}
 		// 跨平台路径碰撞：与现有 live 对象归一化后相同 → 拒绝并存
-		if other, err := db.FindCanonicalCollision(s.db, canonicalKey, ""); err != nil {
+		if other, err := db.FindCanonicalCollision(s.db, scope, canonicalKey, ""); err != nil {
 			return nil, err
 		} else if other != "" {
 			return nil, &PathCollisionError{Path: p.Path, Existing: other}
@@ -558,12 +578,12 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	}
 
 	now := time.Now().Unix()
-	head := &db.ObjectHead{VaultID: db.DefaultVaultID}
+	head := &db.ObjectHead{} // 归属由 UpsertHead 按认证范围强制
 	if cur != nil {
 		*head = *cur
 		head.Revision = cur.Revision + 1
 	} else {
-		fileID, err := s.resolveNewFileID(p.ClientFileID)
+		fileID, err := s.resolveNewFileID(scope, p.ClientFileID)
 		if err != nil {
 			return nil, err
 		}
@@ -581,7 +601,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	} else if hasGen {
 		head.ContentGeneration = newGen
 	}
-	blobID, err := s.blobIDOf(actualHash)
+	blobID, err := s.blobIDOf(scope, actualHash)
 	if err != nil {
 		return nil, err
 	}
@@ -615,13 +635,13 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err := db.UpsertObject(tx, head.FileID, db.ObjectLive, head.CreatedAt, 0); err != nil {
+	if err := db.UpsertObject(tx, scope, head.FileID, db.ObjectLive, head.CreatedAt, 0); err != nil {
 		return nil, err
 	}
-	if err := db.UpsertHead(tx, head); err != nil {
+	if err := db.UpsertHead(tx, scope, head); err != nil {
 		return nil, err
 	}
-	seq, err := db.InsertChange(tx, &db.ObjectChange{
+	seq, err := db.InsertChange(tx, scope, &db.ObjectChange{
 		FileID: head.FileID, Action: "upsert", Revision: head.Revision,
 		ContentGeneration: head.ContentGeneration, MetaGeneration: head.MetaGeneration,
 		Pseudonym: head.Pseudonym, ContentHash: actualHash, OperationID: p.Client.OperationID, CreatedAt: now,
@@ -632,7 +652,7 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 
 	var prunedBlobs []string
 	if s.opts.HistoryEnabled {
-		if err := db.InsertVersion(tx, &db.ObjectVersion{
+		if err := db.InsertVersion(tx, scope, &db.ObjectVersion{
 			FileID: head.FileID, Revision: head.Revision, ContentGeneration: head.ContentGeneration,
 			BlobID: blobID, ContentHash: actualHash, Size: size, Mtime: head.Mtime,
 			Action: action, DeviceID: p.DeviceID, KeyEpoch: head.KeyEpoch,
@@ -640,8 +660,8 @@ func (s *Service) Upload(p UploadParams, body io.Reader) (*UploadResult, error) 
 		}); err != nil {
 			return nil, err
 		}
-		days, maxPerFile := s.retentionFor(tx, rs.MetaState, head.Pseudonym)
-		prunedBlobs, err = s.pruneVersionsTx(tx, head.FileID, now, days, maxPerFile)
+		days, maxPerFile := s.retentionFor(tx, scope, rs.MetaState, head.Pseudonym)
+		prunedBlobs, err = s.pruneVersionsTx(tx, scope, head.FileID, now, days, maxPerFile)
 		if err != nil {
 			return nil, err
 		}
@@ -706,17 +726,17 @@ func (s *Service) guardWrite(rs *db.RepoState, c ClientContext, deviceID, pseudo
 }
 
 // findTombstone 按寻址名或 canonical 键查删除记录（防复活判定）。
-func (s *Service) findTombstone(pseudonym, canonicalKey string) (*db.Tombstone, error) {
-	if t, err := db.GetTombstoneByPseudonym(s.db, pseudonym); err != nil || t != nil {
+func (s *Service) findTombstone(scope db.VaultScope, pseudonym, canonicalKey string) (*db.Tombstone, error) {
+	if t, err := db.GetTombstoneByPseudonym(s.db, scope, pseudonym); err != nil || t != nil {
 		return t, err
 	}
-	return db.GetTombstoneByCanonical(s.db, canonicalKey)
+	return db.GetTombstoneByCanonical(s.db, scope, canonicalKey)
 }
 
 // resolveNewFileID 决定新对象的身份：客户端预生成优先（LSE3 的 AAD 必须在加密前确定）。
-func (s *Service) resolveNewFileID(clientFileID string) (string, error) {
+func (s *Service) resolveNewFileID(scope db.VaultScope, clientFileID string) (string, error) {
 	if clientFileID != "" {
-		used, err := db.FileIDInUse(s.db, clientFileID)
+		used, err := db.FileIDInUse(s.db, scope, clientFileID)
 		if err != nil {
 			return "", err
 		}
@@ -730,7 +750,7 @@ func (s *Service) resolveNewFileID(clientFileID string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		used, err := db.FileIDInUse(s.db, id)
+		used, err := db.FileIDInUse(s.db, scope, id)
 		if err != nil {
 			return "", err
 		}
@@ -860,7 +880,7 @@ type DeleteParams struct {
 }
 
 // Delete 删除对象：HEAD 行移入 tombstones 台账（ADR-002），历史版本保留（恢复仍可用）。
-func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
+func (s *Service) Delete(scope db.VaultScope, p DeleteParams) (*DeleteResult, error) {
 	if err := storage.ValidatePath(p.Path); err != nil {
 		return nil, err
 	}
@@ -868,7 +888,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -876,13 +896,13 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 		return nil, err
 	}
 
-	cur, err := db.GetHeadByPseudonym(s.db, p.Path)
+	cur, err := db.GetHeadByPseudonym(s.db, scope, p.Path)
 	if err != nil {
 		return nil, err
 	}
 	if cur == nil {
 		// 幂等：已经删过了 → 返回 tombstone 的 revision
-		if t, err := db.GetTombstoneByPseudonym(s.db, p.Path); err != nil {
+		if t, err := db.GetTombstoneByPseudonym(s.db, scope, p.Path); err != nil {
 			return nil, err
 		} else if t != nil {
 			return &DeleteResult{Path: p.Path, Revision: t.DeletionRevision, Sequence: t.DeletionSequence, FileID: t.FileID}, nil
@@ -895,7 +915,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 
 	now := time.Now().Unix()
 	newRevision := cur.Revision + 1
-	prior, err := db.PriorContentHash(s.db, cur.FileID)
+	prior, err := db.PriorContentHash(s.db, scope, cur.FileID)
 	if err != nil {
 		return nil, err
 	}
@@ -909,7 +929,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	seq, err := db.InsertChange(tx, &db.ObjectChange{
+	seq, err := db.InsertChange(tx, scope, &db.ObjectChange{
 		FileID: cur.FileID, Action: "delete", Revision: newRevision,
 		ContentGeneration: cur.ContentGeneration, MetaGeneration: cur.MetaGeneration,
 		Pseudonym: cur.Pseudonym, OperationID: p.Client.OperationID, CreatedAt: now,
@@ -917,7 +937,7 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.UpsertTombstone(tx, &db.Tombstone{
+	if err := db.UpsertTombstone(tx, scope, &db.Tombstone{
 		FileID:            cur.FileID,
 		LastPseudonym:     cur.Pseudonym,
 		CanonicalPathHmac: cur.CanonicalPathHmac,
@@ -932,14 +952,14 @@ func (s *Service) Delete(p DeleteParams) (*DeleteResult, error) {
 	}); err != nil {
 		return nil, err
 	}
-	if err := db.DeleteHead(tx, cur.FileID); err != nil {
+	if err := db.DeleteHead(tx, scope, cur.FileID); err != nil {
 		return nil, err
 	}
-	if err := db.UpsertObject(tx, cur.FileID, db.ObjectDeleted, cur.CreatedAt, now); err != nil {
+	if err := db.UpsertObject(tx, scope, cur.FileID, db.ObjectDeleted, cur.CreatedAt, now); err != nil {
 		return nil, err
 	}
 	if s.opts.HistoryEnabled {
-		if err := db.InsertVersion(tx, &db.ObjectVersion{
+		if err := db.InsertVersion(tx, scope, &db.ObjectVersion{
 			FileID: cur.FileID, Revision: newRevision, BlobID: "", ContentHash: "",
 			Size: 0, Mtime: cur.Mtime, Action: "delete", DeviceID: p.DeviceID,
 			OperationID: p.Client.OperationID, CreatedAt: now,
@@ -964,13 +984,13 @@ func (s *Service) tombstoneRetainUntil(now int64) int64 {
 }
 
 // FileInfo 返回 live 对象的 HEAD（轻量，改名流用）。
-func (s *Service) FileInfo(pseudonym string) (*db.ObjectHead, error) {
+func (s *Service) FileInfo(scope db.VaultScope, pseudonym string) (*db.ObjectHead, error) {
 	if err := storage.ValidatePath(pseudonym); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	h, err := db.GetHeadByPseudonym(s.db, pseudonym)
+	h, err := db.GetHeadByPseudonym(s.db, scope, pseudonym)
 	if err != nil {
 		return nil, err
 	}
@@ -981,7 +1001,7 @@ func (s *Service) FileInfo(pseudonym string) (*db.ObjectHead, error) {
 }
 
 // OpenFile 返回对象元数据与内容读取器。
-func (s *Service) OpenFile(pseudonym string) (*db.ObjectHead, io.ReadCloser, error) {
+func (s *Service) OpenFile(scope db.VaultScope, pseudonym string) (*db.ObjectHead, io.ReadCloser, error) {
 	if err := storage.ValidatePath(pseudonym); err != nil {
 		return nil, nil, err
 	}
@@ -989,13 +1009,13 @@ func (s *Service) OpenFile(pseudonym string) (*db.ObjectHead, io.ReadCloser, err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cur, err := db.GetHeadByPseudonym(s.db, pseudonym)
+	cur, err := db.GetHeadByPseudonym(s.db, scope, pseudonym)
 	if err != nil {
 		return nil, nil, err
 	}
 	if cur == nil {
 		// 告知客户端「已删除」以及 tombstone revision（用于显式重建）
-		if t, terr := db.GetTombstoneByPseudonym(s.db, pseudonym); terr == nil && t != nil {
+		if t, terr := db.GetTombstoneByPseudonym(s.db, scope, pseudonym); terr == nil && t != nil {
 			return &db.ObjectHead{FileID: t.FileID, Revision: t.DeletionRevision, Pseudonym: pseudonym},
 				nil, ErrNotFound
 		}
@@ -1017,30 +1037,30 @@ func (s *Service) OpenFile(pseudonym string) (*db.ObjectHead, io.ReadCloser, err
 
 // History / OpenVersion --------------------------------------------------
 
-func (s *Service) History(pseudonym string) ([]db.ObjectVersion, error) {
+func (s *Service) History(scope db.VaultScope, pseudonym string) ([]db.ObjectVersion, error) {
 	if err := storage.ValidatePath(pseudonym); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fileID, err := s.fileIDForLocked(pseudonym)
+	fileID, err := s.fileIDForLocked(scope, pseudonym)
 	if err != nil {
 		return nil, err
 	}
-	return db.ListVersions(s.db, fileID)
+	return db.ListVersions(s.db, scope, fileID)
 }
 
-func (s *Service) OpenVersion(pseudonym string, revision int64) (*db.ObjectVersion, io.ReadCloser, error) {
+func (s *Service) OpenVersion(scope db.VaultScope, pseudonym string, revision int64) (*db.ObjectVersion, io.ReadCloser, error) {
 	if err := storage.ValidatePath(pseudonym); err != nil {
 		return nil, nil, err
 	}
 	s.mu.Lock()
-	fileID, err := s.fileIDForLocked(pseudonym)
+	fileID, err := s.fileIDForLocked(scope, pseudonym)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, nil, err
 	}
-	v, err := db.GetVersion(s.db, fileID, revision)
+	v, err := db.GetVersion(s.db, scope, fileID, revision)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1060,20 +1080,20 @@ func (s *Service) OpenVersion(pseudonym string, revision int64) (*db.ObjectVersi
 
 // fileIDForLocked 把服务器可见寻址名解析为对象身份（含已删除对象——
 // 历史与恢复必须在删除之后仍然可达）。调用方需持锁。
-func (s *Service) fileIDForLocked(pseudonym string) (string, error) {
-	if h, err := db.GetHeadByPseudonym(s.db, pseudonym); err != nil {
+func (s *Service) fileIDForLocked(scope db.VaultScope, pseudonym string) (string, error) {
+	if h, err := db.GetHeadByPseudonym(s.db, scope, pseudonym); err != nil {
 		return "", err
 	} else if h != nil {
 		return h.FileID, nil
 	}
-	if t, err := db.GetTombstoneByPseudonym(s.db, pseudonym); err != nil {
+	if t, err := db.GetTombstoneByPseudonym(s.db, scope, pseudonym); err != nil {
 		return "", err
 	} else if t != nil {
 		return t.FileID, nil
 	}
 	// meta 模式下寻址名就是 fileId：对象可能已被改名但历史仍在
 	if isHex32(pseudonym) {
-		if state, err := db.ObjectState(s.db, pseudonym); err != nil {
+		if state, err := db.ObjectState(s.db, scope, pseudonym); err != nil {
 			return "", err
 		} else if state != "" {
 			return pseudonym, nil
@@ -1087,11 +1107,11 @@ func (s *Service) fileIDForLocked(pseudonym string) (string, error) {
 // Changes 返回 since 之后的变更；since 早于裁剪水位线时要求客户端走 snapshot 对账。
 // 全程持 s.mu（所有写入方都持同一把锁）：epoch/head/水位线/changes 是同一时刻的
 // 一致读——绝不返回「与内容不对应的 sequence」（INV-02）。
-func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
+func (s *Service) Changes(scope db.VaultScope, since, limit int64) (*ChangesResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1101,7 +1121,7 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 			LatestSequence: rs.HeadSequence, ResyncRequired: true, MinSequence: rs.MinRetainedSequence,
 		}, nil
 	}
-	changes, err := db.ListChanges(s.db, since, limit)
+	changes, err := db.ListChanges(s.db, scope, since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1113,10 +1133,12 @@ func (s *Service) Changes(since, limit int64) (*ChangesResult, error) {
 }
 
 // LatestSequence 返回权威 head_sequence（repo_state，不依赖可裁剪的 changes 表）。
+// LatestSequence 是实例级操作（备份快照点）：多租户下取 default vault 的序号，
+// 备份本身覆盖全库，恢复后逐 Vault 旋转 repoEpoch（v11 设计 §5.9）。
 func (s *Service) LatestSequence() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, s.defaultScope())
 	if err != nil {
 		return 0, err
 	}
@@ -1124,14 +1146,14 @@ func (s *Service) LatestSequence() (int64, error) {
 }
 
 // RepoInfo 返回 /api/v1/info 所需的仓库权威信息（单锁内一致读出）。
-func (s *Service) RepoInfo() (*RepoInfo, error) {
+func (s *Service) RepoInfo(scope db.VaultScope) (*RepoInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	vaultID, err := s.vaultIDLocked()
+	vaultID, err := s.vaultIdentityLocked(scope)
 	if err != nil {
 		return nil, err
 	}
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1158,7 +1180,7 @@ func (s *Service) RepoInfo() (*RepoInfo, error) {
 func (s *Service) WithGlobalLock(fn func(latestSequence int64) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, s.defaultScope())
 	if err != nil {
 		return err
 	}
@@ -1166,15 +1188,15 @@ func (s *Service) WithGlobalLock(fn func(latestSequence int64) error) error {
 }
 
 // Snapshot 返回当前所有 live 对象与最新 sequence（严格对应同一时刻，INV-02）。
-func (s *Service) Snapshot() (*SnapshotResult, error) {
+func (s *Service) Snapshot(scope db.VaultScope) (*SnapshotResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	objects, err := db.ListHeads(s.db)
+	objects, err := db.ListHeads(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1187,10 +1209,10 @@ func (s *Service) Snapshot() (*SnapshotResult, error) {
 // E2EE 状态机 -------------------------------------------------------------
 
 // BeginE2eeMigration 进入迁移状态并冻结明文写；重复调用幂等（断点续传）。
-func (s *Service) BeginE2eeMigration() (*db.RepoState, error) {
+func (s *Service) BeginE2eeMigration(scope db.VaultScope) (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1200,25 +1222,25 @@ func (s *Service) BeginE2eeMigration() (*db.RepoState, error) {
 	case db.EncryptionEncrypted:
 		return nil, ErrEncryptionState
 	}
-	if err := db.SetEncryptionState(s.db, s.scope(), db.EncryptionMigrating, true); err != nil {
+	if err := db.SetEncryptionState(s.db, scope, db.EncryptionMigrating, true); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db, s.scope())
+	return db.GetRepoState(s.db, scope)
 }
 
 // CompleteE2eeMigration 验证所有 HEAD 均为 LSE 密文后切换到 encrypted，
 // 并把仓库信封下限提升到至少 1（ADR-006 §2.1）。
-func (s *Service) CompleteE2eeMigration() (*db.RepoState, error) {
+func (s *Service) CompleteE2eeMigration(scope db.VaultScope) (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
 	if rs.EncryptionState != db.EncryptionMigrating {
 		return nil, ErrEncryptionState
 	}
-	heads, err := db.ListHeads(s.db)
+	heads, err := db.ListHeads(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1232,48 +1254,48 @@ func (s *Service) CompleteE2eeMigration() (*db.RepoState, error) {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := db.SetEncryptionState(tx, s.scope(), db.EncryptionEncrypted, false); err != nil {
+	if err := db.SetEncryptionState(tx, scope, db.EncryptionEncrypted, false); err != nil {
 		return nil, err
 	}
-	if err := db.RaiseMinimumEnvelopeVersion(tx, s.scope(), db.EnvelopeLSE1); err != nil {
+	if err := db.RaiseMinimumEnvelopeVersion(tx, scope, db.EnvelopeLSE1); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db, s.scope())
+	return db.GetRepoState(s.db, scope)
 }
 
 // AbortE2eeMigration 放弃迁移，回到 plaintext（仅 migrating 状态下允许）。
-func (s *Service) AbortE2eeMigration() (*db.RepoState, error) {
+func (s *Service) AbortE2eeMigration(scope db.VaultScope) (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
 	if rs.EncryptionState != db.EncryptionMigrating {
 		return nil, ErrEncryptionState
 	}
-	if err := db.SetEncryptionState(s.db, s.scope(), db.EncryptionPlaintext, false); err != nil {
+	if err := db.SetEncryptionState(s.db, scope, db.EncryptionPlaintext, false); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db, s.scope())
+	return db.GetRepoState(s.db, scope)
 }
 
 // CompleteEnvelopeUpgrade 验证全部 live HEAD 均为 LSE3 后把信封下限提升到 3。
 // 提升之后**任何**写入路径（含新建与删除后重建）都不再接受旧信封（ADR-006）。
-func (s *Service) CompleteEnvelopeUpgrade() (*db.RepoState, error) {
+func (s *Service) CompleteEnvelopeUpgrade(scope db.VaultScope) (*db.RepoState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
 	if rs.EncryptionState != db.EncryptionEncrypted {
 		return nil, ErrEncryptionState
 	}
-	heads, err := db.ListHeads(s.db)
+	heads, err := db.ListHeads(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1282,10 +1304,10 @@ func (s *Service) CompleteEnvelopeUpgrade() (*db.RepoState, error) {
 			return nil, ErrEnvelopeTooOld
 		}
 	}
-	if err := db.RaiseMinimumEnvelopeVersion(s.db, s.scope(), db.EnvelopeLSE3); err != nil {
+	if err := db.RaiseMinimumEnvelopeVersion(s.db, scope, db.EnvelopeLSE3); err != nil {
 		return nil, err
 	}
-	return db.GetRepoState(s.db, s.scope())
+	return db.GetRepoState(s.db, scope)
 }
 
 func sha256Hex(b []byte) string {
@@ -1303,7 +1325,7 @@ func truncateID(id string) string {
 
 // Shares ------------------------------------------------------------------
 
-func (s *Service) CreateShare(name string, expiresAt int64, body io.Reader) (*db.Share, error) {
+func (s *Service) CreateShare(scope db.VaultScope, name string, expiresAt int64, body io.Reader) (*db.Share, error) {
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
 		return nil, err
@@ -1323,18 +1345,44 @@ func (s *Service) CreateShare(name string, expiresAt int64, body io.Reader) (*db
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := db.InsertShare(s.db, share); err != nil {
+	if err := db.InsertShare(s.db, scope, share); err != nil {
 		s.shares.Remove(id) //nolint:errcheck
 		return nil, err
 	}
 	return share, nil
 }
 
-func (s *Service) ListShares() ([]db.Share, error) {
-	return db.ListShares(s.db)
+func (s *Service) ListShares(scope db.VaultScope) ([]db.Share, error) {
+	return db.ListShares(s.db, scope)
 }
 
-func (s *Service) RevokeShare(id string) error {
+func (s *Service) RevokeShare(scope db.VaultScope, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 归属校验在 UPDATE 的 WHERE 里完成：跨 Vault 的 id 视同不存在（404 语义，
+	// 不确认资源存在性——ADR-010 §10）
+	ok, err := db.MarkShareRevoked(s.db, scope, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	if err := s.shares.Remove(id); err != nil {
+		s.log.Warn("failed to remove share content", "id", id, "error", err)
+	}
+	return nil
+}
+
+// AdminListShares 列出全实例的分享（运维页：滥用处置需要全局视图，含归属标注）。
+func (s *Service) AdminListShares() ([]db.Share, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.AdminListShares(s.db)
+}
+
+// AdminRevokeShare 按 id 撤销任意 Vault 的分享（管理员处置）。
+func (s *Service) AdminRevokeShare(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	share, err := db.GetShare(s.db, id)
@@ -1344,7 +1392,7 @@ func (s *Service) RevokeShare(id string) error {
 	if share == nil {
 		return ErrNotFound
 	}
-	if err := db.MarkShareRevoked(s.db, id); err != nil {
+	if err := db.AdminMarkShareRevoked(s.db, id); err != nil {
 		return err
 	}
 	if err := s.shares.Remove(id); err != nil {
@@ -1374,8 +1422,8 @@ func (s *Service) OpenShare(id string) (*db.Share, io.ReadCloser, error) {
 
 // Vault key ---------------------------------------------------------------
 
-func (s *Service) GetVaultKey() (string, error) {
-	doc, ok, err := db.GetMeta(s.db, vaultKeyMetaKey)
+func (s *Service) GetVaultKey(scope db.VaultScope) (string, error) {
+	doc, ok, err := db.GetMeta(s.db, vaultKeyMetaKeyFor(scope))
 	if err != nil || !ok {
 		return "", err
 	}
@@ -1393,10 +1441,10 @@ func VaultKeyFingerprint(doc string) string {
 // SetVaultKey 保存 vault key 文档。
 // CAS：replace=true 时必须携带当前文档的指纹，不匹配返回 ErrVaultKeyCAS——
 // 防止并发迁移/误操作无条件覆盖导致密文永久不可读。
-func (s *Service) SetVaultKey(doc string, replace bool, expectedFingerprint string) error {
+func (s *Service) SetVaultKey(scope db.VaultScope, doc string, replace bool, expectedFingerprint string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur, exists, err := db.GetMeta(s.db, vaultKeyMetaKey)
+	cur, exists, err := db.GetMeta(s.db, vaultKeyMetaKeyFor(scope))
 	if err != nil {
 		return err
 	}
@@ -1408,22 +1456,22 @@ func (s *Service) SetVaultKey(doc string, replace bool, expectedFingerprint stri
 			return ErrVaultKeyCAS
 		}
 	}
-	return db.SetMeta(s.db, vaultKeyMetaKey, doc, time.Now().Unix())
+	return db.SetMeta(s.db, vaultKeyMetaKeyFor(scope), doc, time.Now().Unix())
 }
 
 // PruneHistoryBefore（E2EE 迁移用）：删除某对象 revision < before 的历史版本。
-func (s *Service) PruneHistoryBefore(pseudonym string, before int64) (int, error) {
+func (s *Service) PruneHistoryBefore(scope db.VaultScope, pseudonym string, before int64) (int, error) {
 	if err := storage.ValidatePath(pseudonym); err != nil {
 		return 0, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fileID, err := s.fileIDForLocked(pseudonym)
+	fileID, err := s.fileIDForLocked(scope, pseudonym)
 	if err != nil {
 		return 0, err
 	}
-	versions, err := db.ListVersions(s.db, fileID)
+	versions, err := db.ListVersions(s.db, scope, fileID)
 	if err != nil {
 		return 0, err
 	}
@@ -1458,11 +1506,11 @@ func (s *Service) PruneHistoryBefore(pseudonym string, before int64) (int, error
 
 // pruneVersionsTx 按 retention 规则裁剪某对象的历史（事务内），返回待 GC 的 blob。
 // 最新版本永远保留。
-func (s *Service) pruneVersionsTx(tx *sql.Tx, fileID string, now int64, days, maxPerFile int) ([]string, error) {
+func (s *Service) pruneVersionsTx(tx *sql.Tx, scope db.VaultScope, fileID string, now int64, days, maxPerFile int) ([]string, error) {
 	if days <= 0 && maxPerFile <= 0 {
 		return nil, nil
 	}
-	versions, err := db.ListVersions(tx, fileID) // revision 降序
+	versions, err := db.ListVersions(tx, scope, fileID) // revision 降序
 	if err != nil {
 		return nil, err
 	}

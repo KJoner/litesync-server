@@ -42,7 +42,7 @@ func (h *handlers) changes(w http.ResponseWriter, r *http.Request) {
 		limit = min(n, 2000)
 	}
 
-	res, err := h.svc.Changes(since, limit)
+	res, err := h.svc.Changes(scopeOf(r), since, limit)
 	if err != nil {
 		h.internalError(w, "changes", err)
 		return

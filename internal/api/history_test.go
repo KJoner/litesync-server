@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"github.com/KJoner/litesync-server/internal/db"
 	"bytes"
 	"io"
 	"net/http"
@@ -40,7 +41,7 @@ func (e *testEnv) version(t *testing.T, path string, revision int64) (*http.Resp
 // 否则「blob 在不在」这类断言会永远为假。
 func (e *testEnv) blobPath(t *testing.T, contentHash string) string {
 	t.Helper()
-	id, err := e.svc.BlobIDOf(contentHash)
+	id, err := e.svc.BlobIDOf(db.LegacyDefaultScope(), contentHash)
 	if err != nil {
 		t.Fatal(err)
 	}

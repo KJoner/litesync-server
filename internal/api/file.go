@@ -44,7 +44,7 @@ func (h *handlers) putFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
-	res, err := h.svc.Upload(syncsvc.UploadParams{
+	res, err := h.svc.Upload(scopeOf(r), syncsvc.UploadParams{
 		Path:          path,
 		BaseRevision:  baseRevision,
 		ClaimedHash:   hash,
@@ -202,7 +202,7 @@ func (h *handlers) renameFile(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
 		return
 	}
-	res, err := h.svc.Rename(syncsvc.RenameParams{
+	res, err := h.svc.Rename(scopeOf(r), syncsvc.RenameParams{
 		FromPseudonym:      req.FromPath,
 		ToPseudonym:        req.ToPath,
 		BaseMetaGeneration: req.BaseMetaGeneration,
@@ -243,7 +243,7 @@ func (h *handlers) restoreFile(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
 		return
 	}
-	res, err := h.svc.Restore(syncsvc.RestoreParams{
+	res, err := h.svc.Restore(scopeOf(r), syncsvc.RestoreParams{
 		FileID:                    fileID,
 		ExpectedTombstoneRevision: req.ExpectedTombstoneRevision,
 		ContentGeneration:         req.ContentGeneration,
@@ -274,7 +274,7 @@ func (h *handlers) getFile(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
-	meta, rc, err := h.svc.OpenFile(path)
+	meta, rc, err := h.svc.OpenFile(scopeOf(r), path)
 	if err != nil {
 		switch {
 		case errors.Is(err, syncsvc.ErrCorrupted):
@@ -329,7 +329,7 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid request body", false)
 		return
 	}
-	res, err := h.svc.Delete(syncsvc.DeleteParams{
+	res, err := h.svc.Delete(scopeOf(r), syncsvc.DeleteParams{
 		Path:         req.Path,
 		BaseRevision: req.BaseRevision,
 		DeviceID:     auditDeviceID(r),

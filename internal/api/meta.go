@@ -103,7 +103,7 @@ func (h *handlers) getFileMeta(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
-	f, err := h.svc.FileInfo(path)
+	f, err := h.svc.FileInfo(scopeOf(r), path)
 	if err != nil {
 		h.metaError(w, "meta get", err)
 		return
@@ -120,8 +120,8 @@ func (h *handlers) getFileMeta(w http.ResponseWriter, r *http.Request) {
 }
 
 // metaStatus 迁移进度（journal 汇总）。
-func (h *handlers) metaStatus(w http.ResponseWriter, _ *http.Request) {
-	st, err := h.svc.MigrationStatusOf()
+func (h *handlers) metaStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := h.svc.MigrationStatusOf(scopeOf(r))
 	if err != nil {
 		h.internalError(w, "meta status", err)
 		return
@@ -130,7 +130,7 @@ func (h *handlers) metaStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *handlers) metaBegin(w http.ResponseWriter, r *http.Request) {
-	st, err := h.svc.BeginMetaMigration(auditDeviceID(r))
+	st, err := h.svc.BeginMetaMigration(scopeOf(r), auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta begin", err)
 		return
@@ -155,7 +155,7 @@ func (h *handlers) migrateObject(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid body", false)
 		return
 	}
-	res, err := h.svc.MigrateObjectMeta(req.FromPath, req.MetaEnc, req.CanonicalHash, auditDeviceID(r))
+	res, err := h.svc.MigrateObjectMeta(scopeOf(r), req.FromPath, req.MetaEnc, req.CanonicalHash, auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta migrate", err)
 		return
@@ -172,7 +172,7 @@ func (h *handlers) migrateObject(w http.ResponseWriter, r *http.Request) {
 
 // listPlaintextTombstones 列出仍带明文寻址名的删除记录（仅 migrating 态、仅 owner）。
 func (h *handlers) listPlaintextTombstones(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.ListPlaintextTombstones(auditDeviceID(r))
+	list, err := h.svc.ListPlaintextTombstones(scopeOf(r), auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta tombstones", err)
 		return
@@ -192,7 +192,7 @@ func (h *handlers) migrateTombstone(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "invalid body", false)
 		return
 	}
-	if err := h.svc.MigrateTombstone(req.FileID, req.CanonicalHash, auditDeviceID(r)); err != nil {
+	if err := h.svc.MigrateTombstone(scopeOf(r), req.FileID, req.CanonicalHash, auditDeviceID(r)); err != nil {
 		h.metaError(w, "meta migrate tombstone", err)
 		return
 	}
@@ -201,7 +201,7 @@ func (h *handlers) migrateTombstone(w http.ResponseWriter, r *http.Request) {
 
 // metaRenew 续租（计划书 §5.4）：owner 在长迁移中周期调用。
 func (h *handlers) metaRenew(w http.ResponseWriter, r *http.Request) {
-	st, err := h.svc.RenewMigrationLease(auditDeviceID(r))
+	st, err := h.svc.RenewMigrationLease(scopeOf(r), auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta renew", err)
 		return
@@ -218,7 +218,7 @@ func (h *handlers) metaTakeover(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "migrationId required", false)
 		return
 	}
-	st, err := h.svc.TakeoverMigration(req.MigrationID, auditDeviceID(r))
+	st, err := h.svc.TakeoverMigration(scopeOf(r), req.MigrationID, auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta takeover", err)
 		return
@@ -228,7 +228,7 @@ func (h *handlers) metaTakeover(w http.ResponseWriter, r *http.Request) {
 
 // metaVerify migrating → verifying。进入后只接受验证读取与 complete。
 func (h *handlers) metaVerify(w http.ResponseWriter, r *http.Request) {
-	st, err := h.svc.VerifyMetaMigration(auditDeviceID(r))
+	st, err := h.svc.VerifyMetaMigration(scopeOf(r), auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta verify", err)
 		return
@@ -237,8 +237,8 @@ func (h *handlers) metaVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 // metaValidate 只跑验证器不改状态（客户端在 complete 前预检）。
-func (h *handlers) metaValidate(w http.ResponseWriter, _ *http.Request) {
-	failures, err := h.svc.ValidateMetaMigration()
+func (h *handlers) metaValidate(w http.ResponseWriter, r *http.Request) {
+	failures, err := h.svc.ValidateMetaMigration(scopeOf(r))
 	if err != nil {
 		h.internalError(w, "meta validate", err)
 		return
@@ -257,7 +257,7 @@ func (h *handlers) metaComplete(w http.ResponseWriter, r *http.Request) {
 			"confirmErase:true required (plaintext path erasure is irreversible)", false)
 		return
 	}
-	st, err := h.svc.CompleteMetaMigration(req.MigrationID, auditDeviceID(r))
+	st, err := h.svc.CompleteMetaMigration(scopeOf(r), req.MigrationID, auditDeviceID(r))
 	if err != nil {
 		h.metaError(w, "meta complete", err)
 		return
@@ -265,8 +265,8 @@ func (h *handlers) metaComplete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
-func (h *handlers) metaAbort(w http.ResponseWriter, _ *http.Request) {
-	st, err := h.svc.AbortMetaMigration()
+func (h *handlers) metaAbort(w http.ResponseWriter, r *http.Request) {
+	st, err := h.svc.AbortMetaMigration(scopeOf(r))
 	if err != nil {
 		h.metaError(w, "meta abort", err)
 		return
@@ -275,7 +275,7 @@ func (h *handlers) metaAbort(w http.ResponseWriter, _ *http.Request) {
 }
 
 // erasureReport 返回最近一次擦除报告（ADR-008 §3.3）。
-func (h *handlers) erasureReport(w http.ResponseWriter, _ *http.Request) {
+func (h *handlers) erasureReport(w http.ResponseWriter, r *http.Request) {
 	data, err := h.svc.ErasureReportJSON()
 	if err != nil {
 		writeCoded(w, http.StatusNotFound, CodeNotFound, "no erasure report yet", false)

@@ -143,7 +143,7 @@ func (s *Service) sentinelValues() ([]string, error) {
 }
 
 // erasePlaintextPathsLocked 执行擦除流程。调用方必须已持有 s.mu。
-func (s *Service) erasePlaintextPathsLocked(rs *db.RepoState) (*ErasureReport, error) {
+func (s *Service) erasePlaintextPathsLocked(scope db.VaultScope, rs *db.RepoState) (*ErasureReport, error) {
 	report := &ErasureReport{
 		MigrationID: rs.MigrationID,
 		RepoEpoch:   rs.RepoEpoch,
@@ -161,12 +161,12 @@ func (s *Service) erasePlaintextPathsLocked(rs *db.RepoState) (*ErasureReport, e
 	}
 	report.Sentinels = len(sentinels)
 
-	heads, err := db.ListHeads(s.db)
+	heads, err := db.ListHeads(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
 	report.Objects = len(heads)
-	tombs, err := db.ListTombstones(s.db)
+	tombs, err := db.ListTombstones(s.db, scope)
 	if err != nil {
 		return nil, err
 	}

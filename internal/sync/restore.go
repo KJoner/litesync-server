@@ -48,7 +48,7 @@ type RestoreResult struct {
 }
 
 // Restore 把一个已删除对象恢复为 live（内容随后由普通上传写入）。
-func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
+func (s *Service) Restore(scope db.VaultScope, p RestoreParams) (*RestoreResult, error) {
 	if !isHex32(p.FileID) {
 		return nil, storage.ErrInvalidPath
 	}
@@ -59,7 +59,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rs, err := db.GetRepoState(s.db, s.scope())
+	rs, err := db.GetRepoState(s.db, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +79,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 
 	// 幂等：同一 operationId 已提交过 → 返回那次结果
 	if p.Client.OperationID != "" {
-		if prev, err := db.FindChangeByOperation(s.db, p.FileID, p.Client.OperationID); err != nil {
+		if prev, err := db.FindChangeByOperation(s.db, scope, p.FileID, p.Client.OperationID); err != nil {
 			return nil, err
 		} else if prev != nil {
 			return &RestoreResult{FileID: p.FileID, Pseudonym: prev.Pseudonym,
@@ -87,20 +87,20 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		}
 	}
 
-	tomb, err := db.GetTombstone(s.db, p.FileID)
+	tomb, err := db.GetTombstone(s.db, scope, p.FileID)
 	if err != nil {
 		return nil, err
 	}
 	if tomb == nil {
 		// 对象仍是 live → 不需要恢复；对象从未存在或 tombstone 已被清理 → 显式报错，
 		// 绝不静默当作新建（那正是「静默复活」的形状）
-		if h, err := db.GetHead(s.db, p.FileID); err != nil {
+		if h, err := db.GetHead(s.db, scope, p.FileID); err != nil {
 			return nil, err
 		} else if h != nil {
 			return &RestoreResult{FileID: h.FileID, Pseudonym: h.Pseudonym,
 				Revision: h.Revision, MetaGeneration: h.MetaGeneration}, nil
 		}
-		state, err := db.ObjectState(s.db, p.FileID)
+		state, err := db.ObjectState(s.db, scope, p.FileID)
 		if err != nil {
 			return nil, err
 		}
@@ -125,12 +125,12 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		canonicalKey = "h:" + p.CanonicalHash
 	}
 	// 恢复目标名不能与现有 live 对象冲突
-	if other, err := db.FindCanonicalCollision(s.db, canonicalKey, p.FileID); err != nil {
+	if other, err := db.FindCanonicalCollision(s.db, scope, canonicalKey, p.FileID); err != nil {
 		return nil, err
 	} else if other != "" {
 		return nil, &PathCollisionError{Path: p.Pseudonym, Existing: other}
 	}
-	if occupied, err := db.GetHeadByPseudonym(s.db, p.Pseudonym); err != nil {
+	if occupied, err := db.GetHeadByPseudonym(s.db, scope, p.Pseudonym); err != nil {
 		return nil, err
 	} else if occupied != nil && occupied.FileID != p.FileID {
 		return nil, &ConflictError{Path: p.Pseudonym, Revision: occupied.Revision,
@@ -142,7 +142,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 
 	// 域化 blobID 必须在事务外算：vaultSecret 的惰性加载会读数据库，
 	// 单连接下在事务里读会死锁
-	priorBlobID, err := s.blobIDOf(tomb.PriorContentHash)
+	priorBlobID, err := s.blobIDOf(scope, tomb.PriorContentHash)
 	if err != nil {
 		return nil, err
 	}
@@ -177,16 +177,16 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 			head.Size = size
 		}
 	}
-	if err := db.UpsertHead(tx, head); err != nil {
+	if err := db.UpsertHead(tx, scope, head); err != nil {
 		return nil, err
 	}
-	if err := db.UpsertObject(tx, p.FileID, db.ObjectLive, now, 0); err != nil {
+	if err := db.UpsertObject(tx, scope, p.FileID, db.ObjectLive, now, 0); err != nil {
 		return nil, err
 	}
-	if err := db.RemoveTombstone(tx, p.FileID); err != nil {
+	if err := db.RemoveTombstone(tx, scope, p.FileID); err != nil {
 		return nil, err
 	}
-	seq, err := db.InsertChange(tx, &db.ObjectChange{
+	seq, err := db.InsertChange(tx, scope, &db.ObjectChange{
 		FileID: p.FileID, Action: "restore", Revision: newRevision,
 		ContentGeneration: p.ContentGeneration, MetaGeneration: head.MetaGeneration,
 		Pseudonym: p.Pseudonym, ContentHash: head.ContentHash,
@@ -196,7 +196,7 @@ func (s *Service) Restore(p RestoreParams) (*RestoreResult, error) {
 		return nil, err
 	}
 	if s.opts.HistoryEnabled {
-		if err := db.InsertVersion(tx, &db.ObjectVersion{
+		if err := db.InsertVersion(tx, scope, &db.ObjectVersion{
 			FileID: p.FileID, Revision: newRevision, ContentGeneration: p.ContentGeneration,
 			BlobID: head.BlobID, ContentHash: head.ContentHash, Size: head.Size, Mtime: head.Mtime,
 			Action: "restore", DeviceID: p.DeviceID, KeyEpoch: head.KeyEpoch,
@@ -223,10 +223,26 @@ func (s *Service) PurgeTombstones(now int64) (int, error) {
 	if s.opts.TombstoneRetentionDays <= 0 {
 		return 0, nil
 	}
+	// v0.18：deletion_sequence 与设备 ack 都是每 Vault 独立的，逐 Vault 判定
+	scopes, err := db.AllVaultScopes(s.db)
+	if err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	total := 0
+	for _, scope := range scopes {
+		n, perr := s.purgeTombstonesVaultLocked(scope, now)
+		total += n
+		if perr != nil {
+			return total, perr
+		}
+	}
+	return total, nil
+}
 
-	minAcked, deviceCount, err := s.minAckedSequenceLocked()
+func (s *Service) purgeTombstonesVaultLocked(scope db.VaultScope, now int64) (int, error) {
+	minAcked, deviceCount, err := s.minAckedSequenceLocked(scope)
 	if err != nil {
 		return 0, err
 	}
@@ -234,7 +250,7 @@ func (s *Service) PurgeTombstones(now int64) (int, error) {
 		return 0, nil // 没有已注册设备时不做任何清理（无法证明安全）
 	}
 
-	tombs, err := db.ListTombstones(s.db)
+	tombs, err := db.ListTombstones(s.db, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -247,7 +263,7 @@ func (s *Service) PurgeTombstones(now int64) (int, error) {
 		if t.DeletionSequence == 0 || t.DeletionSequence > minAcked {
 			continue // 还有设备没确认越过这个删除点
 		}
-		if err := db.RemoveTombstone(s.db, t.FileID); err != nil {
+		if err := db.RemoveTombstone(s.db, scope, t.FileID); err != nil {
 			return purged, err
 		}
 		s.log.Info("tombstone purged", "fileId", truncateID(t.FileID),
@@ -257,28 +273,8 @@ func (s *Service) PurgeTombstones(now int64) (int, error) {
 	return purged, nil
 }
 
-func (s *Service) minAckedSequenceLocked() (int64, int, error) {
-	rows, err := s.db.Query(`SELECT last_acked_sequence FROM devices WHERE revoked = 0`)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer rows.Close()
-	minAcked := int64(-1)
-	count := 0
-	for rows.Next() {
-		var v int64
-		if err := rows.Scan(&v); err != nil {
-			return 0, 0, err
-		}
-		count++
-		if minAcked < 0 || v < minAcked {
-			minAcked = v
-		}
-	}
-	if minAcked < 0 {
-		minAcked = 0
-	}
-	return minAcked, count, rows.Err()
+func (s *Service) minAckedSequenceLocked(scope db.VaultScope) (int64, int, error) {
+	return db.MinAckedSequence(s.db, scope)
 }
 
 // AckSequence 记录设备已确认到的 sequence（tombstone 清理的第二个条件）。

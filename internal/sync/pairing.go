@@ -25,29 +25,43 @@ const (
 
 var ErrPairingNotFound = errors.New("pairing not found or expired")
 
-// VaultID 返回（首次调用时生成）本仓库的稳定标识。
-func (s *Service) VaultID() (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.vaultIDLocked()
-}
-
-// vaultIDLocked：调用方必须已持有 s.mu。
-func (s *Service) vaultIDLocked() (string, error) {
-	id, ok, err := db.GetMeta(s.db, vaultIDMetaKey)
+// vaultIdentityLocked 返回该 Vault 的稳定身份（/api/v1/info 的 vaultId）。
+// 调用方必须已持有 s.mu。
+//
+// v0.18 多 Vault 后身份存 vaults.identity。default vault 的值从
+// vault_meta['vault-id'] 迁移拷贝——**这一步做错会让所有现有客户端
+// 误判「服务器换库」而重新对账**；迁移后仍同步写回 vault_meta，
+// 保证回滚到 v0.17 后客户端读到同一个身份。
+func (s *Service) vaultIdentityLocked(scope db.VaultScope) (string, error) {
+	id, err := db.VaultIdentity(s.db, scope)
 	if err != nil {
 		return "", err
 	}
-	if ok && id != "" {
+	if id != "" {
 		return id, nil
+	}
+	isDefault := scope.ID() == db.DefaultVaultID
+	if isDefault {
+		legacy, ok, gerr := db.GetMeta(s.db, vaultIDMetaKey)
+		if gerr != nil {
+			return "", gerr
+		}
+		if ok && legacy != "" {
+			return legacy, db.SetVaultIdentity(s.db, scope, legacy)
+		}
 	}
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	id = hex.EncodeToString(raw)
-	if err := db.SetMeta(s.db, vaultIDMetaKey, id, time.Now().Unix()); err != nil {
+	if err := db.SetVaultIdentity(s.db, scope, id); err != nil {
 		return "", err
+	}
+	if isDefault {
+		if err := db.SetMeta(s.db, vaultIDMetaKey, id, time.Now().Unix()); err != nil {
+			return "", err
+		}
 	}
 	return id, nil
 }

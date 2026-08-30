@@ -454,17 +454,17 @@ func migrateOneObject(d *sql.DB, h *ObjectHead, all []ObjectVersion, now int64) 
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err := UpsertObject(tx, h.FileID, ObjectLive, h.CreatedAt, 0); err != nil {
+	if err := UpsertObject(tx, LegacyDefaultScope(), h.FileID, ObjectLive, h.CreatedAt, 0); err != nil {
 		return err
 	}
-	if err := UpsertHead(tx, h); err != nil {
+	if err := UpsertHead(tx, LegacyDefaultScope(), h); err != nil {
 		return err
 	}
 	for i := range all {
 		if all[i].FileID != h.FileID {
 			continue
 		}
-		if err := InsertVersion(tx, &all[i]); err != nil {
+		if err := InsertVersion(tx, LegacyDefaultScope(), &all[i]); err != nil {
 			return err
 		}
 	}
@@ -482,17 +482,17 @@ func migrateOneTombstone(d *sql.DB, t *Tombstone, all []ObjectVersion, now int64
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err := UpsertObject(tx, t.FileID, ObjectDeleted, t.DeletedAt, t.DeletedAt); err != nil {
+	if err := UpsertObject(tx, LegacyDefaultScope(), t.FileID, ObjectDeleted, t.DeletedAt, t.DeletedAt); err != nil {
 		return err
 	}
-	if err := UpsertTombstone(tx, t); err != nil {
+	if err := UpsertTombstone(tx, LegacyDefaultScope(), t); err != nil {
 		return err
 	}
 	for i := range all {
 		if all[i].FileID != t.FileID {
 			continue
 		}
-		if err := InsertVersion(tx, &all[i]); err != nil {
+		if err := InsertVersion(tx, LegacyDefaultScope(), &all[i]); err != nil {
 			return err
 		}
 	}

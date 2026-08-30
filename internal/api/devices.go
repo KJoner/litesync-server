@@ -63,7 +63,12 @@ func (h *handlers) createDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	cred, err := h.svc.CreateDevice(req.Name)
+	me := identityFrom(r)
+	var vaultID, userID string
+	if me != nil {
+		vaultID, userID = me.VaultID, me.UserID
+	}
+	cred, err := h.svc.CreateDevice(req.Name, vaultID, userID)
 	if err != nil {
 		h.internalError(w, "device create", err)
 		return
@@ -78,7 +83,13 @@ func (h *handlers) createEnrollment(w http.ResponseWriter, r *http.Request) {
 		TTLSeconds int64 `json:"ttlSeconds"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) //nolint:errcheck // body 可为空
-	id, secret, expiresAt, err := h.svc.CreateEnrollment(time.Duration(req.TTLSeconds) * time.Second)
+	me := identityFrom(r)
+	var vaultID, userID, actorDevice string
+	if me != nil {
+		vaultID, userID, actorDevice = me.VaultID, me.UserID, me.DeviceID
+	}
+	id, secret, expiresAt, err := h.svc.CreateEnrollment(
+		time.Duration(req.TTLSeconds)*time.Second, vaultID, userID, actorDevice)
 	if err != nil {
 		h.internalError(w, "enrollment create", err)
 		return
@@ -130,22 +141,37 @@ func (h *handlers) revokeDevice(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": id})
 }
 
-// whoami 返回当前凭据身份（客户端据此判断是否需要把根 Token 换成设备凭据）。
+// whoami 返回当前凭据身份（客户端据此判断是否需要把用户 Token 换成设备凭据）。
 // GET /api/v1/whoami
+//
+// tokenType 的取值保持向后兼容："root" 对插件的含义是「这是一个应该被换成
+// 设备凭据的用户级长期 Token」，v0.18 多用户后这个语义对普通用户 Token 同样成立。
 func (h *handlers) whoami(w http.ResponseWriter, r *http.Request) {
 	me := identityFrom(r)
 	if me == nil {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if me.Root {
-		writeJSON(w, http.StatusOK, map[string]any{"tokenType": "root"})
-		return
+	role := "user"
+	if me.IsAdmin {
+		role = "admin"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"tokenType": "device",
-		"deviceId":  me.DeviceID,
-		"name":      me.Name,
-		"scopes":    me.Scopes,
-	})
+	switch {
+	case me.UserToken:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tokenType": "root", "role": role, "name": me.Name, "userId": me.UserID,
+		})
+	case me.UserID != "" && me.DeviceID == "":
+		// 网页会话（v0.18 起会话随身携带用户归属；前端据此渲染角色相关 UI）
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tokenType": "session", "role": role, "name": me.Name, "userId": me.UserID,
+		})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tokenType": "device",
+			"deviceId":  me.DeviceID,
+			"name":      me.Name,
+			"scopes":    me.Scopes,
+		})
+	}
 }

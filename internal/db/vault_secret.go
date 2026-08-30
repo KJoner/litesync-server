@@ -66,3 +66,39 @@ func EnsureVaultSecret(d *sql.DB, s VaultScope, ownerID string) ([]byte, error) 
 // VaultSecretLen 是 secret 的字节长度，与 storage.VaultSecretLen 一致。
 // 这里重复定义是为了不让 db 依赖 storage（依赖方向是 storage → db 之外的单向）。
 const VaultSecretLen = 32
+
+// VaultIdentity 返回该 Vault 的稳定身份（/api/v1/info 的 vaultId）；未设置返回空串。
+func VaultIdentity(d *sql.DB, s VaultScope) (string, error) {
+	if !s.Valid() {
+		return "", ErrVaultScopeMissing
+	}
+	var id string
+	err := d.QueryRow(`SELECT COALESCE(identity, '') FROM vaults WHERE vault_id = ?`, s.ID()).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// SetVaultIdentity 写入 Vault 的稳定身份（只在为空时写入，身份一经建立不可变——
+// 改掉它会让所有客户端误判「服务器换库」而重新对账）。
+func SetVaultIdentity(d *sql.DB, s VaultScope, identity string) error {
+	if !s.Valid() {
+		return ErrVaultScopeMissing
+	}
+	res, err := d.Exec(`UPDATE vaults SET identity = ? WHERE vault_id = ? AND COALESCE(identity, '') = ''`,
+		identity, s.ID())
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 { //nolint:errcheck
+		cur, cerr := VaultIdentity(d, s)
+		if cerr != nil {
+			return cerr
+		}
+		if cur != identity {
+			return fmt.Errorf("vault %s identity already set", s.ID())
+		}
+	}
+	return nil
+}
