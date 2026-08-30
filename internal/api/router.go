@@ -167,7 +167,9 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
 	mux.HandleFunc("GET /share/{id}", h.getShare)
 	if dist, err := fs.Sub(web.Dist, "dist"); err == nil {
-		mux.Handle("GET /", http.FileServerFS(dist))
+		// ETag + no-cache：没有校验头时 CDN 会缓存旧资产，每次发版都撞
+		//「网页端像旧版」（见 staticWithETag 注释）
+		mux.Handle("GET /", staticWithETag(dist))
 	}
 
 	return requestLog(opts.Logger, securityHeaders(authGate(h.web, svc, h.trusted, mux)))
