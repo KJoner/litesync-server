@@ -87,9 +87,10 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/file", h.getFile)
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
-	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)             // v6：改名 = 元数据更新，不产生 tombstone
-	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile) // v6：显式恢复已删除对象
-	mux.HandleFunc("GET /api/v1/trash", h.trash)                         // v0.20：回收站（只读列表；恢复仍走上一行）
+	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)                       // v6：改名 = 元数据更新，不产生 tombstone
+	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile)           // v6：显式恢复已删除对象（插件；语义不变）
+	mux.HandleFunc("PUT /api/v1/files/{fileId}/restore", h.restoreFileWithContent) // v0.20.1：带新内容的原子恢复（W4）
+	mux.HandleFunc("GET /api/v1/trash", h.trash)                                   // v0.20：回收站（只读列表）
 	mux.HandleFunc("GET /api/v1/history", h.history)
 	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
 	mux.HandleFunc("GET /api/v1/version", h.version)
@@ -273,7 +274,16 @@ func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, "info", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	// access（v0.20.1 / RC-1）：调用者在**这个仓库**里的成员角色与能否写内容。网页据此在只读成员
+	// 打开时就隐藏编辑 / 新建，而不是等用户写了半天、保存时才收到 403；最终裁决仍在写路由的服务端检查。
+	// 只对账号身份（网页会话 / 用户 Token）给出；设备凭据的访问范围由 scope 决定，不在这里表达。
+	var access map[string]any
+	if id := identityFrom(r); id != nil && id.UserID != "" && id.VaultID != "" {
+		if role, ok, rerr := h.svc.RoleIn(scopeOf(r), id.UserID); rerr == nil && ok {
+			access = map[string]any{"role": string(role), "canWrite": role.CanWrite()}
+		}
+	}
+	out := map[string]any{
 		"resetAuthConfigured": resetAuth,
 		// v0.20 能力协商（接口约定 §8）：客户端以「数组里有没有这个字符串」判定，未知值忽略
 		"capabilities":       h.capabilities(),
@@ -296,7 +306,11 @@ func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 		"migrationId":            ri.MigrationID,
 		"migrationOwnerDeviceId": ri.MigrationOwnerDeviceID,
 		"serverTime":             time.Now().Unix(),
-	})
+	}
+	if access != nil {
+		out["access"] = access // 只加字段：设备凭据的响应与 0.20.0 完全相同
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *handlers) internalError(w http.ResponseWriter, op string, err error) {
@@ -462,4 +476,7 @@ var serverCapabilities = []string{
 	"vault-bound-pairing",
 	"web-session-oidc", // 网页统一登录（ADR-011；是否启用看 /auth/config）
 	"account-v2",       // /api/v2/me、账户设备与退出全部
+	// v0.20.1（W4/W5）：PUT /api/v1/files/{fileId}/restore 带新内容的原子恢复；
+	// 回收站返回 priorRevision 与 LSM1（metaEnc）；GET /api/v1/version 可按 fileId 寻址
+	"restore-with-content",
 }

@@ -104,6 +104,12 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/datalock/` | 0.20.1 数据目录独占锁（SV-03）：服务启动时持有；`migrate-to-pg` 拿不到即拒绝（源库停写的机器检查）。`dbcopy` 的导入与校验在同一个目标事务里，报告 `targetState` |
 | `web/src/vendor/litesync-core/` | 与插件逐字节一致的 crypto-core / merge-core（MANIFEST 校验，`npm run build` 先跑 `check:core`）；**只能用 `web/scripts/vendor-core.mjs` 从插件仓重新生成，手改必失败** |
 | `web/src/write.ts` + `note-editor.ts` + `editor.ts` | 网页写端（ADR-015）：与插件同协议（CAS、世代、operationId、墓碑/恢复），信封不降级，冲突保留双方，加密草稿只存密文；CodeMirror 单独打包 `/editor.js` |
+| `web/src/note-editor.ts`（v0.20.1 RC-1） | 上传期间可以继续输入：一次上传捕获 `{text, version, base}`，旧成功只确认它那一版；CAS 冲突以**当前全文**合并（输入法组合结束后再套用），保留双方期间编辑器只读；`host.alive()` 让锁定 / 切库 / 换号之后到达的结果全部作废 |
+| `web/src/write.ts` 的 `DraftStore`（wd2） | 草稿按**编辑器实例**（draftId）分开存、带版本号：条件写（逆序完成的旧加密不覆盖新草稿）、compare-and-delete（旧上传成功不删更新的输入）；IndexedDB 只在 `oncomplete` 后算落盘，abort / QuotaExceeded 一律报失败；内存后端（隐私模式）的文案必须说清「刷新即丢」 |
+| `web/src/editor-core.ts` | 编辑器的纯状态逻辑（W6）：一律用文档 position，**不**配 `lineSeparator`；换行风格只在序列化时体现；没有真实编辑（含撤销回原样）时原样返回原文字节 |
+| `web/src/markdown.ts` 的 `renderMarkdown` | 预览 / 分享页 / 离线查看器共用的渲染入口：markdown-it ≥ 14.3.3，超过 `RENDER_LIMIT` 直接降级为源码显示（主线程同步渲染无法中途打断） |
+| `internal/sync/restore.go` 的 `RestoreWithContent` | `PUT /api/v1/files/{fileId}/restore`：一个事务里复活对象并写入新世代内容（W4）；期望的墓碑 revision / 世代 + operationId 幂等；POST restore（插件）语义不变 |
+| `web/e2e/` | 浏览器验收（`npm run test:e2e`）：每个套件一个本机隔离实例，真实 Chromium，插件原样源码充当「另一台设备」；结果 `results.json` + 失败截图 / trace |
 
 ## 4. 数据模型（协议 v6）
 
@@ -112,7 +118,10 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 - **revision 属于对象**，跨改名 / 元数据迁移 / 删除恢复**连续递增**。
 - **改名 = 一次元数据更新**，不产生 tombstone、内容零重传。
 - **删除进入 `tombstones` 台账**，绝不删行；重建必须走显式
-  `POST /api/v1/files/{fileId}/restore`。
+  `POST /api/v1/files/{fileId}/restore`（插件：先复活再补传内容）或
+  `PUT /api/v1/files/{fileId}/restore`（v0.20.1，网页：带新内容的原子恢复，不留「旧密文 + 新世代」的中间态）。
+  路径加密仓库的墓碑保留删除前最后一份 LSM1（`encrypted_metadata`，客户端密文），回收站接口原样返回，
+  服务器从不知道里面的路径；更早的墓碑没有它，网页让用户手动选择恢复位置。
 - **`minimumEnvelopeVersion`**（仓库级信封下限，单调不减，落库前校验）与
   **`formatEpoch`**（寻址格式世代，变化时客户端丢弃游标全量对账）。
 - **元数据迁移是四态状态机** `plain → migrating → verifying → encrypted`，
@@ -191,6 +200,11 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 - **Web 前端构建产物已提交**（`internal/web/dist`），部署无需 Node。
   改了 `web/` 就必须 `cd web && npm run build` 再重新编译服务器，
   否则线上跑的还是旧资产——「查看端行为像旧版」十有八九是这个或镜像标签。
+  构建后跑 `npm run check:dist`（逐字节比对 dist / viewer 与 git 索引）。
+- **Windows 全新 checkout 的换行**（v0.20.1 发现）：Git for Windows 默认 `core.autocrlf=true`，
+  vendor 副本被检出成 CRLF，`check:core` 13 个文件全部与 MANIFEST 不符、构建直接中止；HTML/CSS 模板
+  也会把 CRLF 带进产物。`.gitattributes` 已把 vendor / dist / viewer 设为 `-text`，`build.mjs` 写产物时
+  统一 LF——改这两处之前先在 Windows 上全新 checkout 验证一次。
 - **`obsync restore` 强制要求 `--new-epoch`**：不旋转 repoEpoch 的话，客户端会
   带着恢复点之前的旧游标继续增量同步，**静默跳过**恢复点之后那段变更。
 - **blobID 域化后 `CommitAs(tmp, blobID, contentHash, strict)` 的两个参数不能混**：
@@ -232,7 +246,9 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/api/revocation_test.go` + `review_regression_test.go` | ADR-019 §10 矩阵：A 不撤销设备、B/C 全部失效、C 逐项真实状态与重发、接收端签名 / 时间窗 / 去重、D 的 60 秒 / 单飞 / 宽限 / 403、停用与恢复、撤销与兑换并发（两种库）；审查反例转正 |
 | `internal/api/vault_init_test.go` | 建库状态机全周期、v1 兼容、配对 v2 发行/envelope/兑换/重放/撤销、8 路并发兑换只成功 1 个 |
 | `internal/api/web_edit_test.go` / `quota_test.go` | 网页写入闸门（默认只读、同源、只读成员、审计身份）、回收站；配额（原子、历史计入、幂等放行、覆盖值）与限流 |
-| `web/test/*.test.ts`（`cd web && npm test`） | crypto-core 冻结向量对比、网页写端协议层（信封不降级、世代、重试同密文、三方合并、加密草稿隔离、附件命名） |
+| `web/test/*.test.ts`（`cd web && npm test`） | crypto-core 冻结向量对比、网页写端协议层（信封不降级、世代、重试同密文、三方合并、加密草稿隔离、附件命名）；v0.20.1 起还有：编辑控制器在 PUT / GET / 草稿加密边界注入延迟与逆序（`note-editor.test.ts`，Node 下的控制器状态）、草稿条件写 / compare-and-delete、IndexedDB 事务完成语义（`draft-idb.test.ts`）、文档 position 与原文保真（`editor-core.test.ts`）、病态 Markdown 时间预算（`markdown.test.ts`）、原子恢复请求（`restore-client.test.ts`） |
+| `web/e2e/`（`cd web && npm run test:e2e`） | 真实 Chromium 的验收套件（原 58+5+5+7+6 项入库 + W1/W2/W4/W5/W6）；需要 Go（或 `E2E_SERVER_BIN` / CI 的 `OBSYNC_BIN`）、`npx playwright install chromium`（playwright 与 playwright-core 在 devDependency 里钉成同一版本，装到的 Chromium 修订号与 runner 一致）、插件 checkout（`LITESYNC_PLUGIN_DIR`，默认本仓库旁边的 `litesync`；缺了就记「未执行」并以 1 退出，不冒充通过）。结果在 `web/test-results/<时间>/`（`results.json` + 失败截图 / trace）。`E2E_SERVER_BIN` 指向旧版本二进制即可复现旧缺陷 |
+| `internal/api/restore_content_test.go` | 原子恢复：全流程、拒绝无副作用（墓碑原样）、崩溃注入点、配额、换位置恢复、历史清理、路径加密墓碑 LSM1、网页会话闸门与 `info.access` |
 
 **两种库各跑一遍**：设置 `LITESYNC_TEST_PG_DSN` 后，测试二进制里的 `db.Open(path)` 改走 PG
 （每个路径一个独立 schema，重开同一路径 = 同一 schema，「关闭再打开模拟重启」语义不变）。

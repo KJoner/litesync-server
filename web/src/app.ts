@@ -38,7 +38,7 @@ import {
 	MetaKeys as CoreMetaKeys,
 	VaultKeyDoc as CoreVaultKeyDoc,
 } from "./vendor/litesync-core/crypto/crypto";
-import { NoteEditor, NoteEditorHost } from "./note-editor";
+import { LockOutcome, NoteEditor, NoteEditorHost } from "./note-editor";
 import {
 	attachmentLink,
 	attachmentPath,
@@ -48,11 +48,13 @@ import {
 	indexedDbBackend,
 	memoryBackend,
 	newTrackedFile,
+	PreparedRestore,
+	prepareRestore,
 	renameFile,
 	RepoBinding,
-	restoreTombstone,
 	saveWithRetry,
 	TrackedFile,
+	uploadRestore,
 } from "./write";
 import {
 	decryptFile,
@@ -69,7 +71,7 @@ import {
 	VaultKeyDoc,
 } from "./crypto";
 import { DiffLine, diffLines } from "./diff";
-import { buildOutline, md, preprocessWiki } from "./markdown";
+import { buildOutline, preprocessWiki, renderMarkdown } from "./markdown";
 
 const THEME_KEY = "litesync-theme";
 const VAULT_KEY = "litesync-vault";
@@ -102,8 +104,11 @@ interface State {
 	 */
 	seenGeneration: Map<string, number>;
 	// ---- v0.20 网页编辑（ADR-015） ----
-	/** /api/v1/info 的写入相关字段（逐请求世代校验要带上它们） */
-	repo?: { repoEpoch: string; formatEpoch: number; minimumEnvelopeVersion: number; encryptionState: string; metaState?: string };
+	/**
+	 * /api/v1/info 的写入相关字段（逐请求世代校验要带上它们）。canWrite：本账号在这个仓库里的成员角色
+	 * 能否写内容（v0.20.1；只读成员一打开就隐藏编辑 / 新建，最终裁决仍在服务端）；旧服务端没有这个字段。
+	 */
+	repo?: { repoEpoch: string; formatEpoch: number; minimumEnvelopeVersion: number; encryptionState: string; metaState?: string; canWrite?: boolean; role?: string };
 	/** 可写的仓库密钥（encrypt+decrypt，不可导出；只在内存） */
 	writeKey?: CryptoKey;
 	/** 插件同源的元数据密钥（enc+mac；meta 模式写入用） */
@@ -121,6 +126,20 @@ interface State {
 let S: State | null = null;
 const app = document.getElementById("app")!;
 let blobUrls: string[] = [];
+
+/**
+ * 会话代次（RC-1）：锁定、身份变化、切库会让它前进。异步任务开始时用 fence() 记下
+ * 「代次 + 账号 + 仓库 + 状态对象」，每个 await 之后先问一句还成不成立——旧会话的结果
+ * （上传成功、合并结果、搜索解密、附件图片）一律不得落到新会话的界面、草稿或命名空间里。
+ */
+let sessionGen = 0;
+function fence(): () => boolean {
+	const gen = sessionGen;
+	const account = bootAccountId;
+	const state = S;
+	const vault = currentVaultId();
+	return () => gen === sessionGen && account === bootAccountId && state !== null && state === S && vault === currentVaultId();
+}
 
 /** 切换视图时立即回收上一个笔记的所有附件 Blob URL，避免大图累积占内存。 */
 /** 当前视图里已解密的附件（路径@revision → blob URL）：分栏预览重绘时复用，不重复下载解密。 */
@@ -375,6 +394,7 @@ async function bootVault(api: Api, preset?: { doc: CoreVaultKeyDoc; vmk: CryptoK
 		S.repo = {
 			repoEpoch: info.repoEpoch ?? "", formatEpoch: info.formatEpoch ?? 1,
 			minimumEnvelopeVersion: info.minimumEnvelopeVersion ?? 0, encryptionState: info.encryptionState ?? "plaintext", metaState: info.metaState,
+			canWrite: info.access?.canWrite, role: info.access?.role,
 		};
 		S.account = await accountApi.me().catch(() => undefined);
 		S.resetAuthConfigured = info.resetAuthConfigured;
@@ -465,10 +485,12 @@ async function pollRemote(): Promise<void> {
 	if (!S || polling || document.visibilityState !== "visible") return;
 	if (S.vaultDoc?.enabled && !S.vmk) return; // 已锁定
 	polling = true;
+	const alive = fence();
 	try {
 		const c = await S.api.changes(lastSequence, 1);
-		if (!c.resyncRequired && c.changes.length === 0) return;
+		if (!alive() || (!c.resyncRequired && c.changes.length === 0)) return;
 		const list = await loadFileList();
+		if (!alive() || !S) return; // 轮询期间锁定 / 换号：结果作废
 		lastSequence = list.sequence;
 		S.files = list.files; // 本页新建但还没保存成功的笔记从不进文件列表，这里不会被冲掉
 		S.byPath = new Map(S.files.map((f) => [f.path, f]));
@@ -531,7 +553,14 @@ function canEdit(): boolean {
 	if (enc && !S.writeKey) return false;
 	// 路径加密迁移进行中：只读（服务端对非迁移持有者同样会拒绝写入）
 	if (S.repo?.metaState === "migrating" || S.repo?.metaState === "verifying") return false;
+	// 只读成员（reader）：一打开就不提供编辑 / 新建——不要等用户写了半天，保存时才收到 403
+	if (S.repo?.canWrite === false) return false;
 	return true;
+}
+
+/** 网页编辑开着、但本账号在这个仓库里是只读成员。 */
+function readOnlyMember(): boolean {
+	return S?.account?.features?.webEditing === true && S.repo?.canWrite === false;
 }
 
 function repoBinding(): RepoBinding {
@@ -576,14 +605,28 @@ function idleMinutes(): number {
 		return 15;
 	}
 }
-async function lockNow(reason: string): Promise<void> {
+/** 锁定提示：按草稿的真实结局说，不笼统地写「已加密保存在本机」。 */
+function lockMessage(reason: string, o: LockOutcome): string {
+	if (!o.unsynced) return reason + "。";
+	if (o.volatile) return reason + "。浏览器不允许持久存储：锁定前还没有同步的修改只在页面内存里，已随页面一起释放，无法恢复。";
+	if (!o.persisted) return reason + "。最后一段未同步的输入没能写入本机草稿（存储不可用或超时）。";
+	return reason + "。未同步的修改已加密保存在本机，解锁后打开这篇笔记即可恢复并继续同步。";
+}
+
+async function lockNow(reason: string, interactive = false): Promise<void> {
 	if (!S?.vmk) return;
-	const ok = (await S.editor?.lock()) ?? true;
+	// 只在内存里的草稿会随整页重载消失：主动锁定时先问一句，可以先导出
+	if (interactive && S.draftsVolatile && S.editor?.unsynced) {
+		if (!confirm("浏览器不允许持久存储：这篇笔记还没同步的修改只在页面内存里，锁定后会丢失。\n\n确定：先导出为文件，再锁定\n取消：先不锁定")) return;
+		S.editor.exportText();
+	}
+	sessionGen++; // 在途的上传 / 合并 / 搜索结果从这一刻起一律作废
+	const outcome = (await S.editor?.lock()) ?? { unsynced: false, persisted: true, volatile: S.draftsVolatile === true };
 	S.vmk = null;
 	S.writeKey = undefined;
 	S.drafts = undefined;
 	try {
-		sessionStorage.setItem("litesync-lock-reason", ok ? reason : reason + "（最后一段未保存的输入没能写入本机草稿）");
+		sessionStorage.setItem("litesync-lock-reason", lockMessage(reason, outcome));
 	} catch {
 		/* ignore */
 	}
@@ -606,6 +649,7 @@ function editorHost(): NoteEditorHost {
 		keys: () => (S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null),
 		drafts: () => S?.drafts ?? null,
 		draftsVolatile: () => S?.draftsVolatile === true,
+		alive: fence(), // 编辑器创建时的会话：锁定 / 换号 / 切库之后它的异步结果一律作废
 		renderPreview: (c, t) => renderMarkdownInto(c, S?.editor?.file.path ?? "", t),
 		fetchRemote: async (f) => {
 			const dl = await S!.api.fileWithIdentity(f.serverPath);
@@ -623,8 +667,8 @@ function editorHost(): NoteEditorHost {
 				contentEl.querySelector(".new-note-hint")?.remove();
 			}
 		},
-		onAuthExpired: () => {
-			updateStatus("登录已过期：未保存的内容已加密保存在本机，重新登录并解锁后可恢复");
+		onAuthExpired: (claim) => {
+			updateStatus(`登录已过期，修改没有上传。${claim || "没有未保存的修改。"}重新登录并解锁后可以继续`);
 		},
 		uploadAttachment,
 		showCompare,
@@ -638,6 +682,7 @@ function recordSaved(f: TrackedFile, created: boolean, size = 0): void {
 	if (cur) {
 		cur.revision = f.revision;
 		cur.fileId = f.fileId;
+		cur.metaGeneration = f.metaGeneration; // 之后改名的 CAS 以服务器记账的元数据世代为准
 		cur.mtime = Date.now();
 	} else if (created) {
 		const entry: FileEntry = { path: f.path, revision: f.revision, hash: "", size, mtime: Date.now(), fileId: f.fileId, serverPath: f.serverPath, metaGeneration: f.metaGeneration };
@@ -664,7 +709,7 @@ async function uploadAttachment(file: File, notePath: string): Promise<string> {
 	if (out.kind === "conflict") throw new Error("同名文件刚被别的设备创建，请重试");
 	if (out.kind === "auth") throw new Error("登录已过期");
 	if (out.kind === "offline") throw new Error("网络连接失败");
-	recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, true, bytes.length);
+	recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId, metaGeneration: out.metaGeneration ?? tracked.metaGeneration }, true, bytes.length);
 	const name = path.slice(path.lastIndexOf("/") + 1).normalize("NFC").toLowerCase();
 	const unique = S!.files.filter((f) => f.path.slice(f.path.lastIndexOf("/") + 1).normalize("NFC").toLowerCase() === name).length === 1;
 	return attachmentLink(path, unique);
@@ -734,23 +779,22 @@ async function renderDraftList(): Promise<void> {
 	const box = document.getElementById("draft-list");
 	const ds = S?.drafts;
 	if (!box || !ds) return;
-	const keys = await ds.listKeys().catch(() => [] as string[]);
-	const items: { key: string; path: string; savedAt: number; file: TrackedFile }[] = [];
-	for (const k of keys) {
-		if (backgroundSaves.has(k)) continue;
-		const d = await ds.load(k).catch(() => null);
-		if (d) items.push({ key: k, path: d.path, savedAt: d.savedAt, file: d.file });
-	}
+	const alive = fence();
+	const all = await ds.listFiles().catch(() => []);
+	if (!alive()) return;
+	const items = all.filter((d) => !backgroundSaves.has(d.fileKey));
 	box.innerHTML = "";
 	if (items.length === 0) return;
 	box.append(el("h2", "section-title", "本机未同步的草稿"));
-	box.append(el("p", "muted small", "这些修改只以加密形式保存在这台设备的浏览器里，还没有到达服务器。打开即可继续同步。"));
+	box.append(el("p", "muted small", S?.draftsVolatile
+		? "这些修改只在这个页面的内存里（浏览器不允许持久存储），还没有到达服务器；关闭或刷新页面就会丢失。打开即可继续同步。"
+		: "这些修改只以加密形式保存在这台设备的浏览器里，还没有到达服务器。打开即可继续同步。"));
 	const list = el("div", "recent-list");
-	for (const it of items.sort((a, b) => b.savedAt - a.savedAt)) {
+	for (const it of items) {
 		const card = el("button", "recent-card draft-card");
-		card.append(el("div", "recent-title", noteTitle(it.path)), el("div", "muted small", `草稿 ${new Date(it.savedAt).toLocaleString()}`));
+		card.append(el("div", "recent-title", noteTitle(it.path)), el("div", "muted small", `草稿 ${new Date(it.savedAt).toLocaleString()}${it.count > 1 ? `（共 ${it.count} 份）` : ""}`));
 		card.onclick = () => {
-			const existing = S!.files.find((f) => f.fileId === it.key);
+			const existing = S!.files.find((f) => f.fileId === it.fileKey);
 			if (existing) {
 				location.hash = "#/n/" + encodeURIComponent(existing.path);
 				return;
@@ -850,7 +894,8 @@ function noteMenu(tracked: TrackedFile): HTMLElement {
 		if (r.kind !== "saved") {
 			return alert(r.kind === "conflict" ? "这篇笔记刚在别处被修改过，请刷新后再删除。" : r.kind === "rejected" ? writeError(r.code, r.message) : "网络连接失败，请稍后重试。");
 		}
-		await S!.drafts?.remove(f.fileId).catch(() => undefined);
+		// 只删本编辑器自己的草稿：别的标签页里同一篇的未同步输入留着（保存时会走「远端已删除」另存为新笔记）
+		if (S!.editor) await S!.drafts?.remove(f.fileId, S!.editor.draftId).catch(() => undefined);
 		S!.editor = undefined;
 		S!.files = S!.files.filter((x) => x.path !== tracked.path);
 		S!.byPath.delete(tracked.path);
@@ -965,8 +1010,9 @@ function renderUnlock(err?: string): void {
 	try {
 		const why = sessionStorage.getItem("litesync-lock-reason");
 		if (why) {
+			// 原因里已经按草稿的真实结局说明了「修改现在在哪里」（lockMessage），这里不再笼统补一句
 			sessionStorage.removeItem("litesync-lock-reason");
-			extras.push(el("p", "banner info", why + "。未同步的修改已加密保存在本机，解锁后可继续。"));
+			extras.push(el("p", "banner info", why));
 		}
 	} catch {
 		/* ignore */
@@ -990,7 +1036,12 @@ function renderUnlock(err?: string): void {
 	const submit = async () => {
 		btn.textContent = "解锁中…";
 		btn.disabled = true;
+		const alive = fence();
 		const raw = await unlockVaultKey(S!.vaultDoc!, input.value);
+		if (!alive()) {
+			raw?.fill(0); // 解锁期间换号 / 切库：这把钥匙属于旧会话，丢弃
+			return;
+		}
 		if (!raw) {
 			errEl.textContent = multi
 				? "仓库密码不对。如果这是你另一个仓库的密码，请先在上方切换到那个仓库。"
@@ -1118,7 +1169,7 @@ function renderMain(): void {
 	lockBtn.hidden = !S!.vaultDoc?.enabled;
 	lockBtn.onclick = () => {
 		// 先把未保存的编辑加密写入本机草稿（有限等待），再丢弃内存里的密钥
-		void lockNow("已锁定");
+		void lockNow("已锁定", true);
 	};
 	const outBtn = el("button", "icon-btn", "⏻");
 	outBtn.title = "退出登录";
@@ -1223,6 +1274,8 @@ function renderTree(): void {
 		const add = el("button", "ghost tree-new", "＋ 新建笔记");
 		add.onclick = () => void showNewNote();
 		treeEl.append(add);
+	} else if (readOnlyMember()) {
+		treeEl.append(el("p", "muted small tree-readonly", "你在这个仓库里是只读成员：可以阅读和搜索，不能新建或修改。"));
 	}
 	const root = buildTreeModel();
 	treeEl.append(renderDirChildren(root));
@@ -1352,12 +1405,15 @@ async function showSearchPage(q: string): Promise<void> {
 	update();
 	renderHits();
 	let next = 0;
+	const alive = fence();
 	const worker = async () => {
-		while (run === searchRun && next < todo.length) {
+		while (run === searchRun && alive() && next < todo.length) {
 			const f = todo[next++];
 			try {
 				const dl = await S!.api.fileWithIdentity(serverPathFor(f.path));
+				if (!alive()) return;
 				const data = await decodeContent(f.path, dl.data, { fileId: dl.fileId, generation: dl.generation });
+				if (!alive()) return; // 建索引期间锁定 / 换号：解出来的明文不得留在新会话的索引里
 				textIndex.set(f.path, { revision: dl.revision || f.revision, text: new TextDecoder().decode(data) });
 			} catch {
 				/* 单篇失败（被删、解不开）：跳过，不中断整体 */
@@ -1415,7 +1471,11 @@ async function routeTo(): Promise<void> {
 	}
 	lastRoutedHash = hash;
 	await leaveEditor();
+	// 离开编辑器期间地址又变了（连续快速导航）：交给处理新地址的那一轮，旧的这一轮不再渲染，
+	// 否则较早的路由会在较晚的视图之后完成，把新视图覆盖掉
+	if (location.hash !== hash) return;
 	searchRun++; // 离开搜索页：正在进行的建索引就此停下
+	viewSeq++; // 之前发起、尚未完成的笔记加载作废
 	if (hash === "#/trash") {
 		void showTrash();
 	} else if (hash.startsWith("#/search/")) {
@@ -1479,8 +1539,15 @@ function showHome(): void {
 }
 
 // ---------- 笔记视图 ----------
+/** 每次进入一个视图 +1：较早发起、较晚完成的加载（快速连点、改路由）不得覆盖较新的视图。 */
+let viewSeq = 0;
+
 async function showNote(path: string): Promise<void> {
+	const seq = ++viewSeq;
+	const alive = fence();
+	const current = () => alive() && seq === viewSeq;
 	await settleBackground(S!.byPath.get(path)?.fileId);
+	if (!current()) return;
 	revokeAllBlobs();
 	markActive(path);
 	contentEl.innerHTML = "";
@@ -1516,7 +1583,9 @@ async function showNote(path: string): Promise<void> {
 
 	try {
 		const dl = await S!.api.fileWithIdentity(serverPathFor(path));
+		if (!current()) return;
 		const data = await decodeContent(path, dl.data, { fileId: dl.fileId, generation: dl.generation });
+		if (!current()) return; // 加载期间锁定 / 换号 / 去了别的视图：不渲染旧结果
 		if (path.toLowerCase().endsWith(".md")) {
 			if (canEdit()) {
 				// ignoreBOM：保留原文的 BOM，只打开不修改时绝不改写任何字节
@@ -1562,9 +1631,17 @@ function trackBlob(blob: Blob): string {
 	return url;
 }
 
-function renderMarkdownInto(container: HTMLElement, path: string, src: string): void {
+function renderMarkdownInto(container: HTMLElement, path: string, src: string, force = false): void {
 	const pre = preprocessWiki(src, resolveTarget);
-	container.innerHTML = md.render(pre);
+	// 带长度保护（W3）：超过门槛显示源码，用户可以主动选择仍要渲染
+	const r = renderMarkdown(pre, { force });
+	container.innerHTML = r.html;
+	if (r.degraded) {
+		const btn = el("button", "ghost small-btn", "仍要渲染（可能卡顿一会儿）");
+		btn.onclick = () => renderMarkdownInto(container, path, src, true);
+		container.querySelector(".md-degraded")?.append(" ", btn);
+		return;
+	}
 	// vault: 图片 → 认证下载 + 解密 → blob URL
 	container.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
 		const src = img.getAttribute("src") ?? "";
@@ -1586,13 +1663,16 @@ function renderMarkdownInto(container: HTMLElement, path: string, src: string): 
 			img.src = cached;
 			return;
 		}
+		const alive = fence();
 		void (async () => {
 			try {
 				const dlLink = await S!.api.fileWithIdentity(serverPathFor(finalTarget));
+				if (!alive()) return;
 				const data = await decodeContent(finalTarget, dlLink.data, {
 					fileId: dlLink.fileId,
 					generation: dlLink.generation,
 				});
+				if (!alive()) return; // 锁定 / 换号之后到达：不再生成对象 URL
 				const url = trackBlob(new Blob([data]));
 				attachmentUrlCache.set(cacheKey, url);
 				img.src = url;
@@ -1727,7 +1807,7 @@ async function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer,
 				: out.kind === "auth" ? "登录已过期" : "网络连接失败",
 			);
 		}
-		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, false);
+		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId, metaGeneration: out.metaGeneration ?? tracked.metaGeneration }, false);
 		void showNote(path);
 	} catch (e) {
 		alert(`恢复失败：${e instanceof Error ? e.message : String(e)}`);
@@ -1735,8 +1815,49 @@ async function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer,
 	}
 }
 
-// ---------- 回收站（需求 §7.2「删除回收」） ----------
+// ---------- 回收站（需求 §7.2「删除回收」；v0.20.1 W4 原子恢复 / W5 路径加密仓库） ----------
+//
+// 恢复 = 先取回删除前的内容（按 fileId 寻址的历史版本，在本机解密）→ 以严格更新的世代重新加密
+// → PUT /api/v1/files/{fileId}/restore **一次**提交（期望的墓碑 revision / 世代 + operationId）。
+// 要么什么都没发生（删除记录原样留在回收站，可以重试），要么恢复与新内容同时生效——服务器上
+// 不再有「旧密文 + 新世代」的中间态，本页的防回退检查与其他设备都不会被它误导。
+// 断网 / 限流用同一份密文与同一个 operationId 重试；响应丢失后的重试由服务器返回首次结果。
+//
+// 路径加密仓库：删除记录里带着删除前最后一份 LSM1（客户端密文），这里用元数据密钥解开得到原路径
+// （新设备只要有仓库密码同样可以）。较早的记录没有 LSM1、或解不开时，让用户自己选择恢复位置。
+
+interface TrashView {
+	it: TrashItem;
+	/** 解出来的原路径（明文仓库就是 it.path）；null = 不知道原路径 */
+	path: string | null;
+	pathNote: string;
+}
+
+/** 本页内未完成的恢复（同一份密文与 operationId，用于重试）与它们最后一次失败的原因。 */
+const pendingRestores = new Map<string, PreparedRestore>();
+const restoreErrors = new Map<string, string>();
+
+const canonPath = (p: string) => p.normalize("NFC").toLowerCase();
+
+/** 原位置被占用时建议的恢复位置：「名字（恢复）.md」。 */
+function restoredCopyName(path: string): string {
+	const dot = path.lastIndexOf(".");
+	const slash = path.lastIndexOf("/");
+	return dot > slash ? `${path.slice(0, dot)}（恢复）${path.slice(dot)}` : `${path}（恢复）`;
+}
+
+async function trashViewOf(it: TrashItem, meta: boolean): Promise<TrashView> {
+	if (!meta) return { it, path: it.path, pathNote: it.path };
+	if (!it.metaEnc) {
+		return { it, path: null, pathNote: "这条删除记录没有保存加密的原路径（较早的版本删除，或在启用路径加密之前删除）：恢复时需要你指定位置。" };
+	}
+	const dec = S!.metaKeys && S!.binding?.vaultId ? await decryptMeta(S!.metaKeys, it.metaEnc, S!.binding.vaultId, it.fileId).catch(() => null) : null;
+	if (!dec) return { it, path: null, pathNote: "这条删除记录里的原路径用当前密钥解不开（可能来自密钥轮换之前）：恢复时需要你指定位置。" };
+	return { it, path: dec.path, pathNote: dec.path };
+}
+
 async function showTrash(): Promise<void> {
+	const alive = fence();
 	revokeAllBlobs();
 	markActive(null);
 	outlineEl.innerHTML = "";
@@ -1752,74 +1873,156 @@ async function showTrash(): Promise<void> {
 	try {
 		items = await S!.api.trash();
 	} catch (e) {
-		list.textContent = `加载失败：${e instanceof Error ? e.message : String(e)}`;
+		if (alive()) list.textContent = `加载失败：${e instanceof Error ? e.message : String(e)}`;
 		return;
 	}
-	list.innerHTML = "";
+	if (!alive()) return;
 	const meta = repoBinding().metaMode;
+	const views: TrashView[] = [];
+	for (const it of items) views.push(await trashViewOf(it, meta));
+	if (!alive()) return;
+	list.innerHTML = "";
 	if (meta) {
-		wrap.insertBefore(el("p", "banner warn", "这个仓库启用了路径加密：服务器只保留已删除文件的身份，不知道它原来的路径，因此不能在网页恢复。请在 Obsidian 中处理。"), list);
+		wrap.insertBefore(el("p", "muted small", "这个仓库启用了路径加密：服务器只保存删除记录的密文，原路径在这台设备上用仓库密钥解开后显示。"), list);
 	}
-	if (items.length === 0) {
+	if (views.length === 0) {
 		list.append(el("p", "muted", "回收站是空的。"));
 		return;
 	}
-	const canon = (p: string) => p.normalize("NFC").toLowerCase();
-	for (const it of items) {
-		const row = el("div", "trash-row");
-		const info = el("div", "trash-info");
-		info.append(
-			el("div", "recent-title", meta ? `已删除的文件（${it.fileId.slice(0, 8)}…）` : noteTitle(it.path)),
-			el("div", "muted small", `${meta ? "" : it.path + " · "}删除于 ${fmtTime(it.deletedAt * 1000)}`),
-		);
-		row.append(info);
-		if (!meta && canEdit()) {
-			const btn = el("button", "ghost small-btn", "恢复") as HTMLButtonElement;
-			const clash = S!.files.find((f) => canon(f.path) === canon(it.path));
-			if (!it.restorable) {
-				btn.disabled = true;
-				btn.title = "删除前的内容已被历史清理，无法恢复";
-			} else if (clash) {
-				btn.disabled = true;
-				btn.title = `原位置已有文件「${clash.path}」，请先把它改名或删除`;
-			}
-			btn.onclick = () => void restoreFromTrash(it, btn);
-			row.append(btn);
+	for (const v of views) list.append(trashRow(v));
+}
+
+function trashRow(v: TrashView): HTMLElement {
+	const { it } = v;
+	const row = el("div", "trash-row");
+	row.dataset.fileId = it.fileId;
+	const info = el("div", "trash-info");
+	info.append(
+		el("div", "recent-title", v.path ? noteTitle(v.path) : `原路径未知的文件（${it.fileId.slice(0, 8)}…）`),
+		el("div", "muted small", `${v.pathNote} · 删除于 ${fmtTime(it.deletedAt * 1000)}`),
+	);
+	const err = restoreErrors.get(it.fileId);
+	if (err) {
+		const e = el("div", "banner warn small trash-pending", err);
+		e.setAttribute("role", "alert");
+		info.append(e);
+	}
+	row.append(info);
+	if (canEdit()) {
+		const clash = v.path ? S!.files.find((f) => canonPath(f.path) === canonPath(v.path!)) : undefined;
+		const label = pendingRestores.has(it.fileId) ? "重试恢复" : !v.path ? "选择位置恢复…" : clash ? "恢复到其他位置…" : "恢复";
+		const btn = el("button", "ghost small-btn", label) as HTMLButtonElement;
+		if (!it.restorable) {
+			btn.disabled = true;
+			btn.title = "删除前的内容已被历史清理，无法恢复内容";
+			info.append(el("div", "muted small", "删除前的内容已被历史清理，无法恢复。"));
+		} else if (clash) {
+			btn.title = `原位置已有文件「${clash.path}」：恢复时请换一个位置`;
 		}
-		list.append(row);
+		btn.onclick = () => void restoreFromTrash(v, btn);
+		row.append(btn);
+	}
+	return row;
+}
+
+/** 让用户选择 / 确认恢复位置；返回规范化后的路径，取消返回 null。 */
+function chooseRestorePath(v: TrashView, reason: string): string | null {
+	for (;;) {
+		const suggestion = v.path ? restoredCopyName(v.path) : "";
+		const input = prompt(`${reason}\n请输入恢复后的路径（可以包含文件夹，例如「工作/周记.md」）`, suggestion);
+		if (input === null) return null;
+		const p = normalizeNotePath(input);
+		if (!p) {
+			alert("路径不合法：不能为空、不能以 / 开头、不能包含 .. 或以 . 开头的段。");
+			continue;
+		}
+		const clash = S!.files.find((f) => canonPath(f.path) === canonPath(p));
+		if (clash) {
+			reason = `「${clash.path}」已经存在（大小写或 Unicode 归一后同名也算）。`;
+			continue;
+		}
+		return p;
 	}
 }
 
-/**
- * 从回收站恢复（与插件 push.restoreObject 同协议）：
- *   1. POST restore（revision 连续、fileId 不变、contentGeneration = 删除时 + 1）；
- *   2. 服务器此时的 HEAD 是删除前的内容（旧世代密文）：取回、解密、以 +1 世代重新加密上传。
- * 第 2 步失败时内容已经是删除前的版本、可以正常打开；在网页里修改保存一次即可补齐世代。
- */
-async function restoreFromTrash(it: TrashItem, btn: HTMLButtonElement): Promise<void> {
+async function restoreFromTrash(v: TrashView, btn: HTMLButtonElement): Promise<void> {
+	const alive = fence();
+	const { it } = v;
+	let target = pendingRestores.get(it.fileId)?.path ?? v.path;
+	if (!target) {
+		target = chooseRestorePath(v, v.pathNote);
+	} else if (!pendingRestores.has(it.fileId) && S!.files.some((f) => canonPath(f.path) === canonPath(target!))) {
+		target = chooseRestorePath(v, `原位置「${target}」已有文件。`);
+	}
+	if (!target) return;
 	btn.disabled = true;
 	btn.textContent = "恢复中…";
+	restoreErrors.delete(it.fileId);
+	const fail = (msg: string, keepPending: boolean) => {
+		if (!alive()) return;
+		if (!keepPending) pendingRestores.delete(it.fileId);
+		restoreErrors.set(it.fileId, msg);
+		if (location.hash === "#/trash") void showTrash(); // 用户已经去了别处：状态留着，回到回收站时显示
+	};
 	try {
 		const b = repoBinding();
-		const keys = S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null;
-		const nextGen = it.contentGeneration + 1;
-		const r = await restoreTombstone(b, it.fileId, { expectedTombstoneRevision: it.deletionRevision, contentGeneration: nextGen, pseudonym: it.path });
-		if (!r.ok) throw new Error(r.code === "CONFLICT" || r.code === "STALE_REVISION" ? "这个文件刚被别的设备恢复或改动过，请刷新回收站" : writeError(r.code, r.message));
-		const restored: TrackedFile = { path: it.path, serverPath: r.path, fileId: it.fileId, revision: r.revision, generation: nextGen, envelope: "LSE3", padded: false, metaGeneration: r.metaGeneration };
-		recordSaved(restored, true); // 已经是 live：先进文件树，第 2 步失败也找得到它
-		const dl = await S!.api.fileWithIdentity(r.path);
-		const plain = await decodeContent(it.path, dl.data, { fileId: dl.fileId, historical: true });
-		const env = envelopeOf(dl.data);
-		const tracked = { ...restored, envelope: env.envelope, padded: env.padded };
-		const out = await saveWithRetry(b, keys, tracked, new Uint8Array(plain));
-		if (out.kind !== "saved") {
-			throw new Error(`已恢复为删除前的内容，但重新加密上传没有完成（${out.kind === "rejected" ? out.code : out.kind}）；打开这篇笔记修改并保存一次即可补齐`);
+		let prepared = pendingRestores.get(it.fileId);
+		if (!prepared || prepared.path !== target) {
+			if (!it.priorRevision) return fail("删除前的内容已被历史清理，无法恢复。", false);
+			// 1) 按 fileId 取回删除前的内容（历史版本本来就是旧世代：不做 HEAD 防回退比较）
+			const ver = await S!.api.versionById(it.fileId, it.priorRevision);
+			if (!alive()) return;
+			if (ver.fileId !== it.fileId) return fail("服务器返回的内容身份与删除记录不符，已停止恢复。", false);
+			const plain = await decodeContent(target, ver.data, { fileId: ver.fileId, historical: true });
+			if (!alive()) return;
+			const env = envelopeOf(ver.data);
+			const priorGen = lse3Header(ver.data)?.generation ?? it.priorGeneration ?? 0;
+			const keys = S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null;
+			// 2) 以严格更新的世代重新加密（路径加密仓库另附 LSM1）——固定下来，重试复用同一份字节
+			prepared = await prepareRestore(b, keys, it, target, new Uint8Array(plain), { envelope: env.envelope, padded: env.padded, generation: priorGen });
+			if (!alive()) return;
+			pendingRestores.set(it.fileId, prepared);
 		}
-		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, false);
-		location.hash = "#/n/" + encodeURIComponent(it.path);
+		// 3) 一次提交；断网 / 限流用同一份密文与 operationId 重试
+		let out = await uploadRestore(b, prepared);
+		for (let i = 0; i < 2 && out.kind === "offline" && alive(); i++) {
+			await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+			out = await uploadRestore(b, prepared);
+		}
+		if (!alive()) return;
+		switch (out.kind) {
+			case "restored": {
+				pendingRestores.delete(it.fileId);
+				restoreErrors.delete(it.fileId);
+				recordSaved({
+					path: target, serverPath: out.path, fileId: out.fileId, revision: out.revision, generation: out.generation,
+					envelope: prepared.envelope, padded: prepared.padded, metaGeneration: out.metaGeneration,
+				}, true);
+				location.hash = "#/n/" + encodeURIComponent(target);
+				return;
+			}
+			case "offline":
+				return fail("恢复没有完成：网络连接中断。服务器上的删除记录原样保留，内容没有任何改动——联网后点「重试恢复」。", true);
+			case "auth":
+				return fail("恢复没有完成：登录已过期。删除记录原样保留——重新登录并解锁后回到回收站重试。", true);
+			case "changed":
+				return fail("这个文件刚在别处被恢复或改动过（删除记录已变化）：已刷新回收站，请按最新状态操作。", false);
+			case "collision": {
+				pendingRestores.delete(it.fileId);
+				const again = chooseRestorePath({ ...v, path: target }, `「${target}」已被别的文件占用（大小写或 Unicode 归一后同名也算）。`);
+				if (!again) return fail("恢复没有完成：恢复位置已被占用。", false);
+				btn.disabled = false;
+				return restoreFromTrash({ ...v, path: again }, btn);
+			}
+			case "rejected":
+				if (out.code === "QUOTA_EXCEEDED") {
+					return fail("恢复没有完成：已达到账号的存储配额（恢复会写入一份新的加密内容，历史版本也计入）。删除记录原样保留——清理空间或联系管理员调整配额后点「重试恢复」。", true);
+				}
+				return fail(`恢复被服务器拒绝：${writeError(out.code, out.message)}`, false);
+		}
 	} catch (e) {
-		alert(`恢复：${e instanceof Error ? e.message : String(e)}`);
-		void showTrash();
+		if (e instanceof AuthError) return fail("恢复没有完成：登录已过期。删除记录原样保留——重新登录并解锁后回到回收站重试。", true);
+		fail(`恢复没有完成：${e instanceof Error ? e.message : String(e)}。删除记录原样保留，可以重试。`, true);
 	}
 }
 

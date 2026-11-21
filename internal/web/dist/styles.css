@@ -1593,3 +1593,7 @@ button.recent-card {
 		flex-direction: column;
 	}
 }
+/* 预览过大时的源码降级（W3）：原样显示、可换行，不改写原文 */
+.md-source { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei", monospace; font-size: 13px; max-height: 70vh; overflow: auto; }
+.trash-pending { margin-top: 6px; }
+.tree-readonly { padding: 6px 10px; }

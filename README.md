@@ -336,12 +336,21 @@ API Token 与完全独立的仓库（见下方「多用户」一节）。隔离�
   相同（fileId、CAS、内容世代、operationId 幂等、墓碑与显式恢复），**信封不降级**。冲突用插件的三方合并，合并不干净
   就保留双方（冲突副本），绝不最后写覆盖。未同步的修改以仓库密钥派生的独立密钥加密存进 IndexedDB（只有密文），
   重新解锁后可恢复。空闲 15 分钟自动锁定。网页写入的审计身份由服务器生成（`web-…`），客户端自报的设备 ID 不作数。
+  上传进行中继续输入不会丢：合并以当前全文为准，旧上传的成功响应只确认它那一版，不删除之后输入的草稿。
+  **代价与做不到的**：浏览器不允许持久存储（隐私模式等）时草稿只在页面内存里，刷新、关闭或锁定即丢失——状态栏
+  会如实说明，主动锁定前会提示导出；同一篇笔记在多个标签页里同时编辑，各自保存各自的草稿，最后靠保存时的合并 /
+  冲突副本收敛，不会实时互相看到。
   网页每 30 秒（以及回到前台时）看一眼 `changes` 游标，别的设备的新建 / 修改 / 删除不刷新页面就能看到；
   正在编辑且有未保存修改的笔记不会被覆盖，保存时合并。
 - **正文全文搜索**：在网页里逐篇下载密文、**在本机解密**建索引（只在页面内存里，锁定 / 刷新 / 切换仓库即清除），
   服务器只看到普通的文件下载，搜索词与正文从不发给服务器。
-- **回收站**：`GET /api/v1/trash` 列出仍保留的删除记录；恢复走 `POST /api/v1/files/{fileId}/restore`
-  （fileId 与全部历史不变、revision 连续、内容世代前进）。路径加密仓库的服务器不知道已删除文件的原路径，网页不提供恢复。
+- **回收站**：`GET /api/v1/trash` 列出仍保留的删除记录。网页恢复（0.20.1）先按 fileId 取回删除前的内容、在本机以
+  更新的世代重新加密，再用 `PUT /api/v1/files/{fileId}/restore` **一次**提交（期望的墓碑 revision / 世代 + operationId
+  幂等）：断网、登录过期、配额已满或刷新时什么都不会发生（删除记录原样留在回收站，可以重试），不会出现「已恢复但打不开」
+  的半成品。插件仍用 `POST` 两步恢复，语义不变。路径加密仓库：删除时服务器把最后一份**加密的**元数据（LSM1）留在删除
+  记录里，网页用仓库密钥解开显示原路径并恢复（换一台只知道仓库密码的设备也一样），服务器始终不知道路径；**0.20.1 之前
+  删除、或启用路径加密之前删除的记录没有这份元数据**，网页会说明原路径未知并让你指定恢复位置。原位置已被别的文件占用时
+  同样让你另选位置。删除前的内容被历史清理后无法恢复（回收站如实标出）。
 - **配额与限流**：见上表 `OBSYNC_QUOTA_*` / `OBSYNC_RATE_PER_USER`。存储配额在写锁内原子核算、历史计入总量；
   超出返回 413 `QUOTA_EXCEEDED`（`retryable:false`，`details` 给出种类 / 上限 / 已用；旧插件按「跳过此文件」处理），
   读取、导出、删除与清理历史永远可用。管理员可逐账号覆盖：`PUT /api/v1/admin/users/{userId}/quota`
@@ -457,6 +466,7 @@ API Token 与完全独立的仓库（见下方「多用户」一节）。隔离�
 | DELETE | `/api/v1/file` | 逻辑删除，Body: `{"path","baseRevision"}` |
 | POST | `/api/v1/file/rename` | 改名（0.13.0）：**一次元数据更新**——revision / contentGeneration / blob 不动，**不产生 tombstone**；metaGeneration CAS 不符 → 412，目标被占用或目标名上有 tombstone → 409 |
 | POST | `/api/v1/files/{fileId}/restore` | 显式恢复已删除对象（0.13.0）：普通上传无法再穿透墓碑，重建必须走这里 |
+| PUT | `/api/v1/files/{fileId}/restore` | 带新内容的原子恢复（0.20.1，能力位 `restore-with-content`）：body 为新世代密文，头部带 `X-Expected-Tombstone-Revision` / `X-Expected-Tombstone-Generation` / `X-Operation-Id`（必填）；一个事务内复活对象并写入内容，同一 operationId 重试返回首次结果 |
 | POST | `/api/v1/envelope/complete` | 验证全部 HEAD 为 LSE3 后把仓库信封下限提升到 3（0.13.0 / ADR-006） |
 | GET | `/api/v1/history?path=...` | 历史版本列表（revision 降序） |
 | DELETE | `/api/v1/history?path=...&beforeRevision=N` | 清理该 revision 之前的历史（E2EE 迁移用） |
@@ -606,7 +616,7 @@ X-Canonical-Hash: canonical path HMAC，64 位小写 hex（0.12.0）
 | POST | `/api/v2/vaults/{id}/pairing-grants` · `/api/v2/pairings` · DELETE `/api/v2/pairings/{id}` | 发行连接链接、上传加密配对包、撤销 |
 | GET | `/api/v2/pairings/{id}/envelope` | **公开**，读取不消费；按 IP 限流 |
 | POST | `/api/v2/device-enrollments/redeem` | **公开**，显式兑换（exchangeId 幂等、可续传）；按 IP 限流 |
-| GET | `/api/v1/trash` | 回收站列表（恢复走 `POST /api/v1/files/{fileId}/restore`） |
+| GET | `/api/v1/trash` | 回收站列表（0.20.1 起另带 `priorRevision` / `priorGeneration` 与路径加密仓库的 `metaEnc`；网页恢复走 `PUT …/restore`，插件仍可用 `POST`）。删除前内容可按 `GET /api/v1/version?fileId=&revision=` 取回 |
 | PUT | `/api/v1/admin/users/{userId}/quota` | 管理员设置账号配额覆盖值 `{bytes, vaults}`（0 = 默认，-1 = 不限） |
 | GET | `/api/v1/admin/mail/status` | 管理员：邮件 outbox 计数（不含地址与正文） |
 | POST | `/hooks/mail/resend` | 邮件服务商回执（Svix 签名 + 时间窗）；未配置密钥时 404 |

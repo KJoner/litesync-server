@@ -72,6 +72,10 @@ type Tombstone struct {
 	RetainUntil       int64
 	DeleteProof       string
 	NeedsReview       bool
+	// EncryptedMetadata：删除前最后一份 LSM1 加密元数据（v0.20.1 / W5）。服务器看不到里面的路径，
+	// 已解锁的客户端解密后得到原路径与经 AEAD 认证的 metaGeneration，用来在回收站显示并恢复。
+	// 空 = 明文仓库，或 v0.20.1 之前删除 / 元数据迁移前删除的记录（客户端给出手动选择路径的降级）
+	EncryptedMetadata string
 }
 
 // ObjectVersion 是一条不可变历史版本（object_versions 一行）。
@@ -248,14 +252,14 @@ func FileIDInUse(q dbtx, s VaultScope, fileID string) (bool, error) {
 
 const tombstoneColumns = `vault_id, file_id, last_pseudonym, canonical_path_hmac, deletion_revision,
 	content_generation, meta_generation, key_epoch, prior_content_hash, deleted_at, deletion_sequence,
-	retain_until, delete_proof, needs_review`
+	retain_until, delete_proof, needs_review, encrypted_metadata`
 
 func scanTombstone(row interface{ Scan(...any) error }) (*Tombstone, error) {
 	t := &Tombstone{}
 	var needsReview int64
 	err := row.Scan(&t.VaultID, &t.FileID, &t.LastPseudonym, &t.CanonicalPathHmac, &t.DeletionRevision,
 		&t.ContentGeneration, &t.MetaGeneration, &t.KeyEpoch, &t.PriorContentHash, &t.DeletedAt,
-		&t.DeletionSequence, &t.RetainUntil, &t.DeleteProof, &needsReview)
+		&t.DeletionSequence, &t.RetainUntil, &t.DeleteProof, &needsReview, &t.EncryptedMetadata)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -284,7 +288,7 @@ func UpsertTombstone(q dbtx, s VaultScope, t *Tombstone) error {
 	}
 	_, err := q.Exec(
 		`INSERT INTO tombstones (`+tombstoneColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id, file_id) DO UPDATE SET
 		   last_pseudonym = excluded.last_pseudonym,
 		   canonical_path_hmac = excluded.canonical_path_hmac,
@@ -297,10 +301,11 @@ func UpsertTombstone(q dbtx, s VaultScope, t *Tombstone) error {
 		   deletion_sequence = excluded.deletion_sequence,
 		   retain_until = excluded.retain_until,
 		   delete_proof = excluded.delete_proof,
-		   needs_review = excluded.needs_review`,
+		   needs_review = excluded.needs_review,
+		   encrypted_metadata = excluded.encrypted_metadata`,
 		t.VaultID, t.FileID, t.LastPseudonym, t.CanonicalPathHmac, t.DeletionRevision,
 		t.ContentGeneration, t.MetaGeneration, t.KeyEpoch, t.PriorContentHash, t.DeletedAt,
-		t.DeletionSequence, t.RetainUntil, t.DeleteProof, needsReview)
+		t.DeletionSequence, t.RetainUntil, t.DeleteProof, needsReview, t.EncryptedMetadata)
 	return err
 }
 
@@ -444,6 +449,17 @@ func ListVersions(q dbtx, s VaultScope, fileID string) ([]ObjectVersion, error) 
 func GetVersion(q dbtx, s VaultScope, fileID string, revision int64) (*ObjectVersion, error) {
 	return scanVersion(q.QueryRow(versionSelect+` WHERE vault_id = ? AND file_id = ? AND revision = ?`,
 		s.ID(), fileID, revision))
+}
+
+// PriorContentVersion 返回某对象内容 hash 为 contentHash 的最近一个有内容的历史版本
+// （回收站恢复要先取回删除前的内容再重新加密，W4）；历史已被清理返回 (nil, nil)。
+func PriorContentVersion(q dbtx, s VaultScope, fileID, contentHash string) (*ObjectVersion, error) {
+	if contentHash == "" {
+		return nil, nil
+	}
+	return scanVersion(q.QueryRow(versionSelect+` WHERE vault_id = ? AND file_id = ? AND content_hash = ?
+		AND action != 'delete' AND COALESCE(blob_id,'') != '' ORDER BY revision DESC LIMIT 1`,
+		s.ID(), fileID, contentHash))
 }
 
 // PriorContentHash 返回该对象最近一个有内容版本的 hash（陈旧副本复活判定用）。

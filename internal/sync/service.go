@@ -966,6 +966,8 @@ func (s *Service) Delete(scope db.VaultScope, p DeleteParams) (*DeleteResult, er
 		DeletedAt:         now,
 		DeletionSequence:  seq,
 		RetainUntil:       s.tombstoneRetainUntil(now),
+		// W5：路径加密仓库把删除前最后一份 LSM1 留在墓碑里（客户端密文；改名后删除留下的就是改名后的那份）
+		EncryptedMetadata: cur.EncryptedMetadata,
 	}); err != nil {
 		return nil, err
 	}
@@ -1077,6 +1079,19 @@ func (s *Service) OpenVersion(scope db.VaultScope, pseudonym string, revision in
 	if err != nil {
 		return nil, nil, err
 	}
+	return s.openVersionOf(scope, fileID, revision)
+}
+
+// OpenVersionByID 按对象身份读历史版本（v0.20.1 / W4）：回收站恢复要读一个已删除对象的
+// 删除前内容——明文模式下它原来的路径可能已被别的对象占用，按路径寻址会解析到那个对象。
+func (s *Service) OpenVersionByID(scope db.VaultScope, fileID string, revision int64) (*db.ObjectVersion, io.ReadCloser, error) {
+	if !isHex32(fileID) {
+		return nil, nil, storage.ErrInvalidPath
+	}
+	return s.openVersionOf(scope, fileID, revision)
+}
+
+func (s *Service) openVersionOf(scope db.VaultScope, fileID string, revision int64) (*db.ObjectVersion, io.ReadCloser, error) {
 	v, err := db.GetVersion(s.db, scope, fileID, revision)
 	if err != nil {
 		return nil, nil, err

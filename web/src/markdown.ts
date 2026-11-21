@@ -1,11 +1,42 @@
 import MarkdownIt from "markdown-it";
 
-/** Markdown 渲染（html 关闭，杜绝笔记内嵌 HTML 注入）。 */
+/**
+ * Markdown 渲染（html 关闭，杜绝笔记内嵌 HTML 注入）。
+ *
+ * 依赖版本（W3）：markdown-it ≥ 14.3.3。14.3.0 在本配置下有两条可达的主线程 CPU 放大
+ * （GHSA-gfr2-rv44-r23c 未闭合的多行引用标题、GHSA-253c-mchw-3w2r 软换行 + linkify），
+ * 200 KB / 84 KB 的病态输入要数秒；这是可用性问题，不是已证明的 XSS。
+ */
 export const md = new MarkdownIt({
 	html: false,
 	linkify: true,
 	breaks: true, // 贴近 Obsidian 的换行行为
 });
+
+/**
+ * 预览渲染的长度门槛（字符）。markdown-it 在主线程同步运行、中途无法打断，所以在开始之前判断：
+ * 超过门槛直接降级为源码显示（不改写原文，用户可以主动选择仍要渲染）。14.3.3 下 1 MB 的普通笔记
+ * 约 0.2 秒；已知的病态输入在门槛内也落在回归测试的时间预算里（web/test/markdown.test.ts）。
+ */
+export const RENDER_LIMIT = 1_000_000;
+
+export interface Rendered {
+	html: string;
+	/** 超过门槛，显示的是源码而不是渲染结果 */
+	degraded: boolean;
+}
+
+/** 渲染（带长度保护）。app 预览、分享页、离线查看器共用这一个入口。 */
+export function renderMarkdown(src: string, opts: { force?: boolean } = {}): Rendered {
+	if (!opts.force && src.length > RENDER_LIMIT) {
+		const kb = Math.round(src.length / 1024);
+		return {
+			html: `<p class="banner warn md-degraded">内容过大（约 ${kb} KB），为避免页面长时间卡住，这里直接显示源码。</p><pre class="md-source">${md.utils.escapeHtml(src)}</pre>`,
+			degraded: true,
+		};
+	}
+	return { html: md.render(src), degraded: false };
+}
 
 // 允许内部资源协议（vault: 图片经解密后替换为 blob URL）
 const defaultValidate = md.validateLink.bind(md);

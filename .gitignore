@@ -26,3 +26,6 @@ Thumbs.db
 
 # Web 测试编译产物
 web/.test-build/
+
+# 浏览器验收结果（截图 / trace / results.json；npm run test:e2e 生成，CI 失败时上传 web/test-results）
+web/test-results/

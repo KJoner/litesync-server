@@ -76,7 +76,8 @@ func webContentWrite(r *http.Request) bool {
 	switch {
 	case p == "/api/v1/file" && (r.Method == http.MethodPut || r.Method == http.MethodDelete),
 		p == "/api/v1/file/rename" && r.Method == http.MethodPost,
-		strings.HasPrefix(p, "/api/v1/files/") && strings.HasSuffix(p, "/restore") && r.Method == http.MethodPost:
+		// POST = 两阶段恢复（插件）；PUT = 带新内容的原子恢复（v0.20.1 网页回收站，W4）
+		strings.HasPrefix(p, "/api/v1/files/") && strings.HasSuffix(p, "/restore") && (r.Method == http.MethodPost || r.Method == http.MethodPut):
 		return true
 	}
 	return false

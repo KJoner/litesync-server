@@ -274,11 +274,89 @@ func (h *handlers) restoreFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// restoreFileWithContent 带新内容的恢复（v0.20.1 / W4）：一个事务内复活对象并写入新世代的内容。
+// PUT /api/v1/files/{fileId}/restore
+// Header：X-File-Path（恢复后的寻址名，percent-encoded）、X-Content-Hash、
+// X-Expected-Tombstone-Revision、X-Expected-Tombstone-Generation（防复活锚点）、
+// X-Operation-Id（必填，幂等键）、X-Meta-Enc / X-Canonical-Hash（路径加密仓库必填）、
+// X-File-Mtime（可选）与逐请求协议/世代头。Body：新内容的密文。
+func (h *handlers) restoreFileWithContent(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("fileId")
+	path, err := url.PathUnescape(r.Header.Get("X-File-Path"))
+	if err != nil || path == "" {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "missing or invalid X-File-Path", false)
+		return
+	}
+	expRev, err1 := strconv.ParseInt(r.Header.Get("X-Expected-Tombstone-Revision"), 10, 64)
+	expGen, err2 := strconv.ParseInt(r.Header.Get("X-Expected-Tombstone-Generation"), 10, 64)
+	if err1 != nil || err2 != nil || expRev <= 0 || expGen < 0 {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "X-Expected-Tombstone-Revision / X-Expected-Tombstone-Generation required", false)
+		return
+	}
+	hash := strings.ToLower(r.Header.Get("X-Content-Hash"))
+	if !isSHA256Hex(hash) {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "X-Content-Hash must be a sha256 hex digest", false)
+		return
+	}
+	if bad := validateMetaHeaders(r.Header); bad != "" {
+		writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, "invalid "+bad+" header", false)
+		return
+	}
+	var mtime int64
+	if v := r.Header.Get("X-File-Mtime"); v != "" {
+		mtime, _ = strconv.ParseInt(v, 10, 64)
+	}
+	body := http.MaxBytesReader(w, r.Body, h.opts.MaxFileSize)
+	res, err := h.svc.RestoreWithContent(scopeOf(r), syncsvc.RestoreContentParams{
+		FileID:                      fileID,
+		ExpectedTombstoneRevision:   expRev,
+		ExpectedTombstoneGeneration: expGen,
+		Pseudonym:                   path,
+		ClaimedHash:                 hash,
+		Mtime:                       mtime,
+		MetaEnc:                     r.Header.Get("X-Meta-Enc"),
+		CanonicalHash:               r.Header.Get("X-Canonical-Hash"),
+		DeviceID:                    auditDeviceID(r),
+		Client:                      clientContext(r),
+	}, body)
+	if err != nil {
+		switch {
+		case errors.Is(err, syncsvc.ErrOperationRequired):
+			writeCoded(w, http.StatusBadRequest, CodeInvalidHeader, err.Error(), false)
+		case errors.Is(err, syncsvc.ErrStaleRevision):
+			writeCoded(w, http.StatusPreconditionFailed, CodeStaleRevision,
+				"expected tombstone revision / generation does not match the ledger", false)
+		case errors.Is(err, syncsvc.ErrTombstonePurged):
+			writeCoded(w, http.StatusConflict, CodeTombstonePurged, "tombstone has been purged", false)
+		default:
+			h.writeUploadError(w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fileId":            res.FileID,
+		"path":              res.Pseudonym,
+		"revision":          res.Revision,
+		"contentGeneration": res.ContentGeneration,
+		"metaGeneration":    res.MetaGeneration,
+		"sequence":          res.Sequence,
+		"hash":              res.Hash,
+		"size":              res.Size,
+		"restored":          true,
+		"replayed":          res.Replayed,
+	})
+}
+
 // trash 回收站（v0.20 网页编辑 / 需求 §7.2「删除回收」）：本仓库仍保留的删除记录。
 //
-// 只读；恢复走既有的 POST /api/v1/files/{fileId}/restore（revision 连续、fileId 不变、
-// 内容世代必须新于删除时）。restorable=false 表示删除前的内容已被历史裁剪清掉——
-// 这时 restore 只能复活一个空对象，界面据此不提供恢复按钮。
+// 只读。restorable=false 表示删除前的内容已被历史清理（或 blob 已不在）——界面据此不提供恢复。
+// v0.20.1 只加字段，原有字段的名字与含义不变（插件 0.20.1 起读其中的 contentGeneration / metaGeneration
+// 作为显式恢复时信封世代的下限，见插件 push.ts 的 tombstoneFacts；它不看 restorable）：
+//   - priorRevision / priorGeneration：删除前内容所在的历史版本（W4：先取回再以新世代重新加密，
+//     PUT /api/v1/files/{fileId}/restore 一次提交）；
+//   - metaEnc：路径加密仓库删除前最后一份 LSM1 密文（W5：已解锁的客户端解密出原路径；
+//     服务器看不到里面的明文）。空 = 明文仓库或较早删除的记录，客户端给出手动选择路径的降级。
+//
 // GET /api/v1/trash
 func (h *handlers) trash(w http.ResponseWriter, r *http.Request) {
 	list, err := h.svc.ListTrash(scopeOf(r))
@@ -295,13 +373,18 @@ func (h *handlers) trash(w http.ResponseWriter, r *http.Request) {
 		DeletedAt         int64  `json:"deletedAt"`
 		RetainUntil       int64  `json:"retainUntil,omitempty"`
 		Restorable        bool   `json:"restorable"`
+		PriorRevision     int64  `json:"priorRevision,omitempty"`
+		PriorGeneration   int64  `json:"priorGeneration,omitempty"`
+		MetaEnc           string `json:"metaEnc,omitempty"`
 	}
 	out := make([]item, 0, len(list))
 	for _, t := range list {
 		out = append(out, item{
 			FileID: t.FileID, Path: t.LastPseudonym, DeletionRevision: t.DeletionRevision,
 			ContentGeneration: t.ContentGeneration, MetaGeneration: t.MetaGeneration,
-			DeletedAt: t.DeletedAt, RetainUntil: t.RetainUntil, Restorable: t.PriorContentHash != "",
+			DeletedAt: t.DeletedAt, RetainUntil: t.RetainUntil,
+			Restorable:    t.PriorContentHash != "" && t.PriorRevision > 0,
+			PriorRevision: t.PriorRevision, PriorGeneration: t.PriorGeneration, MetaEnc: t.EncryptedMetadata,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DeletedAt > out[j].DeletedAt })

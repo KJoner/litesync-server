@@ -97,6 +97,14 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+      # 浏览器 E2E 里「另一台设备」用插件原样代码；放在本仓库 checkout 之后（先 checkout 本仓库会清空工作区）。
+      # 钉插件 SHA，插件合并后改成对应提交；缺插件时 runner 把相关套件记为「未执行」并以 1 退出，不冒充通过。
+      - name: Checkout the plugin for E2E
+        uses: actions/checkout@v4
+        with:
+          repository: KJoner/litesync
+          ref: 265c3b9b678289986a63dc1b31305ea73648ee2e
+          path: litesync-plugin
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -130,6 +138,8 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Browser E2E
         run: npm run test:e2e
+        env:
+          LITESYNC_PLUGIN_DIR: ${{ github.workspace }}/litesync-plugin
       - name: Upload E2E traces on failure
         if: failure()
         uses: actions/upload-artifact@v4
