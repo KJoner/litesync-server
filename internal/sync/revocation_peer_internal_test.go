@@ -2,7 +2,7 @@ package sync
 
 // 跨产品撤销事件的编码与签名（ADR-019 §2.4「签名与编码细则」，2026-11-21 与 Nexus 定稿）。
 // 固定测试向量与 Nexus 的 peer-revocation.test.ts 是同一组（用 `openssl dgst -sha256 -hmac` 独立算出）：
-// 两边各自断言与它相等，就保证了两个实现逐字节一致。覆盖 INV-12（事件只按 (issuer, subject) 定位）。
+// 两边各自断言与它相等，就保证了两个实现逐字节一致。不对应 INV 编号（跨产品协议的编码一致性）。
 
 import (
 	"errors"

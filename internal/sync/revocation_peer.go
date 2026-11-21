@@ -394,10 +394,15 @@ func (s *Service) deliverPeer(ctx context.Context, eventID, peer string) bool {
 		}
 	}
 	s.mu.Lock()
-	err = db.UpdateRevocationDelivery(s.db, d)
+	written, err := db.UpdateRevocationDelivery(s.db, d)
 	s.mu.Unlock()
 	if err != nil {
 		s.log.Error("record revocation delivery failed", "event", d.EventID, "error", err)
+		return true
+	}
+	if !written {
+		// 与「重新发送」重叠的另一次尝试已经送达：已送达是终态，这次的结果不再写回
+		s.log.Info("revocation event already delivered by an overlapping attempt", "event", d.EventID, "peer", d.Peer)
 		return true
 	}
 	switch d.State {

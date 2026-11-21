@@ -274,14 +274,22 @@ func DueRevocationDeliveries(q dbtx, now int64, limit int) ([]RevocationDelivery
 	return scanDeliveries(rows)
 }
 
-// UpdateRevocationDelivery 写回一次投递尝试的结果。
-func UpdateRevocationDelivery(q dbtx, d *RevocationDelivery) error {
-	_, err := q.Exec(`UPDATE revocation_deliveries SET delivery_state = ?, attempts = ?, next_attempt_at = ?,
+// UpdateRevocationDelivery 写回一次投递尝试的结果，返回是否写入。
+//
+// attempts 只由领取（ClaimRevocationDelivery）递增，这里不写。delivered 是终态：「重新发送」可能与一次
+// 正在进行的尝试重叠（接收方按 eventId 去重，重复送达没有副作用），较晚结束的那次不得把已送达的记录
+// 改回 pending / failed——这种情况返回 (false, nil)。
+func UpdateRevocationDelivery(q dbtx, d *RevocationDelivery) (bool, error) {
+	res, err := q.Exec(`UPDATE revocation_deliveries SET delivery_state = ?, next_attempt_at = ?,
 		last_error = ?, peer_result = ?, delivered_at = ?, expires_at = ?, updated_at = ?
-		WHERE event_id = ? AND peer = ?`,
-		d.State, d.Attempts, d.NextAttemptAt, truncate(d.LastError, 64), truncate(d.PeerResult, 32), d.DeliveredAt,
+		WHERE event_id = ? AND peer = ? AND delivery_state != 'delivered'`,
+		d.State, d.NextAttemptAt, truncate(d.LastError, 64), truncate(d.PeerResult, 32), d.DeliveredAt,
 		d.ExpiresAt, d.UpdatedAt, d.EventID, d.Peer)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected() //nolint:errcheck
+	return n == 1, nil
 }
 
 // ResetRevocationDeliveries 「重新发送」：把该事件尚未送达的投递重新置为立即到期（失败的也重新开始，
