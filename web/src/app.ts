@@ -69,7 +69,7 @@ import {
 	VaultKeyDoc,
 } from "./crypto";
 import { DiffLine, diffLines } from "./diff";
-import { buildOutline, md, preprocessWiki } from "./markdown";
+import { buildOutline, preprocessWiki, renderMarkdown } from "./markdown";
 
 const THEME_KEY = "litesync-theme";
 const VAULT_KEY = "litesync-vault";
@@ -1562,9 +1562,17 @@ function trackBlob(blob: Blob): string {
 	return url;
 }
 
-function renderMarkdownInto(container: HTMLElement, path: string, src: string): void {
+function renderMarkdownInto(container: HTMLElement, path: string, src: string, force = false): void {
 	const pre = preprocessWiki(src, resolveTarget);
-	container.innerHTML = md.render(pre);
+	// 带长度保护（W3）：超过门槛显示源码，用户可以主动选择仍要渲染
+	const r = renderMarkdown(pre, { force });
+	container.innerHTML = r.html;
+	if (r.degraded) {
+		const btn = el("button", "ghost small-btn", "仍要渲染（可能卡顿一会儿）");
+		btn.onclick = () => renderMarkdownInto(container, path, src, true);
+		container.querySelector(".md-degraded")?.append(" ", btn);
+		return;
+	}
 	// vault: 图片 → 认证下载 + 解密 → blob URL
 	container.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
 		const src = img.getAttribute("src") ?? "";

@@ -7,7 +7,7 @@
  * 与登录后 reader 的能力对齐：只有图片内联，笔记/PDF 嵌入降级为文本。
  */
 import { ShareAttachment } from "./crypto";
-import { md, preprocessWiki } from "./markdown";
+import { preprocessWiki, renderMarkdown } from "./markdown";
 
 const MIME: Record<string, string> = {
 	png: "image/png",
@@ -42,7 +42,8 @@ export function renderSharedNote(container: HTMLElement, text: string, attachmen
 	//（附件表只含图片，因此 preprocessWiki 的笔记链接分支在分享页永远不会命中）
 	const resolve = (target: string): string | null => find(target)?.path ?? null;
 
-	container.innerHTML = md.render(preprocessWiki(text, resolve));
+	// 带长度保护的渲染（W3）：过大的分享内容降级为源码显示，不让打开分享页的标签页卡死
+	container.innerHTML = renderMarkdown(preprocessWiki(text, resolve)).html;
 
 	// 标准 markdown 图片：`![](dir/img.png)` 的 src 是相对路径 → 同样查附件表；
 	// 外链图片不动（在线页由服务器 CSP 拦、离线 viewer 由页面 CSP 拦）
