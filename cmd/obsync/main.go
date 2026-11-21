@@ -219,7 +219,21 @@ func run() error {
 		Logger:         logger,
 		Backup:         bkp,
 		TrustedProxies: cfg.TrustedProxies,
+		// v0.20 公开化：统一登录（ADR-011）与新仓库强制 E2EE（ADR-012）
+		OIDC: api.OIDCOptions{
+			Issuer:           cfg.OIDCIssuer,
+			ClientID:         cfg.OIDCClientID,
+			ClientSecret:     cfg.OIDCClientSecret,
+			PublicURL:        cfg.PublicURL,
+			RegistrationMode: cfg.RegistrationMode,
+		},
+		LegacyTokenLogin:     cfg.LegacyTokenLogin,
+		RequireE2EENewVaults: cfg.RequireE2EENewVaults,
 	}, svc)
+	if cfg.OIDCEnabled() {
+		logger.Info("unified sign-in enabled", "issuer", cfg.OIDCIssuer,
+			"registration", cfg.RegistrationMode, "legacyTokenLogin", cfg.LegacyTokenLogin)
+	}
 
 	// HTTP 超时与限额（v0.13.3 / 计划书 §7.6）。
 	//

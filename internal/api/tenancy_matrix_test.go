@@ -46,6 +46,16 @@ var publicRoutes = map[string]string{
 	"GET /join/{secret}":           "注册落地页：内容由一次性邀请 secret 保护",
 	"GET /join/{secret}/info":      "邀请可用性查询：secret 即凭证",
 	"POST /join/{secret}/register": "消费邀请注册：secret 即凭证，一次性",
+	// v0.20 统一身份（ADR-011）：OIDC 依赖方的协议端点天然在登录之前
+	"GET /auth/config":              "只返回是否启用统一登录与注册模式，不含任何账号或仓库信息",
+	"GET /auth/login":               "发起登录：生成单次 state 并绑定发起浏览器，本身不授予任何访问",
+	"GET /auth/callback":            "登录回调：state 单次 + 浏览器绑定 + PKCE + ID Token 验签后才建会话",
+	"GET /auth/link/start":          "旧账号认领：handler 内要求已认证的旧会话，否则 401 页面",
+	"POST /auth/logout":             "退出本产品当前会话：只作用于请求自带的 Cookie（Origin 同源校验）",
+	"POST /auth/backchannel-logout": "身份服务直连：logout token 验签、事件类型、iat 与 jti 防重放后才作废会话",
+	// v0.20 配对 v2（ADR-014）：与 /pair、/enroll 同类——新设备此刻没有任何凭据
+	"GET /api/v2/pairings/{id}/envelope":     "只返回密文（密钥在链接 #fragment）；不消费、按 IP 限流、无效一律 404",
+	"POST /api/v2/device-enrollments/redeem": "一次性 enrollment secret 即认证；按 IP 限流、失败减速",
 }
 
 // parseRoutes 从 router.go 抽出全部注册的路由。

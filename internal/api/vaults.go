@@ -59,6 +59,9 @@ func (h *handlers) listVaults(w http.ResponseWriter, r *http.Request) {
 			"bytesUsed":       v.BytesUsed,
 			"updatedAt":       v.UpdatedAt,
 			"encryptionState": v.EncryptionState,
+			// v0.20：初始化状态与加密绑定身份（vaultId = 选择器，vaultIdentity = AAD 绑定）
+			"initState":     v.InitState,
+			"vaultIdentity": v.Identity,
 			// current：本次请求的凭据当前指向的仓库（设备=绑定仓库；
 			// 用户 Token/会话=默认或 X-Vault-ID 选中的）
 			"current": me != nil && me.VaultID == v.VaultID,
@@ -85,7 +88,19 @@ func (h *handlers) createVault(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "仓库名需为 1–64 个字符")
 		return
 	}
-	id, err := h.svc.CreateUserVault(me.UserID, name)
+	if me.Restricted {
+		writeCoded(w, http.StatusForbidden, CodeEmailNotVerified, "verify your email before creating a vault", false)
+		return
+	}
+	var id string
+	var err error
+	if h.opts.RequireE2EENewVaults {
+		// 公开模式（ADR-012 §7）：v1 新建的仓库同样从 pending_encryption 开始，
+		// 0.19 插件随后的 E2EE 初始化序列在 e2ee/complete 时把它推进到 ready
+		id, _, err = h.svc.CreateVaultV2(me.UserID, name, "v1-"+randomHex32()[:24], true)
+	} else {
+		id, err = h.svc.CreateUserVault(me.UserID, name)
+	}
 	switch {
 	case errors.Is(err, db.ErrVaultLimit):
 		writeCoded(w, http.StatusConflict, CodeConflict, "已达到仓库数量上限", false)

@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema + invitesSchema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -152,6 +152,30 @@ func migrateColumns(d *sql.DB) error {
 		// 公开读取路径（分享链接、配对落地页）仍按不可猜测的 id 寻址，行为不变
 		{"shares", "vault_id", `ALTER TABLE shares ADD COLUMN vault_id TEXT NOT NULL DEFAULT 'default'`, false},
 		{"pairings", "vault_id", `ALTER TABLE pairings ADD COLUMN vault_id TEXT NOT NULL DEFAULT 'default'`, false},
+		// --- v0.20 公开化（基线 PRE-03 / ADR-014） ---
+		// 配对包的发行者与 v2 grant 绑定：撤销只认发行者本人；v2 包的密文随
+		// grant 的兑换/撤销/过期一并删除，读取 envelope 不消费
+		{"pairings", "user_id", `ALTER TABLE pairings ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`, false},
+		{"pairings", "grant_id", `ALTER TABLE pairings ADD COLUMN grant_id TEXT NOT NULL DEFAULT ''`, false},
+		// enrollment grant（ADR-014）：可被发行者撤销；v2 兑换记录 exchange_id，
+		// 并把签发结果用 secret 派生的密钥加密暂存一个短窗口，供「响应丢失后同
+		// exchangeId 重试」原样取回（只知道 exchangeId 的人拿不到任何东西）
+		{"enrollments", "revoked", `ALTER TABLE enrollments ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0`, false},
+		{"enrollments", "exchange_id", `ALTER TABLE enrollments ADD COLUMN exchange_id TEXT NOT NULL DEFAULT ''`, false},
+		{"enrollments", "replay_ciphertext", `ALTER TABLE enrollments ADD COLUMN replay_ciphertext TEXT NOT NULL DEFAULT ''`, false},
+		{"enrollments", "replay_expires_at", `ALTER TABLE enrollments ADD COLUMN replay_expires_at INTEGER NOT NULL DEFAULT 0`, false},
+		// 统一身份（ADR-011）：users 上的资料快照只用于管理员列表展示，从不参与匹配；
+		// created_via 区分 token（旧管理员/邀请）与 oidc（公开注册）账号
+		{"users", "email", `ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''`, false},
+		{"users", "display_name", `ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''`, false},
+		{"users", "created_via", `ALTER TABLE users ADD COLUMN created_via TEXT NOT NULL DEFAULT ''`, false},
+		// 仓库加密初始化状态机（ADR-012）：既有仓库一律 ready（含旧明文仓库，其
+		// encryption_state 不变）；v2 新建仓库从 pending_encryption 开始
+		{"vaults", "init_state", `ALTER TABLE vaults ADD COLUMN init_state TEXT NOT NULL DEFAULT 'ready'`, false},
+		{"vaults", "init_version", `ALTER TABLE vaults ADD COLUMN init_version INTEGER NOT NULL DEFAULT 1`, false},
+		{"vaults", "client_request_id", `ALTER TABLE vaults ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''`, false},
+		{"vaults", "init_lease_op", `ALTER TABLE vaults ADD COLUMN init_lease_op TEXT NOT NULL DEFAULT ''`, false},
+		{"vaults", "init_lease_expires", `ALTER TABLE vaults ADD COLUMN init_lease_expires INTEGER NOT NULL DEFAULT 0`, false},
 	}
 
 	for _, m := range migrations {
@@ -181,6 +205,8 @@ func migrateColumns(d *sql.DB) error {
 	for _, ddl := range []string{
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token_hash ON users(token_hash) WHERE token_hash IS NOT NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name) WHERE name != ''`,
+		// v2 建库幂等（ADR-012）：同一用户同一 clientRequestId 只能建出一个仓库
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_vaults_client_request ON vaults(owner_id, client_request_id) WHERE client_request_id != ''`,
 		// 存量设备归属回填（幂等）：v0.16 加列时的默认值是 ''，而单用户阶段的
 		// 全部设备事实上属于管理员。InsertDevice 已强制归属兜底，此后不会再有空值行。
 		`UPDATE devices SET user_id = 'default' WHERE user_id = ''`,

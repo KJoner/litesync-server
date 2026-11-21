@@ -26,6 +26,15 @@ type Options struct {
 	// TrustedProxies：允许信任其 X-Forwarded-Proto 的反向代理地址（IP 或 CIDR）。
 	// 其余来源的该 Header 一律忽略（v9：不再无条件信任任意请求的转发头）。
 	TrustedProxies []string
+
+	// ---- v0.20 公开化 ----
+	// OIDC：统一登录（ADR-011）；Issuer/ClientID/ClientSecret/PublicURL 全部非空才启用。
+	OIDC OIDCOptions
+	// LegacyTokenLogin：统一登录启用时是否保留「API Token 网页登录」。
+	// 未启用统一登录时 API Token 登录总是可用（自托管现状不变）。
+	LegacyTokenLogin bool
+	// RequireE2EENewVaults：新建仓库必须先完成 E2EE 初始化才可写入内容（ADR-012）。
+	RequireE2EENewVaults bool
 }
 
 type handlers struct {
@@ -33,12 +42,17 @@ type handlers struct {
 	opts    Options
 	web     *sessionStore
 	trusted []netip.Prefix // 可信反向代理（X-Forwarded-Proto 只信它们）
+	rp      *oidcRP        // 统一登录依赖方；未配置时为 nil
+	// publicLimiter：/api/v2 下公开端点（配对 envelope、设备兑换）的按 IP 限流
+	publicLimiter *ipLimiter
 }
 
 // New 构建完整的 HTTP handler。
 // /api/* 要求 Bearer Token（完整权限）或 Web 只读会话（白名单 GET）。
 func New(opts Options, svc *syncsvc.Service) http.Handler {
 	h := &handlers{svc: svc, opts: opts, web: newSessionStore(), trusted: parseTrustedProxies(opts.TrustedProxies)}
+	h.rp = newOIDCRP(opts.OIDC, svc)
+	h.publicLimiter = newIPLimiter(30, time.Minute)
 
 	// v0.18 启动对账：管理员账号与 Token 哈希落库（幂等）。
 	// 失败不 panic——认证会自然拒绝一切请求，日志里有原因；
@@ -164,6 +178,30 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/enrollments", h.createEnrollment)
 	mux.HandleFunc("GET /api/v1/whoami", h.whoami)
 
+	// 统一身份（v0.20 公开化 / ADR-011）：OIDC 依赖方 + 账户中心。
+	// /auth/* 不带 /api/ 前缀 = 不经 authGate，各自校验（state 单次 + 浏览器绑定、
+	// 旧会话、logout token 签名）；在越权矩阵的 publicRoutes 里逐条登记了理由
+	mux.HandleFunc("GET /auth/config", h.authConfig)
+	mux.HandleFunc("GET /auth/login", h.oidcLogin)
+	mux.HandleFunc("GET /auth/callback", h.oidcCallback)
+	mux.HandleFunc("GET /auth/link/start", h.oidcLinkStart)
+	mux.HandleFunc("POST /auth/logout", h.oidcLogout)
+	mux.HandleFunc("POST /auth/backchannel-logout", h.backchannelLogout)
+	mux.HandleFunc("GET /api/v2/me", h.me)
+	mux.HandleFunc("POST /api/v2/account/logout-all", h.logoutAll)
+	mux.HandleFunc("GET /api/v2/devices", h.accountDevices)
+	mux.HandleFunc("DELETE /api/v2/devices/{id}", h.accountRevokeDevice)
+
+	// 网页建库 + 浏览器端 E2EE 初始化（ADR-012）与指定仓库配对 v2（ADR-014）
+	mux.HandleFunc("POST /api/v2/vaults", h.createVaultV2)
+	mux.HandleFunc("GET /api/v2/vaults/{id}/initialization", h.vaultInitStatus)
+	mux.HandleFunc("POST /api/v2/vaults/{id}/initialization", h.vaultInitAction)
+	mux.HandleFunc("POST /api/v2/vaults/{id}/pairing-grants", h.createPairingGrant)
+	mux.HandleFunc("POST /api/v2/pairings", h.createPairingV2)
+	mux.HandleFunc("DELETE /api/v2/pairings/{id}", h.deletePairingV2)
+	mux.HandleFunc("GET /api/v2/pairings/{id}/envelope", h.pairingEnvelope)
+	mux.HandleFunc("POST /api/v2/device-enrollments/redeem", h.redeemEnrollment)
+
 	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
 	mux.HandleFunc("GET /share/{id}", h.getShare)
 	if dist, err := fs.Sub(web.Dist, "dist"); err == nil {
@@ -172,7 +210,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 		mux.Handle("GET /", staticWithETag(dist))
 	}
 
-	return requestLog(opts.Logger, securityHeaders(authGate(h.web, svc, h.trusted, mux)))
+	return requestLog(opts.Logger, securityHeaders(authGate(h, readyGate(h, mux))))
 }
 
 // 协议版本由服务层定义（逐请求校验发生在那里）；这里只做转发。
@@ -205,6 +243,8 @@ func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"resetAuthConfigured": resetAuth,
+		// v0.20 能力协商（接口约定 §8）：客户端以「数组里有没有这个字符串」判定，未知值忽略
+		"capabilities": serverCapabilities,
 		"version":            h.opts.Version,
 		"protocolVersion":    ProtocolVersion,
 		"minProtocolVersion": MinProtocolVersion,
@@ -285,6 +325,11 @@ const (
 	CodeTokenRevoked = "TOKEN_REVOKED"
 	// CodeResetAuthMismatch：重置凭证（E2EE 密码知识证明）不符。
 	CodeResetAuthMismatch = "RESET_AUTH_MISMATCH"
+	// --- v0.20 公开化（接口约定 §0.1） ---
+	CodeAuthRequired        = "AUTH_REQUIRED"         // 会话失效：重新登录，不跨账号重发
+	CodeVaultRequired       = "VAULT_REQUIRED"        // 零仓库/未选仓库却调了需要仓库的接口
+	CodeEmailNotVerified    = "EMAIL_NOT_VERIFIED"    // 未验证邮箱的账号不能消耗资源
+	CodeLegacyLoginDisabled = "LEGACY_LOGIN_DISABLED" // API Token 网页登录已关闭
 )
 
 // writeCoded 统一错误响应体：{code, message, retryable}。
@@ -356,4 +401,13 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// serverCapabilities 是本服务端声明的业务能力（与同步协议版本分开协商）。
+var serverCapabilities = []string{
+	"vault-init-v2",     // POST /api/v2/vaults + initialization（ADR-012）
+	"pairing-v2-redeem", // 配对 envelope 不消费 + 显式可恢复兑换（ADR-014）
+	"vault-bound-pairing",
+	"web-session-oidc", // 网页统一登录（ADR-011；是否启用看 /auth/config）
+	"account-v2",       // /api/v2/me、账户设备与退出全部
 }

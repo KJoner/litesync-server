@@ -41,6 +41,11 @@ type sessionInfo struct {
 	vaultID string
 	// tokenGeneration：创建会话时的用户 Token 世代
 	tokenGeneration int64
+	// oidc：统一登录建立的会话才有（v0.20 / ADR-011）——复核状态与 back-channel
+	// logout 的 sid。指针共享，自带锁；API Token 网页登录的会话为 nil。
+	oidc *oidcSessionState
+	// authTime：本会话完成认证的时刻（敏感操作的「近期认证」判定）
+	authTime time.Time
 }
 
 type sessionStore struct {
@@ -98,6 +103,20 @@ func (s *sessionStore) revoke(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, id)
+}
+
+// revokeWhere 作废所有满足条件的会话（back-channel logout 按 sid 定位）。
+func (s *sessionStore) revokeWhere(match func(sessionInfo) bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, info := range s.sessions {
+		if match(info) {
+			delete(s.sessions, id)
+			n++
+		}
+	}
+	return n
 }
 
 // adoptGeneration 把请求携带的会话迁移到新的 Token 世代。
@@ -233,6 +252,13 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	// 统一登录启用且关闭了旧方式（旧管理员认领之后）：API Token 不再能换网页会话。
+	// 设备与插件的 Bearer 认证不受影响——这里只关网页登录这一个入口。
+	if !h.legacyLoginAllowed() {
+		writeCoded(w, http.StatusForbidden, CodeLegacyLoginDisabled,
+			"API token web login is disabled; sign in with your account", false)
+		return
+	}
 	u, err := h.svc.AuthUserByToken(strings.TrimSpace(req.Token))
 	if err != nil {
 		h.internalError(w, "session login", err)
@@ -259,7 +285,7 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	base := sessionInfo{
 		userID: u.UserID, name: u.Name, isAdmin: u.IsAdmin, vaultID: vaultID,
-		tokenGeneration: u.TokenGeneration,
+		tokenGeneration: u.TokenGeneration, authTime: time.Now(),
 	}
 	h.setSessionCookie(w, r, sessionCookieName, h.web.create(base), int(sessionTTL.Seconds()))
 	if req.Admin {
@@ -316,6 +342,24 @@ func webSessionAllowed(r *http.Request) bool {
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/v1/vaults/") &&
 		(r.Method == http.MethodPatch || r.Method == http.MethodDelete) {
+		return true
+	}
+	// v0.20 公开化：账户中心（统一身份之后网页会话就是账号身份本身）。
+	// 写操作另有 Origin 同源校验（authGate），handler 侧 owner 校验兜底。
+	switch {
+	case r.Method == http.MethodGet && (r.URL.Path == "/api/v2/me" || r.URL.Path == "/api/v2/devices"):
+		return true
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v2/account/logout-all":
+		return true
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v2/devices/"):
+		return true
+	// 网页建库与加密初始化（ADR-012）、从网页连接 Obsidian（ADR-014）：
+	// owner 校验在 handler（ownedVaultScope）；会话写请求另有 Origin 同源校验
+	case r.URL.Path == "/api/v2/vaults" && r.Method == http.MethodPost,
+		strings.HasPrefix(r.URL.Path, "/api/v2/vaults/") && strings.HasSuffix(r.URL.Path, "/initialization"),
+		strings.HasPrefix(r.URL.Path, "/api/v2/vaults/") && strings.HasSuffix(r.URL.Path, "/pairing-grants") && r.Method == http.MethodPost,
+		r.URL.Path == "/api/v2/pairings" && r.Method == http.MethodPost,
+		strings.HasPrefix(r.URL.Path, "/api/v2/pairings/") && r.Method == http.MethodDelete:
 		return true
 	}
 	if r.Method != http.MethodGet {

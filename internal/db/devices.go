@@ -140,7 +140,74 @@ func ListDevices(q dbtx) ([]Device, error) {
 	return out, rows.Err()
 }
 
+// ListDevicesOfUser 列出某用户在某 Vault 下的设备（v0.20 / 公开化基线 PRE-01）。
+//
+// ListDevices 是全实例视图，只给管理员运维页用；普通的 /api/v1/devices 曾经
+// 直接返回它——多用户之后，任何一个用户都能看到全实例所有人的设备名、scope
+// 与设备 ID。按内容断言的回归测试在 api/tenancy_devices_test.go。
+func ListDevicesOfUser(q dbtx, s VaultScope, userID string) ([]Device, error) {
+	if !s.Valid() {
+		return nil, ErrVaultScopeMissing
+	}
+	if userID == "" {
+		return nil, nil
+	}
+	rows, err := q.Query(`SELECT `+deviceColumns+` FROM devices
+		WHERE vault_id = ? AND user_id = ? ORDER BY created_at ASC`, s.ID(), userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Device
+	for rows.Next() {
+		d, err := scanDevice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *d)
+	}
+	return out, rows.Err()
+}
+
+// ListAllDevicesOfUser 列出某用户名下全部仓库的设备（账户中心「设备列表」）。
+func ListAllDevicesOfUser(q dbtx, userID string) ([]Device, error) {
+	if userID == "" {
+		return nil, nil
+	}
+	rows, err := q.Query(`SELECT `+deviceColumns+` FROM devices
+		WHERE user_id = ? ORDER BY created_at ASC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Device
+	for rows.Next() {
+		d, err := scanDevice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *d)
+	}
+	return out, rows.Err()
+}
+
+// RevokeDeviceOfUser 只撤销属于 userID 的设备（PRE-02）；不属于他的与不存在的
+// 同样返回 false——调用方据此回 404，不泄露「这个 ID 存在但不是你的」。
+func RevokeDeviceOfUser(q dbtx, deviceID, userID string) (bool, error) {
+	if userID == "" || deviceID == "" {
+		return false, nil
+	}
+	res, err := q.Exec(`UPDATE devices SET revoked = 1 WHERE id = ? AND user_id = ?`, deviceID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected() //nolint:errcheck
+	return n > 0, nil
+}
+
 // RevokeDevice 撤销设备；返回是否存在该设备。
+// 只用于管理员运维与内部流程（成员移除、Token 重置）；请求路径上的普通撤销
+// 必须走 RevokeDeviceOfUser。
 func RevokeDevice(q dbtx, deviceID string) (bool, error) {
 	res, err := q.Exec(`UPDATE devices SET revoked = 1 WHERE id = ?`, deviceID)
 	if err != nil {
@@ -180,7 +247,7 @@ func ConsumeEnrollment(q dbtx, secretHash string, now int64) (*EnrollmentGrant, 
 	g := &EnrollmentGrant{}
 	err := q.QueryRow(
 		`UPDATE enrollments SET consumed_at = ?
-		 WHERE secret_hash = ? AND consumed_at = 0 AND expires_at > ?
+		 WHERE secret_hash = ? AND consumed_at = 0 AND revoked = 0 AND expires_at > ?
 		 RETURNING scopes, vault_id, user_id`,
 		now, secretHash, now,
 	).Scan(&g.Scopes, &g.VaultID, &g.UserID)
@@ -197,6 +264,16 @@ func ConsumeEnrollment(q dbtx, secretHash string, now int64) (*EnrollmentGrant, 
 		g.UserID = AdminUserID
 	}
 	return g, nil
+}
+
+// RevokeEnrollmentGrant 作废一个尚未兑换的注册凭据（v2 配对包被发行者撤销时连带执行）。
+// 已兑换的不受影响——那台设备要单独撤销。
+func RevokeEnrollmentGrant(q dbtx, grantID string, now int64) error {
+	if grantID == "" {
+		return nil
+	}
+	_, err := q.Exec(`UPDATE enrollments SET revoked = 1 WHERE id = ? AND consumed_at = 0`, grantID)
+	return err
 }
 
 // PruneEnrollments 清理已过期或已消费超过一天的注册凭据。

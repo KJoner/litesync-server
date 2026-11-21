@@ -214,7 +214,33 @@ func (s *Service) ListDevices() ([]db.Device, error) {
 	return db.ListDevices(s.db)
 }
 
-// RevokeDevice 撤销设备（根 Token 专用）；被撤销设备的下一个请求即 401。
+// ListDevicesFor 列出 userID 在该 Vault 下的设备（普通 /api/v1/devices，PRE-01）。
+// ListDevices（全实例）只给管理员运维页。
+func (s *Service) ListDevicesFor(scope db.VaultScope, userID string) ([]db.Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.ListDevicesOfUser(s.db, scope, userID)
+}
+
+// ListAllUserDevices 列出 userID 名下全部仓库的设备（账户中心）。
+func (s *Service) ListAllUserDevices(userID string) ([]db.Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.ListAllDevicesOfUser(s.db, userID)
+}
+
+// RevokeUserDevice 撤销属于 userID 的设备（PRE-02）；不是他的返回 false（调用方回 404）。
+func (s *Service) RevokeUserDevice(userID, deviceID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ok, err := db.RevokeDeviceOfUser(s.db, deviceID, userID)
+	if err == nil && ok {
+		s.log.Info("device revoked", "deviceId", deviceID)
+	}
+	return ok, err
+}
+
+// RevokeDevice 撤销设备（管理员运维与内部流程专用）；被撤销设备的下一个请求即 401。
 func (s *Service) RevokeDevice(deviceID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

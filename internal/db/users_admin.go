@@ -127,6 +127,11 @@ func DeleteUserCascade(d *sql.DB, userID string) (blobIDs, shareIDs []string, va
 	if _, err := tx.Exec(`DELETE FROM memberships WHERE user_id = ?`, userID); err != nil {
 		return nil, nil, "", err
 	}
+	// 外部身份映射随账号删除（ADR-011）：否则同一主体再次登录会指向一个
+	// 已不存在的 user_id；删除后再登录 = 全新的空账号，历史数据不会「复活」
+	if _, err := tx.Exec(`DELETE FROM external_identities WHERE user_id = ?`, userID); err != nil {
+		return nil, nil, "", err
+	}
 	if _, err := tx.Exec(`DELETE FROM users WHERE user_id = ?`, userID); err != nil {
 		return nil, nil, "", err
 	}

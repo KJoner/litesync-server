@@ -30,6 +30,8 @@ func (h *handlers) metaError(w http.ResponseWriter, op string, err error) {
 	var collision *syncsvc.PathCollisionError
 	var validation *syncsvc.ValidationError
 	switch {
+	case errors.Is(err, syncsvc.ErrVaultNotReady):
+		writeVaultNotReady(w)
 	case errors.As(err, &conflict):
 		writeConflict(w, conflict)
 	case errors.As(err, &collision):

@@ -38,13 +38,16 @@ type UserVault struct {
 	UpdatedAt       int64 // live 对象的最近更新（Unix 秒；0 = 空仓库）
 	EncryptionState string
 	KeyEpoch        int64
+	// InitState / Identity（v0.20）：初始化状态（ADR-012）与加密绑定身份（= v1 info.vaultId）
+	InitState string
+	Identity  string
 }
 
 // ListUserVaults 列出该用户为 owner 的全部仓库及概要（created_at 升序，
 // 第一个即「默认仓库」——与 OwnerVaultOf 的取法一致）。
 func ListUserVaults(d *sql.DB, userID string) ([]UserVault, error) {
 	rows, err := d.Query(`
-		SELECT v.vault_id, v.name, v.created_at
+		SELECT v.vault_id, v.name, v.created_at, v.init_state, v.identity
 		  FROM memberships m JOIN vaults v ON v.vault_id = m.vault_id
 		 WHERE m.user_id = ? AND m.role = 'owner'
 		 ORDER BY m.created_at ASC, v.vault_id ASC`, userID)
@@ -55,7 +58,7 @@ func ListUserVaults(d *sql.DB, userID string) ([]UserVault, error) {
 	var out []UserVault
 	for rows.Next() {
 		var v UserVault
-		if err := rows.Scan(&v.VaultID, &v.Name, &v.CreatedAt); err != nil {
+		if err := rows.Scan(&v.VaultID, &v.Name, &v.CreatedAt, &v.InitState, &v.Identity); err != nil {
 			return nil, err
 		}
 		out = append(out, v)

@@ -59,7 +59,7 @@ func (s *Service) Rename(scope db.VaultScope, p RenameParams) (*RenameResult, er
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.FromPseudonym); err != nil {
+	if err := s.guardWriteReady(scope, rs, p.Client, p.DeviceID, p.FromPseudonym); err != nil {
 		return nil, err
 	}
 

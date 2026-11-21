@@ -32,7 +32,12 @@ func (h *handlers) createPairing(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	id, expiresAt, err := h.svc.CreatePairing(req.Ciphertext, time.Duration(req.TTLSeconds)*time.Second)
+	owner, err := h.requestOwner(identityFrom(r))
+	if err != nil {
+		h.internalError(w, "pairing create", err)
+		return
+	}
+	id, expiresAt, err := h.svc.CreatePairing(scopeOf(r), owner, req.Ciphertext, time.Duration(req.TTLSeconds)*time.Second)
 	if err != nil {
 		h.internalError(w, "pairing create", err)
 		return
@@ -55,8 +60,14 @@ func (h *handlers) consumePairing(w http.ResponseWriter, r *http.Request) {
 }
 
 // deletePairing DELETE /api/v1/pairing/{id}（配对窗口关闭时撤销）
+// 只删发行者本人的包；别人的与不存在的同样返回 ok（PRE-03，不泄露存在性）。
 func (h *handlers) deletePairing(w http.ResponseWriter, r *http.Request) {
-	if err := h.svc.DeletePairing(r.PathValue("id")); err != nil {
+	owner, err := h.requestOwner(identityFrom(r))
+	if err != nil {
+		h.internalError(w, "pairing delete", err)
+		return
+	}
+	if err := h.svc.DeletePairing(scopeOf(r), owner, r.PathValue("id")); err != nil {
 		h.internalError(w, "pairing delete", err)
 		return
 	}

@@ -470,7 +470,7 @@ func (s *Service) Upload(scope db.VaultScope, p UploadParams, body io.Reader) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.Path); err != nil {
+	if err := s.guardWriteReady(scope, rs, p.Client, p.DeviceID, p.Path); err != nil {
 		return nil, err
 	}
 
@@ -892,7 +892,7 @@ func (s *Service) Delete(scope db.VaultScope, p DeleteParams) (*DeleteResult, er
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.Path); err != nil {
+	if err := s.guardWriteReady(scope, rs, p.Client, p.DeviceID, p.Path); err != nil {
 		return nil, err
 	}
 
@@ -1259,6 +1259,16 @@ func (s *Service) CompleteE2eeMigration(scope db.VaultScope) (*db.RepoState, err
 	}
 	if err := db.RaiseMinimumEnvelopeVersion(tx, scope, db.EnvelopeLSE1); err != nil {
 		return nil, err
+	}
+	// v1 兼容（ADR-012 §7）：0.19 插件在 pending_encryption 的新仓库上走
+	// PUT vault-key → e2ee begin → e2ee complete；密钥文档已在、加密状态已切换，
+	// 这一刻就是它的「初始化完成」——之后才接受内容写入
+	if _, present, err := db.GetMeta(tx, vaultKeyMetaKeyFor(scope)); err != nil {
+		return nil, err
+	} else if present {
+		if err := db.SetVaultInitState(tx, scope, db.InitReady); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

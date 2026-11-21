@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
@@ -35,6 +35,15 @@ type authIdentity struct {
 	// 换票接口本身不接受短期票——否则一张泄露的票可以无限续期，
 	// 「被动泄露后自动过期」这条性质就没了。
 	ViaAccessToken bool
+	// ViaOIDC：网页会话由统一登录建立（v0.20 / ADR-011）。
+	ViaOIDC bool
+	// Restricted：邮箱尚未验证的统一账号——可以查看，不能做消耗资源的操作
+	//（建仓库、发行配对等，需求 §4.1）。
+	Restricted bool
+	// idTokenHint：全局退出时交给身份服务的 id_token_hint（只在本进程内存中）。
+	idTokenHint string
+	// authTime：网页会话完成认证的时刻（发行配对等敏感操作的「近期认证」判定）
+	authTime time.Time
 }
 
 type ctxKey int
@@ -143,6 +152,20 @@ func routeScope(method, path string) (scope string, rootOnly bool) {
 		return syncsvc.ScopeKeyAdmin, false
 	case path == "/api/v1/whoami":
 		return "", false // 任何有效凭据均可
+	// ---- v0.20 公开化 /api/v2 ----
+	case path == "/api/v2/me":
+		// 用户身份不走 scope；设备凭据需要 sync（看到的是其主人的账号信息，
+		// 零 scope 设备什么都拿不到——越权矩阵 TestZeroScopeDeviceGetsNothing）
+		return syncsvc.ScopeSync, false
+	case strings.HasPrefix(path, "/api/v2/account/") || path == "/api/v2/devices" ||
+		strings.HasPrefix(path, "/api/v2/devices/"):
+		return "", true // 账户级操作：用户身份专属，被盗设备不得退出/撤销别的设备
+	case strings.HasPrefix(path, "/api/v2/vaults/") && strings.HasSuffix(path, "/pairing-grants"):
+		return syncsvc.ScopePairing, false // 插件「添加新设备」：设备凭据只能为自己绑定的仓库发行
+	case path == "/api/v2/pairings" || strings.HasPrefix(path, "/api/v2/pairings/"):
+		return syncsvc.ScopePairing, false
+	case path == "/api/v2/vaults" || strings.HasPrefix(path, "/api/v2/vaults/"):
+		return "", true // 建库与加密初始化：用户身份专属（设备不能建库，也不能动别的仓库的密钥）
 	case syncRoutes[path]:
 		return syncsvc.ScopeSync, false
 	default:
@@ -169,9 +192,57 @@ func normalizeClientPlatform(v string) string {
 	return v
 }
 
-func authGate(web *sessionStore, svc *syncsvc.Service, trusted []netip.Prefix, next http.Handler) http.Handler {
+// vaultRequired 报告该路由是否需要一个具体仓库（v0.20：零仓库账号是正常状态）。
+// 不需要仓库的：仓库列表/新建/改名/删除（目标在路径或请求体里，由 handler 按
+// owner 校验）、身份查询与全部 /api/v2 账号接口。
+func vaultRequired(r *http.Request) bool {
+	p := r.URL.Path
+	switch {
+	case p == "/api/v1/vaults", strings.HasPrefix(p, "/api/v1/vaults/"),
+		p == "/api/v1/whoami", strings.HasPrefix(p, "/api/v2/"),
+		strings.HasPrefix(p, "/api/v1/admin/"): // 实例级运维不依附于某个仓库
+		return false
+	}
+	return true
+}
+
+// sessionIdentity 把网页会话转成认证身份；ok=false 时响应已写好。
+func (h *handlers) sessionIdentity(w http.ResponseWriter, r *http.Request, cookieID string, info sessionInfo, admin bool) (*authIdentity, bool) {
+	if info.oidc != nil && h.rp != nil && !h.rp.revalidate(r.Context(), info.oidc) {
+		// 身份服务明确拒绝了复核（冻结、全局退出、会话撤销）：本会话作废
+		h.web.revoke(cookieID)
+		writeCoded(w, http.StatusUnauthorized, CodeAuthRequired, "session ended; sign in again", false)
+		return nil, false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && !h.sameOrigin(r) {
+		writeCoded(w, http.StatusForbidden, CodeForbidden, "cross-origin request rejected", false)
+		return nil, false
+	}
+	chosen, okv := resolveVaultChoice(w, r, h.svc, info.userID, info.vaultID)
+	if !okv {
+		return nil, false
+	}
+	if chosen == "" && vaultRequired(r) {
+		writeCoded(w, http.StatusConflict, CodeVaultRequired, "no vault selected; create or choose a vault first", false)
+		return nil, false
+	}
+	id := &authIdentity{UserID: info.userID, Name: info.name, IsAdmin: info.isAdmin || admin, VaultID: chosen, authTime: info.authTime}
+	if info.oidc != nil {
+		id.ViaOIDC = true
+		id.Restricted = !info.oidc.emailVerified
+		info.oidc.mu.Lock()
+		id.idTokenHint = info.oidc.idToken
+		info.oidc.mu.Unlock()
+	}
+	return id, true
+}
+
+func authGate(h *handlers, next http.Handler) http.Handler {
+	web, svc, trusted := h.web, h.svc, h.trusted
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") {
+		if !strings.HasPrefix(r.URL.Path, "/api/") || publicAPIRoute(r) {
+			// /api/ 之外 = 公开；publicAPIRoute 是 /api/v2 下 secret 即认证的少数端点
+			//（配对 envelope 读取、设备兑换），各自在 handler 内校验并限流
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -277,14 +348,11 @@ func authGate(web *sessionStore, svc *syncsvc.Service, trusted []netip.Prefix, n
 			// ADMIN capability：普通会话不够，必须持管理员 Token 或短期 admin 会话
 			if c, err := r.Cookie(adminCookieName); err == nil {
 				if info, ok := web.lookup(c.Value, true); ok && sessionGenerationValid(svc, info) {
-					chosen, okv := resolveVaultChoice(w, r, svc, info.userID, info.vaultID)
+					id, okv := h.sessionIdentity(w, r, c.Value, info, true)
 					if !okv {
 						return
 					}
-					ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
-						UserID: info.userID, Name: info.name, IsAdmin: true, VaultID: chosen,
-					})
-					next.ServeHTTP(w, r.WithContext(ctx))
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 					return
 				}
 			}
@@ -300,14 +368,11 @@ func authGate(web *sessionStore, svc *syncsvc.Service, trusted []netip.Prefix, n
 		if c, err := r.Cookie(sessionCookieName); err == nil {
 			if info, ok := web.lookup(c.Value, false); ok && sessionGenerationValid(svc, info) {
 				if webSessionAllowed(r) {
-					chosen, okv := resolveVaultChoice(w, r, svc, info.userID, info.vaultID)
+					id, okv := h.sessionIdentity(w, r, c.Value, info, false)
 					if !okv {
 						return
 					}
-					ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
-						UserID: info.userID, Name: info.name, IsAdmin: info.isAdmin, VaultID: chosen,
-					})
-					next.ServeHTTP(w, r.WithContext(ctx))
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 					return
 				}
 				writeErr(w, http.StatusForbidden, "web session is read-only")

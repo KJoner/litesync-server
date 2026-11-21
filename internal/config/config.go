@@ -4,6 +4,8 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -60,6 +62,104 @@ type Config struct {
 	// 设成 0 表示不限（不推荐：半开连接会一直占着 goroutine）。
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
+
+	// ---- v0.20 公开化（ADR-011 / ADR-012） ----
+
+	// PublicURL（OBSYNC_PUBLIC_URL）：本服务对外的规范地址，如 https://sync.example.com。
+	// OIDC 回调地址必须与身份服务登记的**逐字一致**，因此从这里拼，绝不从请求的
+	// Host 头推断（那是 Host 头注入与开放重定向的入口）。
+	PublicURL string
+	// OIDC（OBSYNC_OIDC_ISSUER / _CLIENT_ID / _CLIENT_SECRET）：三者都设置才启用统一登录。
+	// client secret 只在服务端环境变量里，不进前端、插件或仓库。
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCClientSecret string
+	// RegistrationMode（OBSYNC_REGISTRATION_MODE = closed|invite|open，默认 invite）：
+	// 产品侧注册兜底开关（接口约定 §1.6）；先以邀请模式试运行，再开放。
+	RegistrationMode string
+	// LegacyTokenLogin（OBSYNC_LEGACY_TOKEN_LOGIN，默认 true）：是否保留
+	// 「API Token 网页登录」。旧管理员认领统一账号之前必须保留；之后可关闭。
+	LegacyTokenLogin bool
+	// RequireE2EENewVaults（OBSYNC_REQUIRE_E2EE_NEW_VAULTS，默认 true）：新建仓库
+	// 必须先完成 E2EE 初始化才能写入内容（ADR-012）。自托管且确实需要明文仓库
+	// 的部署才关掉它；旧仓库不受影响。
+	RequireE2EENewVaults bool
+}
+
+// OIDCEnabled 报告是否配置了统一登录。
+func (c *Config) OIDCEnabled() bool {
+	return c.OIDCIssuer != "" && c.OIDCClientID != "" && c.OIDCClientSecret != ""
+}
+
+// loadPublicLaunch 解析 v0.20 公开化相关配置。半套 OIDC 配置直接拒绝启动——
+// 「以为开了统一登录其实没开」比启动失败更糟。
+func loadPublicLaunch(cfg *Config) error {
+	cfg.PublicURL = strings.TrimRight(strings.TrimSpace(os.Getenv("OBSYNC_PUBLIC_URL")), "/")
+	cfg.OIDCIssuer = strings.TrimSpace(os.Getenv("OBSYNC_OIDC_ISSUER"))
+	cfg.OIDCClientID = strings.TrimSpace(os.Getenv("OBSYNC_OIDC_CLIENT_ID"))
+	cfg.OIDCClientSecret = os.Getenv("OBSYNC_OIDC_CLIENT_SECRET")
+
+	set := 0
+	for _, v := range []string{cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCClientSecret} {
+		if v != "" {
+			set++
+		}
+	}
+	if set != 0 && set != 3 {
+		return fmt.Errorf("OIDC is half-configured: OBSYNC_OIDC_ISSUER, OBSYNC_OIDC_CLIENT_ID and OBSYNC_OIDC_CLIENT_SECRET must all be set (or none)")
+	}
+	if cfg.OIDCEnabled() {
+		if cfg.PublicURL == "" {
+			return fmt.Errorf("OBSYNC_PUBLIC_URL is required when OIDC is enabled (the callback must be https://<host>/auth/callback exactly)")
+		}
+		u, err := url.Parse(cfg.PublicURL)
+		if err != nil || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("invalid OBSYNC_PUBLIC_URL: %q (use scheme://host[:port] with no path)", cfg.PublicURL)
+		}
+		if u.Scheme != "https" && !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("OBSYNC_PUBLIC_URL must use https outside localhost: %q", cfg.PublicURL)
+		}
+		iu, err := url.Parse(cfg.OIDCIssuer)
+		if err != nil || iu.Host == "" || (iu.Scheme != "https" && !isLoopbackHost(iu.Hostname())) {
+			return fmt.Errorf("invalid OBSYNC_OIDC_ISSUER: %q (https required outside localhost)", cfg.OIDCIssuer)
+		}
+	}
+
+	switch mode := strings.ToLower(getenv("OBSYNC_REGISTRATION_MODE", "invite")); mode {
+	case "closed", "invite", "open":
+		cfg.RegistrationMode = mode
+	default:
+		return fmt.Errorf("invalid OBSYNC_REGISTRATION_MODE: %q (use closed/invite/open)", mode)
+	}
+
+	var err error
+	if cfg.LegacyTokenLogin, err = boolEnv("OBSYNC_LEGACY_TOKEN_LOGIN", true); err != nil {
+		return err
+	}
+	if cfg.RequireE2EENewVaults, err = boolEnv("OBSYNC_REQUIRE_E2EE_NEW_VAULTS", true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func boolEnv(key string, def bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s: %q", key, v)
+	}
+	return b, nil
+}
+
+func isLoopbackHost(h string) bool {
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 func Load() (*Config, error) {
@@ -192,6 +292,10 @@ func Load() (*Config, error) {
 		if e = strings.TrimSpace(e); e != "" {
 			cfg.TrustedProxies = append(cfg.TrustedProxies, e)
 		}
+	}
+
+	if err := loadPublicLaunch(cfg); err != nil {
+		return nil, err
 	}
 
 	switch strings.ToLower(getenv("OBSYNC_LOG_LEVEL", "info")) {

@@ -63,7 +63,7 @@ func (s *Service) Restore(scope db.VaultScope, p RestoreParams) (*RestoreResult,
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guardWrite(rs, p.Client, p.DeviceID, p.Pseudonym); err != nil {
+	if err := s.guardWriteReady(scope, rs, p.Client, p.DeviceID, p.Pseudonym); err != nil {
 		return nil, err
 	}
 

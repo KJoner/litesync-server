@@ -98,13 +98,22 @@ func (h *handlers) createEnrollment(w http.ResponseWriter, r *http.Request) {
 }
 
 // listDevices 设备列表（不含任何凭据材料）。GET /api/v1/devices
+//
+// 只列**调用者本人**在当前仓库下的设备（v0.20 / 基线 PRE-01）。以前这里返回的是
+// 全实例视图：多用户服务器上任何人都能看到所有人的设备名、scope 与设备 ID，
+// 而设备 ID 恰好是撤销接口的参数。全实例视图只在 /api/v1/admin/devices。
 func (h *handlers) listDevices(w http.ResponseWriter, r *http.Request) {
-	devices, err := h.svc.ListDevices()
+	me := identityFrom(r)
+	owner, err := h.requestOwner(me)
 	if err != nil {
 		h.internalError(w, "device list", err)
 		return
 	}
-	me := identityFrom(r)
+	devices, err := h.svc.ListDevicesFor(scopeOf(r), owner)
+	if err != nil {
+		h.internalError(w, "device list", err)
+		return
+	}
 	type apiDevice struct {
 		ID         string `json:"id"`
 		Name       string `json:"name"`
@@ -129,7 +138,13 @@ func (h *handlers) listDevices(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/v1/devices/{id}
 func (h *handlers) revokeDevice(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	ok, err := h.svc.RevokeDevice(id)
+	me := identityFrom(r)
+	if me == nil || me.UserID == "" {
+		writeErr(w, http.StatusForbidden, "user token required")
+		return
+	}
+	// 只能撤销自己的设备（PRE-02）：别人的与不存在的同样 404
+	ok, err := h.svc.RevokeUserDevice(me.UserID, id)
 	if err != nil {
 		h.internalError(w, "device revoke", err)
 		return
@@ -139,6 +154,21 @@ func (h *handlers) revokeDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": id})
+}
+
+// requestOwner 返回本次请求的账号主体：用户 Token / 网页会话直接带 UserID；
+// 设备凭据与短期票的归属由服务端设备行决定（请求里声称的一律不作数）。
+func (h *handlers) requestOwner(me *authIdentity) (string, error) {
+	if me == nil {
+		return "", nil
+	}
+	if me.UserID != "" {
+		return me.UserID, nil
+	}
+	if me.DeviceID != "" {
+		return h.svc.DeviceOwner(me.DeviceID)
+	}
+	return "", nil
 }
 
 // whoami 返回当前凭据身份（客户端据此判断是否需要把用户 Token 换成设备凭据）。

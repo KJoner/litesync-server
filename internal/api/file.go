@@ -131,6 +131,8 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	var collision *syncsvc.PathCollisionError
 	var tooBig *http.MaxBytesError
 	switch {
+	case errors.Is(err, syncsvc.ErrVaultNotReady):
+		writeVaultNotReady(w)
 	case errors.As(err, &conflict):
 		writeConflict(w, conflict)
 	case errors.As(err, &collision):
@@ -338,6 +340,8 @@ func (h *handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var conflict *syncsvc.ConflictError
 		switch {
+		case errors.Is(err, syncsvc.ErrVaultNotReady):
+			writeVaultNotReady(w)
 		case errors.As(err, &conflict):
 			writeConflict(w, conflict)
 		case errors.Is(err, syncsvc.ErrNotFound):

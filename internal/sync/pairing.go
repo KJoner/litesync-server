@@ -67,7 +67,8 @@ func (s *Service) vaultIdentityLocked(scope db.VaultScope) (string, error) {
 }
 
 // CreatePairing 保存一次性配对密文，返回随机 id 与过期时间。
-func (s *Service) CreatePairing(ciphertext string, ttl time.Duration) (string, int64, error) {
+// 归属（vault + 发行者 userID）取自认证上下文，撤销时只认发行者本人（PRE-03）。
+func (s *Service) CreatePairing(scope db.VaultScope, userID, ciphertext string, ttl time.Duration) (string, int64, error) {
 	if ttl <= 0 || ttl > pairingMaxTTL {
 		ttl = pairingDefaultTTL
 	}
@@ -81,10 +82,7 @@ func (s *Service) CreatePairing(ciphertext string, ttl time.Duration) (string, i
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(
-		`INSERT INTO pairings (id, ciphertext, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-		id, ciphertext, now.Unix(), expiresAt,
-	); err != nil {
+	if err := db.InsertPairing(s.db, scope, userID, id, ciphertext, "", now.Unix(), expiresAt); err != nil {
 		return "", 0, err
 	}
 	return id, expiresAt, nil
@@ -95,36 +93,52 @@ func (s *Service) CreatePairing(ciphertext string, ttl time.Duration) (string, i
 func (s *Service) ConsumePairing(id string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var ciphertext string
-	err := s.db.QueryRow(
-		`DELETE FROM pairings WHERE id = ? AND expires_at > ? RETURNING ciphertext`,
-		id, time.Now().Unix(),
-	).Scan(&ciphertext)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrPairingNotFound
-	}
+	ciphertext, ok, err := db.ConsumePairing(s.db, id, time.Now().Unix())
 	if err != nil {
 		return "", err
+	}
+	if !ok {
+		return "", ErrPairingNotFound
 	}
 	return ciphertext, nil
 }
 
-// DeletePairing 撤销配对（配对窗口关闭时调用；不存在视为成功）。
-func (s *Service) DeletePairing(id string) error {
+// DeletePairing 撤销配对（配对窗口关闭时调用）。
+//
+// 只有发行者本人（同一 vault、同一 user）能删；不属于调用者的与不存在的
+// 一样「成功」返回——插件在关闭窗口时无条件调用它，而区分两种情况的响应
+// 本身就是存在性预言机。v2 包连带作废尚未兑换的 grant（ADR-014）。
+func (s *Service) DeletePairing(scope db.VaultScope, userID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM pairings WHERE id = ?`, id)
-	return err
+	return s.inTx(func(tx *sql.Tx) error {
+		grantID, deleted, err := db.DeletePairingOwned(tx, scope, userID, id)
+		if err != nil || !deleted || grantID == "" {
+			return err
+		}
+		return db.RevokeEnrollmentGrant(tx, grantID, time.Now().Unix())
+	})
 }
 
 // maintainPairings 清理已过期的配对（正常路径消费即删，这里兜底）。
 func (s *Service) maintainPairings(now int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`DELETE FROM pairings WHERE expires_at <= ?`, now)
+	return db.PrunePairings(s.db, now)
+}
+
+// inTx 在单个事务里执行 fn（调用方必须已持有 s.mu）。
+//
+// 注意：sync.db 是单连接池——fn 内部只能用 tx，任何对 s.db 的直接调用都会
+// 等待这条连接而永远拿不到（死锁）。
+func (s *Service) inTx(fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	n, _ := res.RowsAffected() //nolint:errcheck
-	return n, nil
+	if err := fn(tx); err != nil {
+		tx.Rollback() //nolint:errcheck
+		return err
+	}
+	return tx.Commit()
 }
