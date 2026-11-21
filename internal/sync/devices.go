@@ -77,7 +77,24 @@ func HasScope(scopes, want string) bool {
 func (s *Service) CreateDevice(name, vaultID, userID string) (*DeviceCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.createDeviceLocked(name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID)
+	cred, err := s.createDeviceLocked(name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID)
+	if err == nil {
+		s.notifyDeviceLocked(userID, vaultID, cred.DeviceID, name, "")
+	}
+	return cred, err
+}
+
+// notifyDeviceLocked 发出「新设备已连接」通知（调用方持有 s.mu，且写入已提交）。
+func (s *Service) notifyDeviceLocked(userID, vaultID, deviceID, name, platform string) {
+	if userID == "" {
+		userID = db.AdminUserID
+	}
+	if vaultID == "" {
+		vaultID = db.DefaultVaultID
+	}
+	s.notify(userID, "device-enrolled", map[string]string{
+		"device": name, "platform": platform, "vault": db.VaultDisplayName(s.db, vaultID), "eventId": deviceID,
+	})
 }
 
 func (s *Service) createDeviceLocked(name, scopes, vaultID, userID string) (*DeviceCredential, error) {
@@ -153,7 +170,11 @@ func (s *Service) EnrollDevice(secret, name string) (*DeviceCredential, error) {
 	if grant == nil {
 		return nil, ErrEnrollmentInvalid
 	}
-	return s.createDeviceLocked(name, grant.Scopes, grant.VaultID, grant.UserID)
+	cred, err := s.createDeviceLocked(name, grant.Scopes, grant.VaultID, grant.UserID)
+	if err == nil {
+		s.notifyDeviceLocked(grant.UserID, grant.VaultID, cred.DeviceID, name, "")
+	}
+	return cred, err
 }
 
 // AuthDevice 校验设备 token；有效则返回设备并更新 last_seen（节流到 5 分钟一次）。

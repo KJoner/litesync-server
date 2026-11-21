@@ -110,6 +110,14 @@ func createVaultTx(tx *sql.Tx, userID, name string, now int64) (vaultID string, 
 // CreateUserVault 为用户新建一个仓库（v0.19）。
 // 上限与同名检查在同一事务里完成；返回时 repo_state 已就绪（可立即接入）。
 func CreateUserVault(d *sql.DB, userID, name string) (string, error) {
+	return CreateUserVaultWithLimit(d, userID, name, MaxVaultsPerUser)
+}
+
+// CreateUserVaultWithLimit 同 CreateUserVault，仓库数上限由调用方给出（v0.20 配额；≤0 用默认）。
+func CreateUserVaultWithLimit(d *sql.DB, userID, name string, maxVaults int) (string, error) {
+	if maxVaults <= 0 {
+		maxVaults = MaxVaultsPerUser
+	}
 	now := time.Now().Unix()
 	tx, err := d.Begin()
 	if err != nil {
@@ -122,7 +130,7 @@ func CreateUserVault(d *sql.DB, userID, name string) (string, error) {
 		userID).Scan(&count); err != nil {
 		return "", err
 	}
-	if count >= MaxVaultsPerUser {
+	if count >= maxVaults {
 		return "", ErrVaultLimit
 	}
 	var dup int

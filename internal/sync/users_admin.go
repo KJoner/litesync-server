@@ -138,7 +138,11 @@ func (s *Service) ListUserVaults(userID string) ([]db.UserVault, error) {
 func (s *Service) CreateUserVault(userID, name string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id, err := db.CreateUserVault(s.db, userID, name)
+	limit, err := s.vaultLimitFor(userID)
+	if err != nil {
+		return "", err
+	}
+	id, err := db.CreateUserVaultWithLimit(s.db, userID, name, limit)
 	if err == nil {
 		s.log.Info("vault created", "user", userID, "vault", id)
 	}
@@ -148,11 +152,13 @@ func (s *Service) CreateUserVault(userID, name string) (string, error) {
 // DeleteUserVault 删除用户自己的一个仓库（confirmName 校验、最后一个保护在 db 层）。
 func (s *Service) DeleteUserVault(userID, vaultID, confirmName string) error {
 	s.mu.Lock()
+	name := db.VaultDisplayName(s.db, vaultID)
 	blobIDs, shareIDs, err := db.DeleteUserVault(s.db, userID, vaultID, confirmName)
 	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	s.notify(userID, "vault-deleted", map[string]string{"vault": name, "eventId": vaultID})
 	for _, id := range shareIDs {
 		if rerr := s.shares.Remove(id); rerr != nil {
 			s.log.Warn("delete vault: share content remove failed", "share", truncateID(id), "error", rerr)

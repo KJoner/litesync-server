@@ -65,7 +65,7 @@ func PairingEnvelope(q dbtx, id string, now int64) (ciphertext, grantID string, 
 }
 
 // DeletePairingOwned 只删除属于 (vault, user) 的配对包；返回被删除包绑定的 grant
-//（v2 撤销要连带作废 grant）。不属于调用者的与不存在的同样返回 ("", false)。
+// （v2 撤销要连带作废 grant）。不属于调用者的与不存在的同样返回 ("", false)。
 func DeletePairingOwned(q dbtx, s VaultScope, userID, id string) (grantID string, deleted bool, err error) {
 	if !s.Valid() {
 		return "", false, ErrVaultScopeMissing

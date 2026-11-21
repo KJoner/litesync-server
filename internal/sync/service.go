@@ -253,6 +253,13 @@ type Options struct {
 	// QuarantineRetentionDays（§7.3）：隔离区独立清理策略。0 = 永久保留。
 	// 隔离区里的东西不参与普通 GC——它们是取证材料，不是垃圾。
 	QuarantineRetentionDays int
+
+	// 用户级配额默认值（v0.20 / 需求 §12；可被 users.quota_* 逐用户覆盖）：
+	//   QuotaBytesPerUser：存储（live + 历史，密文字节）；0 = 不限。只约束非管理员，
+	//     免得给公开实例配上限之后把部署者自己的既有仓库卡住（管理员可单独设置覆盖值）；
+	//   QuotaVaultsPerUser：仓库数；0 = 沿用 db.MaxVaultsPerUser。
+	QuotaBytesPerUser  int64
+	QuotaVaultsPerUser int
 }
 
 type Service struct {
@@ -268,7 +275,9 @@ type Service struct {
 	blobs   *storage.BlobStore
 	shares  *storage.ShareStore
 	opts    Options
-	log     *slog.Logger
+	// notifier：账号安全通知（v0.20，可为 nil）；见 notify.go
+	notifier Notifier
+	log      *slog.Logger
 	// blobID 域分隔密钥（§10.3）。按 Vault 缓存（vaultID → []byte）：
 	// 密钥落库后不变，缓存永不失效；换掉它会让该 Vault 的去重失效。
 	secrets gosync.Map
@@ -540,6 +549,12 @@ func (s *Service) Upload(scope db.VaultScope, p UploadParams, body io.Reader) (*
 	// 同一对象上 generation 不增反降 = 客户端状态异常或回退重放 → 按冲突拒绝
 	if cur != nil && hasGen && cur.ContentGeneration > 0 && newGen <= cur.ContentGeneration {
 		return nil, &ConflictError{Path: p.Path, Revision: cur.Revision, Hash: cur.ContentHash, FileID: cur.FileID}
+	}
+
+	// 存储配额（v0.20 / 需求 §12）：在写锁内、两条幂等短路之后核算——响应丢失后的
+	// 原样重试照常成功；新内容（覆盖也算：旧版本进历史，历史计入总量）才占新额度
+	if err := s.checkStorageQuota(scope, size); err != nil {
+		return nil, err
 	}
 
 	// canonical 碰撞键：明文模式服务器计算；meta 模式用客户端 HMAC

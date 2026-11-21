@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -130,6 +131,7 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 	var conflict *syncsvc.ConflictError
 	var collision *syncsvc.PathCollisionError
 	var tooBig *http.MaxBytesError
+	var quota *syncsvc.QuotaExceededError
 	switch {
 	case errors.Is(err, syncsvc.ErrVaultNotReady):
 		writeVaultNotReady(w)
@@ -164,6 +166,9 @@ func (h *handlers) writeUploadError(w http.ResponseWriter, err error) {
 		writeCoded(w, http.StatusBadRequest, CodeMetaRequired, err.Error(), false)
 	case errors.As(err, &tooBig):
 		writeCoded(w, http.StatusRequestEntityTooLarge, CodeTooLarge, "file too large", false)
+	case errors.As(err, &quota):
+		// 永久性超限：413（旧插件按「跳过此文件」处理，不重试风暴），retryable=false
+		writeQuotaExceeded(w, http.StatusRequestEntityTooLarge, quota, "storage quota exceeded; delete files or purge history to free space")
 	case errors.Is(err, storage.ErrInvalidPath):
 		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "invalid path", false)
 	case errors.Is(err, storage.ErrHashMismatch):
@@ -267,6 +272,40 @@ func (h *handlers) restoreFile(w http.ResponseWriter, r *http.Request) {
 		"sequence":       res.Sequence,
 		"restored":       true,
 	})
+}
+
+// trash 回收站（v0.20 网页编辑 / 需求 §7.2「删除回收」）：本仓库仍保留的删除记录。
+//
+// 只读；恢复走既有的 POST /api/v1/files/{fileId}/restore（revision 连续、fileId 不变、
+// 内容世代必须新于删除时）。restorable=false 表示删除前的内容已被历史裁剪清掉——
+// 这时 restore 只能复活一个空对象，界面据此不提供恢复按钮。
+// GET /api/v1/trash
+func (h *handlers) trash(w http.ResponseWriter, r *http.Request) {
+	list, err := h.svc.ListTrash(scopeOf(r))
+	if err != nil {
+		h.internalError(w, "trash", err)
+		return
+	}
+	type item struct {
+		FileID            string `json:"fileId"`
+		Path              string `json:"path"`
+		DeletionRevision  int64  `json:"deletionRevision"`
+		ContentGeneration int64  `json:"contentGeneration"`
+		MetaGeneration    int64  `json:"metaGeneration"`
+		DeletedAt         int64  `json:"deletedAt"`
+		RetainUntil       int64  `json:"retainUntil,omitempty"`
+		Restorable        bool   `json:"restorable"`
+	}
+	out := make([]item, 0, len(list))
+	for _, t := range list {
+		out = append(out, item{
+			FileID: t.FileID, Path: t.LastPseudonym, DeletionRevision: t.DeletionRevision,
+			ContentGeneration: t.ContentGeneration, MetaGeneration: t.MetaGeneration,
+			DeletedAt: t.DeletedAt, RetainUntil: t.RetainUntil, Restorable: t.PriorContentHash != "",
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DeletedAt > out[j].DeletedAt })
+	writeJSON(w, http.StatusOK, map[string]any{"items": out})
 }
 
 // getFile 下载内容，元数据通过响应 Header 返回。
@@ -404,9 +443,16 @@ func writeConflict(w http.ResponseWriter, c *syncsvc.ConflictError) {
 // auditDeviceID：历史记录里的设备身份。设备 Token 认证时用服务器侧的可信
 // 设备 ID（客户端自报的 X-Device-ID 不再作为审计身份）；根 Token 保留自报值。
 func auditDeviceID(r *http.Request) string {
-	if me := identityFrom(r); me != nil && me.DeviceID != "" {
-		return me.DeviceID
+	if me := identityFrom(r); me != nil {
+		if me.DeviceID != "" {
+			return me.DeviceID
+		}
+		// 网页会话（v0.20）：用服务端生成的网页标识，客户端自报的头不作数
+		if me.AuditDevice != "" {
+			return me.AuditDevice
+		}
 	}
+	// 旧路径：用户 Token 直连（插件首台设备换发凭据之前）仍沿用自报头
 	return r.Header.Get("X-Device-ID")
 }
 

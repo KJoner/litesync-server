@@ -46,7 +46,7 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema); err != nil {
+	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema + mailSchema); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -176,6 +176,9 @@ func migrateColumns(d *sql.DB) error {
 		{"vaults", "client_request_id", `ALTER TABLE vaults ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''`, false},
 		{"vaults", "init_lease_op", `ALTER TABLE vaults ADD COLUMN init_lease_op TEXT NOT NULL DEFAULT ''`, false},
 		{"vaults", "init_lease_expires", `ALTER TABLE vaults ADD COLUMN init_lease_expires INTEGER NOT NULL DEFAULT 0`, false},
+		// 用户级配额覆盖值（需求 §12）：0 = 跟随服务器默认，-1 = 不限，>0 = 指定值
+		{"users", "quota_bytes", `ALTER TABLE users ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0`, false},
+		{"users", "quota_vaults", `ALTER TABLE users ADD COLUMN quota_vaults INTEGER NOT NULL DEFAULT 0`, false},
 	}
 
 	for _, m := range migrations {

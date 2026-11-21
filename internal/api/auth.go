@@ -44,6 +44,25 @@ type authIdentity struct {
 	idTokenHint string
 	// authTime：网页会话完成认证的时刻（发行配对等敏感操作的「近期认证」判定）
 	authTime time.Time
+	// AuditDevice：没有设备凭据的身份（网页会话）在审计与写入归属里用的服务端标识，
+	// 形如 "web-<userId 哈希前 12 位>"。客户端自报的 X-Device-ID 永远不作数。
+	AuditDevice string
+}
+
+// webContentWrite：网页编辑需要的内容写路由（ADR-015；OBSYNC_WEB_EDITING 开启时才对会话放行）。
+func webContentWrite(r *http.Request) bool {
+	p := r.URL.Path
+	switch {
+	case p == "/api/v1/file" && (r.Method == http.MethodPut || r.Method == http.MethodDelete),
+		p == "/api/v1/file/rename" && r.Method == http.MethodPost,
+		strings.HasPrefix(p, "/api/v1/files/") && strings.HasSuffix(p, "/restore") && r.Method == http.MethodPost:
+		return true
+	}
+	return false
+}
+
+func webAuditDevice(userID string) string {
+	return "web-" + sha256HexStr(userID)[:12]
 }
 
 type ctxKey int
@@ -144,6 +163,8 @@ func routeScope(method, path string) (scope string, rootOnly bool) {
 		return syncsvc.ScopeSync, false
 	case strings.HasPrefix(path, "/api/v1/files/") && strings.HasSuffix(path, "/restore"):
 		return syncsvc.ScopeSync, false
+	case path == "/api/v1/trash" && method == http.MethodGet:
+		return syncsvc.ScopeSync, false // 回收站列表：与显式恢复同一 scope
 	case path == "/api/v1/token":
 		return "", false // 换票：任何有效的**长期**设备凭据均可（短期票另行拒绝）
 	case path == "/api/v1/members" || strings.HasPrefix(path, "/api/v1/members/"):
@@ -226,7 +247,20 @@ func (h *handlers) sessionIdentity(w http.ResponseWriter, r *http.Request, cooki
 		writeCoded(w, http.StatusConflict, CodeVaultRequired, "no vault selected; create or choose a vault first", false)
 		return nil, false
 	}
-	id := &authIdentity{UserID: info.userID, Name: info.name, IsAdmin: info.isAdmin || admin, VaultID: chosen, authTime: info.authTime}
+	if webContentWrite(r) {
+		// 网页写入：仓库成员角色必须可写（只读成员、零仓库一律拒绝）；解锁成功≠允许写
+		role, ok, err := h.svc.RoleIn(db.ScopeFromAuth(chosen), info.userID)
+		if err != nil {
+			h.internalError(w, "web write role", err)
+			return nil, false
+		}
+		if !ok || !role.CanWrite() {
+			writeCoded(w, http.StatusForbidden, CodeForbidden, "your role in this vault is read-only", false)
+			return nil, false
+		}
+	}
+	id := &authIdentity{UserID: info.userID, Name: info.name, IsAdmin: info.isAdmin || admin, VaultID: chosen, authTime: info.authTime,
+		AuditDevice: webAuditDevice(info.userID)}
 	if info.oidc != nil {
 		id.ViaOIDC = true
 		id.Restricted = !info.oidc.emailVerified
@@ -367,7 +401,7 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 		}
 		if c, err := r.Cookie(sessionCookieName); err == nil {
 			if info, ok := web.lookup(c.Value, false); ok && sessionGenerationValid(svc, info) {
-				if webSessionAllowed(r) {
+				if webSessionAllowed(r) || (h.opts.WebEditing && webContentWrite(r)) {
 					id, okv := h.sessionIdentity(w, r, c.Value, info, false)
 					if !okv {
 						return

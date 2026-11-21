@@ -84,6 +84,40 @@ type Config struct {
 	// 必须先完成 E2EE 初始化才能写入内容（ADR-012）。自托管且确实需要明文仓库
 	// 的部署才关掉它；旧仓库不受影响。
 	RequireE2EENewVaults bool
+	// WebEditing（OBSYNC_WEB_EDITING，默认 false）：允许网页会话写入笔记（ADR-015）。
+	// 需求 §14：网页写功能在完整数据安全与真机验收通过后**单独**开放，所以默认关闭。
+	WebEditing bool
+
+	// 产品通知邮件（ADR-018）。身份邮件由身份服务发送，不在这里。
+	// 密钥只在服务端环境变量；默认 log 渠道（只记「有一封邮件」，不外发）。
+	MailProvider        string // OBSYNC_MAIL_PROVIDER = log | smtp | resend
+	MailFrom            string // OBSYNC_MAIL_FROM，例如 "LiteSync <no-reply@mail.example.com>"
+	MailReplyTo         string // OBSYNC_MAIL_REPLY_TO
+	SMTPHost            string // OBSYNC_SMTP_HOST
+	SMTPPort            int    // OBSYNC_SMTP_PORT（默认 587）
+	SMTPUser            string // OBSYNC_SMTP_USER
+	SMTPPassword        string // OBSYNC_SMTP_PASSWORD
+	SMTPTLS             string // OBSYNC_SMTP_TLS = starttls | implicit | none
+	ResendAPIKey        string // OBSYNC_RESEND_API_KEY
+	ResendWebhookSecret string // OBSYNC_RESEND_WEBHOOK_SECRET（whsec_…；空 = 回执端点关闭）
+
+	// 配额与限流（v0.20 / 需求 §12；可被管理员逐用户覆盖）
+	//
+	// QuotaBytesPerUser（OBSYNC_QUOTA_BYTES_PER_USER，支持 KB/MB/GB/TB 后缀，-1 = 明确不限）：
+	// 每个账号的存储上限（live + 历史，密文字节）；默认 0 = 不限，且只约束非管理员。
+	// **开放注册（OBSYNC_REGISTRATION_MODE=open）时必须显式设置**——公开实例默认无限
+	// 存储是一个等着被滥用的缺口，宁可启动失败让部署者做决定。
+	QuotaBytesPerUser int64
+	// QuotaVaultsPerUser（OBSYNC_QUOTA_VAULTS_PER_USER，默认 20）：每个账号可拥有的仓库数。
+	QuotaVaultsPerUser int
+	// RatePerUserPerMin（OBSYNC_RATE_PER_USER，默认 3000/分钟，突发 1/6；0 = 关闭）：
+	// 按账号（设备按设备）限流，超出返回 429 RATE_LIMITED + Retry-After。
+	RatePerUserPerMin int
+	// UploadConcurrencyPerUser（OBSYNC_UPLOAD_CONCURRENCY_PER_USER，默认 8；0 = 不限）。
+	UploadConcurrencyPerUser int
+	// MailDailyBudget（OBSYNC_MAIL_DAILY_BUDGET，默认 500；0 = 不限）：全局每 24 小时
+	// 最多发出的通知邮件数；超出的延后发送（不丢弃），并记 WARN。
+	MailDailyBudget int
 }
 
 // OIDCEnabled 报告是否配置了统一登录。
@@ -133,13 +167,109 @@ func loadPublicLaunch(cfg *Config) error {
 	}
 
 	var err error
+	if v := strings.TrimSpace(os.Getenv("OBSYNC_QUOTA_BYTES_PER_USER")); v != "" {
+		n, perr := parseByteSize(v)
+		if perr != nil {
+			return fmt.Errorf("invalid OBSYNC_QUOTA_BYTES_PER_USER: %q (e.g. 2GB, 500MB, or -1 for unlimited)", v)
+		}
+		if n < 0 {
+			n = 0 // -1：部署者明确选择不限
+		}
+		cfg.QuotaBytesPerUser = n
+	} else if cfg.RegistrationMode == "open" {
+		return fmt.Errorf("OBSYNC_REGISTRATION_MODE=open requires OBSYNC_QUOTA_BYTES_PER_USER " +
+			"(e.g. 2GB; use -1 to explicitly allow unlimited storage per account)")
+	}
+	if cfg.QuotaVaultsPerUser, err = intEnv("OBSYNC_QUOTA_VAULTS_PER_USER", 20, 1); err != nil {
+		return err
+	}
+	if cfg.RatePerUserPerMin, err = intEnv("OBSYNC_RATE_PER_USER", 3000, 0); err != nil {
+		return err
+	}
+	if cfg.UploadConcurrencyPerUser, err = intEnv("OBSYNC_UPLOAD_CONCURRENCY_PER_USER", 8, 0); err != nil {
+		return err
+	}
+	if cfg.MailDailyBudget, err = intEnv("OBSYNC_MAIL_DAILY_BUDGET", 500, 0); err != nil {
+		return err
+	}
 	if cfg.LegacyTokenLogin, err = boolEnv("OBSYNC_LEGACY_TOKEN_LOGIN", true); err != nil {
 		return err
 	}
 	if cfg.RequireE2EENewVaults, err = boolEnv("OBSYNC_REQUIRE_E2EE_NEW_VAULTS", true); err != nil {
 		return err
 	}
+	if cfg.WebEditing, err = boolEnv("OBSYNC_WEB_EDITING", false); err != nil {
+		return err
+	}
+
+	cfg.MailProvider = strings.ToLower(getenv("OBSYNC_MAIL_PROVIDER", "log"))
+	cfg.MailFrom = os.Getenv("OBSYNC_MAIL_FROM")
+	cfg.MailReplyTo = os.Getenv("OBSYNC_MAIL_REPLY_TO")
+	cfg.SMTPHost = os.Getenv("OBSYNC_SMTP_HOST")
+	cfg.SMTPUser = os.Getenv("OBSYNC_SMTP_USER")
+	cfg.SMTPPassword = os.Getenv("OBSYNC_SMTP_PASSWORD")
+	cfg.SMTPTLS = strings.ToLower(getenv("OBSYNC_SMTP_TLS", "starttls"))
+	cfg.ResendAPIKey = os.Getenv("OBSYNC_RESEND_API_KEY")
+	cfg.ResendWebhookSecret = os.Getenv("OBSYNC_RESEND_WEBHOOK_SECRET")
+	if v := os.Getenv("OBSYNC_SMTP_PORT"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 || n > 65535 {
+			return fmt.Errorf("invalid OBSYNC_SMTP_PORT: %q", v)
+		}
+		cfg.SMTPPort = n
+	}
+	switch cfg.MailProvider {
+	case "log":
+	case "smtp":
+		if cfg.SMTPHost == "" || cfg.MailFrom == "" {
+			return fmt.Errorf("OBSYNC_MAIL_PROVIDER=smtp needs OBSYNC_SMTP_HOST and OBSYNC_MAIL_FROM")
+		}
+		if cfg.SMTPTLS == "none" && !isLoopbackHost(cfg.SMTPHost) {
+			return fmt.Errorf("OBSYNC_SMTP_TLS=none is only allowed for a loopback SMTP relay")
+		}
+	case "resend":
+		if cfg.ResendAPIKey == "" || cfg.MailFrom == "" {
+			return fmt.Errorf("OBSYNC_MAIL_PROVIDER=resend needs OBSYNC_RESEND_API_KEY and OBSYNC_MAIL_FROM")
+		}
+	default:
+		return fmt.Errorf("invalid OBSYNC_MAIL_PROVIDER: %q (use log/smtp/resend)", cfg.MailProvider)
+	}
 	return nil
+}
+
+func intEnv(key string, def, min int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < min {
+		return 0, fmt.Errorf("invalid %s: %q (integer >= %d)", key, v, min)
+	}
+	return n, nil
+}
+
+// parseByteSize 解析「2GB / 500MB / 1048576 / -1」（1024 进制；大小写不敏感，B/KiB 写法都认）。
+func parseByteSize(v string) (int64, error) {
+	s := strings.ToUpper(strings.TrimSpace(v))
+	if s == "-1" {
+		return -1, nil
+	}
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"TIB", 1 << 40}, {"GIB", 1 << 30}, {"MIB", 1 << 20}, {"KIB", 1 << 10}, {"TB", 1 << 40}, {"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"T", 1 << 40}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(s, u.suffix) {
+			s, mult = strings.TrimSpace(strings.TrimSuffix(s, u.suffix)), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 || n > (1<<62)/mult {
+		return 0, fmt.Errorf("invalid size %q", v)
+	}
+	return n * mult, nil
 }
 
 func boolEnv(key string, def bool) (bool, error) {

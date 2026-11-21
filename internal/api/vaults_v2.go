@@ -115,7 +115,7 @@ func (h *handlers) createVaultV2(w http.ResponseWriter, r *http.Request) {
 	id, created, err := h.svc.CreateVaultV2(me.UserID, name, req.ClientRequestID, h.opts.RequireE2EENewVaults)
 	switch {
 	case errors.Is(err, db.ErrVaultLimit):
-		writeCoded(w, http.StatusConflict, CodeConflict, "已达到仓库数量上限", false)
+		h.writeVaultLimit(w, me.UserID)
 		return
 	case errors.Is(err, db.ErrVaultNameTaken):
 		writeCoded(w, http.StatusConflict, CodeConflict, "同名仓库已存在，请换一个名字", false)
@@ -149,13 +149,13 @@ func (h *handlers) writeInitStatus(w http.ResponseWriter, _ *http.Request, scope
 		actions = []string{"open", "connect_device"}
 	}
 	out := map[string]any{
-		"vaultId":       scope.ID(),
-		"vaultIdentity": ri.VaultID, // = v1 info.vaultId（加密 AAD 绑定）
-		"initState":     vi.State,
-		"initVersion":   vi.Version,
-		"leaseActive":   vi.State == db.InitInitializing && vi.LeaseExpires > now,
-		"keyDocPresent": keyDoc,
-		"cryptoProfile": syncsvc.CurrentCryptoProfile(),
+		"vaultId":        scope.ID(),
+		"vaultIdentity":  ri.VaultID, // = v1 info.vaultId（加密 AAD 绑定）
+		"initState":      vi.State,
+		"initVersion":    vi.Version,
+		"leaseActive":    vi.State == db.InitInitializing && vi.LeaseExpires > now,
+		"keyDocPresent":  keyDoc,
+		"cryptoProfile":  syncsvc.CurrentCryptoProfile(),
 		"allowedActions": actions,
 	}
 	if vi.State == db.InitInitializing && vi.LeaseExpires > now {
@@ -227,7 +227,6 @@ func (h *handlers) vaultInitAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
 func (h *handlers) initError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, syncsvc.ErrInitInProgress):
@@ -285,9 +284,9 @@ func (h *handlers) createPairingGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"grantId": g.GrantID, "enrollmentSecret": g.EnrollmentSecret, "expiresAt": g.ExpiresAt,
-		"vault":           map[string]any{"vaultId": scope.ID(), "vaultIdentity": g.VaultIdentity, "displayName": g.VaultName},
-		"accountLabel":    label,
-		"protocolVersion": ProtocolVersion,
+		"vault":                map[string]any{"vaultId": scope.ID(), "vaultIdentity": g.VaultIdentity, "displayName": g.VaultName},
+		"accountLabel":         label,
+		"protocolVersion":      ProtocolVersion,
 		"requiredCapabilities": []string{"vault-bound-pairing", "redeem-v2"},
 		// 服务器只能给出「首次信任 / 新库起点」：它说的 checkpoint 不能自证可信（ADR-014 I-5）
 		"trust": map[string]any{"mode": trustMode, "repoEpoch": g.RepoEpoch, "headSequence": g.HeadSequence},
@@ -505,4 +504,25 @@ func publicAPIRoute(r *http.Request) bool {
 	p := r.URL.Path
 	return (r.Method == http.MethodGet && strings.HasPrefix(p, "/api/v2/pairings/") && strings.HasSuffix(p, "/envelope")) ||
 		(r.Method == http.MethodPost && p == "/api/v2/device-enrollments/redeem")
+}
+
+// mailWebhook POST /hooks/mail/resend：服务商回执（Svix 签名校验在 handler 内）。
+func (h *handlers) mailWebhook(w http.ResponseWriter, r *http.Request) {
+	if h.opts.MailWebhook == nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	h.opts.MailWebhook.ServeHTTP(w, r)
+}
+
+// adminMailStatus GET /api/v1/admin/mail/status：投递计数（不含任何地址）。
+func (h *handlers) adminMailStatus(w http.ResponseWriter, _ *http.Request) {
+	st, err := h.svc.MailStats()
+	if err != nil {
+		h.internalError(w, "mail status", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"queued": st.Queued, "sending": st.Sending, "sent": st.Sent, "failed": st.Failed, "suppressed": st.Suppressed,
+	})
 }

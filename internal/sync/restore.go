@@ -47,6 +47,13 @@ type RestoreResult struct {
 	Sequence       int64
 }
 
+// ListTrash 回收站：本仓库仍保留的全部删除记录（显式恢复的入口；只读）。
+func (s *Service) ListTrash(scope db.VaultScope) ([]db.Tombstone, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.ListTombstones(s.db, scope)
+}
+
 // Restore 把一个已删除对象恢复为 live（内容随后由普通上传写入）。
 func (s *Service) Restore(scope db.VaultScope, p RestoreParams) (*RestoreResult, error) {
 	if !isHex32(p.FileID) {

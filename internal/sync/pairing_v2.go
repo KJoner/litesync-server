@@ -148,14 +148,14 @@ type RedeemParams struct {
 
 // RedeemResult 是兑换结果（Token 明文只在响应里出现）。
 type RedeemResult struct {
-	DeviceID           string   `json:"deviceId"`
-	VaultID            string   `json:"vaultId"`
-	VaultIdentity      string   `json:"vaultIdentity"`
-	Scopes             []string `json:"scopes"`
-	DeviceCredential   string   `json:"deviceCredential"`
-	EnrollmentStatus   string   `json:"enrollmentStatus"`
-	RequiresVaultUnlock bool    `json:"requiresVaultUnlock"`
-	Replayed           bool     `json:"replayed"`
+	DeviceID            string   `json:"deviceId"`
+	VaultID             string   `json:"vaultId"`
+	VaultIdentity       string   `json:"vaultIdentity"`
+	Scopes              []string `json:"scopes"`
+	DeviceCredential    string   `json:"deviceCredential"`
+	EnrollmentStatus    string   `json:"enrollmentStatus"`
+	RequiresVaultUnlock bool     `json:"requiresVaultUnlock"`
+	Replayed            bool     `json:"replayed"`
 }
 
 func replayKey(secret string) ([]byte, error) {
@@ -345,5 +345,6 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 		return nil, err
 	}
 	s.log.Info("device enrolled", "deviceId", res.DeviceID, "vault", res.VaultID, "via", "redeem-v2")
+	s.notifyDeviceLocked(row.UserID, row.VaultID, res.DeviceID, name, p.Platform)
 	return res, nil
 }

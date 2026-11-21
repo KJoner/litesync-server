@@ -736,10 +736,15 @@ func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 		"features": map[string]any{
 			"oidc":             h.rp != nil,
 			"registrationMode": h.opts.OIDC.RegistrationMode,
+			"webEditing":       h.opts.WebEditing,
 		},
 	}
 	if h.rp != nil && h.rp.ensure(r.Context()) == nil {
 		out["accountConsoleUrl"] = h.rp.acctURL
+	}
+	// 用量与上限（需求 §12：达到额度之前就让用户看得到；limit 0 = 不限）
+	if usage, err := h.svc.UserUsage(owner); err == nil {
+		out["usage"] = usageJSON(usage)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

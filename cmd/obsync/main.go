@@ -17,11 +17,12 @@ import (
 	"github.com/KJoner/litesync-server/internal/backup"
 	"github.com/KJoner/litesync-server/internal/config"
 	"github.com/KJoner/litesync-server/internal/db"
+	"github.com/KJoner/litesync-server/internal/mail"
 	"github.com/KJoner/litesync-server/internal/storage"
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
-const version = "0.19.0"
+const version = "0.20.0"
 
 func main() {
 	// rotate-epoch：灾备恢复后的必要步骤（服务停止时执行）。
@@ -36,6 +37,18 @@ func main() {
 	}
 	// token reset：API Token 重置的 SSH 兜底（v0.18）。
 	// 网页端的重置受 E2EE 重置凭证保护；shell 权限即最终授权，这里不设门禁。
+	// identity / vaults：统一身份认领与初始化状态的 SSH 兜底（v0.20）
+	if len(os.Args) > 1 && (os.Args[1] == "identity" || os.Args[1] == "vaults") {
+		run := runIdentity
+		if os.Args[1] == "vaults" {
+			run = runVaults
+		}
+		if err := run(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "obsync "+os.Args[1]+":", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "token" {
 		if err := runToken(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "obsync token:", err)
@@ -148,6 +161,9 @@ func run() error {
 		// v0.13.3 §7.1 / §7.3
 		StrictBlobVerify:        cfg.StrictBlobVerify,
 		QuarantineRetentionDays: cfg.QuarantineRetentionDays,
+		// 用户级配额默认值（需求 §12；管理员可逐用户覆盖）
+		QuotaBytesPerUser:  cfg.QuotaBytesPerUser,
+		QuotaVaultsPerUser: cfg.QuotaVaultsPerUser,
 	}, logger)
 
 	// v5 → v6 数据迁移（ADR-001 §5 / ADR-003 §5）。
@@ -212,6 +228,28 @@ func run() error {
 	bkp := backup.New(database, svc, backup.NewRunner(""), cfg.DataDir, version, cfg.BackupKeyFile, logger)
 	bkp.StartScheduler(ctx)
 
+	// v0.20：产品通知邮件（ADR-018）。默认 log 渠道（不外发），配置了才真正投递
+	mailCfg := mail.Config{
+		Provider: cfg.MailProvider, From: cfg.MailFrom, ReplyTo: cfg.MailReplyTo,
+		SMTPHost: cfg.SMTPHost, SMTPPort: cfg.SMTPPort, SMTPUser: cfg.SMTPUser,
+		SMTPPassword: cfg.SMTPPassword, SMTPTLS: cfg.SMTPTLS,
+		ResendAPIKey: cfg.ResendAPIKey, PublicURL: cfg.PublicURL,
+		DailyBudget: cfg.MailDailyBudget,
+	}
+	mailProvider, err := mail.NewProvider(mailCfg, logger)
+	if err != nil {
+		logger.Error("mail provider", "error", err)
+		os.Exit(1)
+	}
+	outbox := mail.NewOutbox(database, mailProvider, mailCfg, logger)
+	outbox.Start(ctx)
+	svc.SetNotifier(outbox)
+	var mailWebhook http.Handler
+	if cfg.ResendWebhookSecret != "" {
+		mailWebhook = &mail.ResendWebhook{DB: database, Secret: cfg.ResendWebhookSecret, Log: logger}
+	}
+	logger.Info("product notifications", "provider", mailProvider.Name())
+
 	handler := api.New(api.Options{
 		Token:          cfg.Token,
 		MaxFileSize:    cfg.MaxFileSize,
@@ -229,6 +267,11 @@ func run() error {
 		},
 		LegacyTokenLogin:     cfg.LegacyTokenLogin,
 		RequireE2EENewVaults: cfg.RequireE2EENewVaults,
+		WebEditing:           cfg.WebEditing,
+		MailWebhook:          mailWebhook,
+		// 配额与限流（需求 §12）
+		RatePerUserPerMin:        cfg.RatePerUserPerMin,
+		UploadConcurrencyPerUser: cfg.UploadConcurrencyPerUser,
 	}, svc)
 	if cfg.OIDCEnabled() {
 		logger.Info("unified sign-in enabled", "issuer", cfg.OIDCIssuer,

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
@@ -46,7 +47,7 @@ var (
 // ResolveOIDCLogin 把验证通过的外部主体解析为本地用户。
 //
 // 已映射 → 刷新资料快照后返回该用户；未映射 → 按注册开关决定是否新建
-//（零仓库、无 API Token、非管理员）。invite 模式下 inviteSecret 必须是
+// （零仓库、无 API Token、非管理员）。invite 模式下 inviteSecret 必须是
 // 一条有效邀请，邀请与建号在同一事务里消费。
 func (s *Service) ResolveOIDCLogin(issuer, subject string, p db.IdentityProfile,
 	mode RegistrationMode, inviteSecret string) (*db.User, bool, error) {
@@ -188,6 +189,7 @@ func (s *Service) LogoutEverywhere(userID string) (int, error) {
 	n, err := db.RevokeAllDevicesOfUser(s.db, userID)
 	if err == nil {
 		s.log.Info("logout everywhere", "user", userID, "revokedDevices", n)
+		s.notify(userID, "logout-everywhere", map[string]string{"revokedDevices": fmt.Sprint(n)})
 	}
 	return n, err
 }

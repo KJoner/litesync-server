@@ -103,7 +103,7 @@ func (h *handlers) createVault(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case errors.Is(err, db.ErrVaultLimit):
-		writeCoded(w, http.StatusConflict, CodeConflict, "已达到仓库数量上限", false)
+		h.writeVaultLimit(w, me.UserID)
 		return
 	case errors.Is(err, db.ErrVaultNameTaken):
 		writeCoded(w, http.StatusConflict, CodeConflict, "同名仓库已存在，请换一个名字", false)

@@ -337,4 +337,3 @@ func NewOpID() string {
 	rand.Read(b) //nolint:errcheck
 	return "op_" + hex.EncodeToString(b)
 }
-

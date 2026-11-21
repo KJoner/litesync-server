@@ -35,6 +35,14 @@ type Options struct {
 	LegacyTokenLogin bool
 	// RequireE2EENewVaults：新建仓库必须先完成 E2EE 初始化才可写入内容（ADR-012）。
 	RequireE2EENewVaults bool
+	// WebEditing：网页会话可写入笔记（ADR-015；默认关闭，独立门槛开放）。
+	WebEditing bool
+	// MailWebhook：邮件服务商的退信/投诉回执（ADR-018）；nil = 端点关闭（404）。
+	MailWebhook http.Handler
+	// RatePerUserPerMin / UploadConcurrencyPerUser：按账号（设备按设备）的限流与
+	// 上传并发上限（需求 §12）；0 = 关闭。
+	RatePerUserPerMin        int
+	UploadConcurrencyPerUser int
 }
 
 type handlers struct {
@@ -45,6 +53,8 @@ type handlers struct {
 	rp      *oidcRP        // 统一登录依赖方；未配置时为 nil
 	// publicLimiter：/api/v2 下公开端点（配对 envelope、设备兑换）的按 IP 限流
 	publicLimiter *ipLimiter
+	// limiter：已认证请求的按身份限流 + 上传并发（需求 §12）
+	limiter *identityLimiter
 }
 
 // New 构建完整的 HTTP handler。
@@ -53,6 +63,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	h := &handlers{svc: svc, opts: opts, web: newSessionStore(), trusted: parseTrustedProxies(opts.TrustedProxies)}
 	h.rp = newOIDCRP(opts.OIDC, svc)
 	h.publicLimiter = newIPLimiter(30, time.Minute)
+	h.limiter = newIdentityLimiter(opts.RatePerUserPerMin, opts.UploadConcurrencyPerUser)
 
 	// v0.18 启动对账：管理员账号与 Token 哈希落库（幂等）。
 	// 失败不 panic——认证会自然拒绝一切请求，日志里有原因；
@@ -72,6 +83,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
 	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)             // v6：改名 = 元数据更新，不产生 tombstone
 	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile) // v6：显式恢复已删除对象
+	mux.HandleFunc("GET /api/v1/trash", h.trash)                         // v0.20：回收站（只读列表；恢复仍走上一行）
 	mux.HandleFunc("GET /api/v1/history", h.history)
 	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
 	mux.HandleFunc("GET /api/v1/version", h.version)
@@ -166,6 +178,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/users/{id}/disable", h.adminSetUserDisabled(true))
 	mux.HandleFunc("POST /api/v1/admin/users/{id}/enable", h.adminSetUserDisabled(false))
 	mux.HandleFunc("DELETE /api/v1/admin/users/{id}", h.adminDeleteUser)
+	mux.HandleFunc("PUT /api/v1/admin/users/{userId}/quota", h.adminSetQuota) // v0.20 配额覆盖值（需求 §12）
 	mux.HandleFunc("GET /join/{secret}", h.joinLanding)
 	mux.HandleFunc("GET /join/{secret}/info", h.joinInfo)
 	mux.HandleFunc("POST /join/{secret}/register", h.joinRegister)
@@ -202,6 +215,10 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v2/pairings/{id}/envelope", h.pairingEnvelope)
 	mux.HandleFunc("POST /api/v2/device-enrollments/redeem", h.redeemEnrollment)
 
+	// 产品通知邮件（ADR-018）：服务商回执（公开，签名即认证）与管理员投递统计
+	mux.HandleFunc("POST /hooks/mail/resend", h.mailWebhook)
+	mux.HandleFunc("GET /api/v1/admin/mail/status", h.adminMailStatus)
+
 	// 公开路径（不经过 Token 认证）：分享内容 + Web 静态资源
 	mux.HandleFunc("GET /share/{id}", h.getShare)
 	if dist, err := fs.Sub(web.Dist, "dist"); err == nil {
@@ -210,7 +227,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 		mux.Handle("GET /", staticWithETag(dist))
 	}
 
-	return requestLog(opts.Logger, securityHeaders(authGate(h, readyGate(h, mux))))
+	return requestLog(opts.Logger, securityHeaders(authGate(h, rateGate(h, readyGate(h, mux)))))
 }
 
 // 协议版本由服务层定义（逐请求校验发生在那里）；这里只做转发。
@@ -244,7 +261,7 @@ func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"resetAuthConfigured": resetAuth,
 		// v0.20 能力协商（接口约定 §8）：客户端以「数组里有没有这个字符串」判定，未知值忽略
-		"capabilities": serverCapabilities,
+		"capabilities":       h.capabilities(),
 		"version":            h.opts.Version,
 		"protocolVersion":    ProtocolVersion,
 		"minProtocolVersion": MinProtocolVersion,
@@ -343,6 +360,17 @@ func writeCoded(w http.ResponseWriter, status int, code, msg string, retryable b
 	})
 }
 
+// writeCodedDetails 同 writeCoded，附机器可读的 details（配额的种类 / 上限 / 已用等）。
+func writeCodedDetails(w http.ResponseWriter, status int, code, msg string, retryable bool, details map[string]any) {
+	writeJSON(w, status, map[string]any{
+		"code":      code,
+		"message":   msg,
+		"retryable": retryable,
+		"error":     msg,
+		"details":   details,
+	})
+}
+
 // writeErr 按状态码推断默认错误码（逐步替换为显式 writeCoded）。
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeCoded(w, status, defaultCodeFor(status), msg, status >= http.StatusInternalServerError)
@@ -401,6 +429,15 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// capabilities 返回本服务端声明的业务能力；按部署开关追加可选能力。
+func (h *handlers) capabilities() []string {
+	out := append([]string(nil), serverCapabilities...)
+	if h.opts.WebEditing {
+		out = append(out, "web-editing")
+	}
+	return out
 }
 
 // serverCapabilities 是本服务端声明的业务能力（与同步协议版本分开协商）。

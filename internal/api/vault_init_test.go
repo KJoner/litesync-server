@@ -78,7 +78,9 @@ func (e *testEnv) putFileIn(t *testing.T, bearer, vault, path string, content []
 	return e.do(t, req)
 }
 
-func b64n(n int, fill byte) string { return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, n)) }
+func b64n(n int, fill byte) string {
+	return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, n))
+}
 
 // testKeyDoc 形状与插件 createVaultKeyDoc 一致（密文是假的：服务端不理解也不校验内容）。
 func testKeyDoc(iterations int) map[string]any {

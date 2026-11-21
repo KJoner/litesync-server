@@ -400,7 +400,11 @@ func TestOIDCCallbackRejectsTampering(t *testing.T) {
 	}{
 		{"wrong issuer", func(c map[string]any) bool { c["iss"] = "https://evil.example"; return true }},
 		{"wrong audience", func(c map[string]any) bool { c["aud"] = "someone-else"; c["azp"] = "someone-else"; return true }},
-		{"azp mismatch", func(c map[string]any) bool { c["aud"] = []string{testClientID, "other"}; c["azp"] = "other"; return true }},
+		{"azp mismatch", func(c map[string]any) bool {
+			c["aud"] = []string{testClientID, "other"}
+			c["azp"] = "other"
+			return true
+		}},
 		{"nonce mismatch", func(c map[string]any) bool { c["nonce"] = "not-the-nonce"; return true }},
 		{"expired", func(c map[string]any) bool { c["exp"] = time.Now().Add(-time.Hour).Unix(); return true }},
 		{"signed with unknown key", func(map[string]any) bool { return false }},

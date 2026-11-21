@@ -150,12 +150,17 @@ func (h *handlers) adminListUsers(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, len(users))
 	for i := range users {
 		u := &users[i]
-		out = append(out, map[string]any{
+		row := map[string]any{
 			"userId": u.UserID, "name": u.Name, "isAdmin": u.IsAdmin, "disabled": u.Disabled,
 			"vaults": u.Vaults,
 			"createdAt": u.CreatedAt, "lastSeenAt": u.LastSeenAt,
 			"devices": u.Devices, "objects": u.Objects, "bytesUsed": u.BytesUsed,
-		})
+		}
+		// 配额口径的占用（含历史）与生效上限、覆盖值（需求 §12）
+		if usage, err := h.svc.UserUsage(u.UserID); err == nil {
+			row["usage"] = usageJSON(usage)
+		}
+		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }

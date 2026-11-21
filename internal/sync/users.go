@@ -171,6 +171,9 @@ func (s *Service) ResetUserToken(scope db.VaultScope, targetUserID, submittedRes
 	}
 	s.log.Warn("api token reset", "user", targetUserID, "revokedDevices", revoked,
 		"resetAuthEnforced", enforced)
+	s.notify(targetUserID, "token-reset", map[string]string{
+		"revokedDevices": fmt.Sprint(revoked), "eventId": fmt.Sprintf("gen-%d", gen),
+	})
 	return &TokenResetResult{
 		Token: token, RevokedDevices: revoked, Generation: gen, ResetAuthEnforced: enforced,
 	}, nil

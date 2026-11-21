@@ -57,13 +57,13 @@ func ValidateKeyDoc(raw string, profile CryptoProfile) error {
 		return fmt.Errorf("%w: unsupported profile", ErrInvalidKeyDoc)
 	}
 	var doc struct {
-		Version    *int    `json:"version"`
-		KDF        string  `json:"kdf"`
-		Iterations *int64  `json:"iterations"`
-		Salt       string  `json:"salt"`
-		IV         string  `json:"iv"`
-		WrappedKey string  `json:"wrappedKey"`
-		Enabled    *bool   `json:"enabled"`
+		Version    *int     `json:"version"`
+		KDF        string   `json:"kdf"`
+		Iterations *int64   `json:"iterations"`
+		Salt       string   `json:"salt"`
+		IV         string   `json:"iv"`
+		WrappedKey string   `json:"wrappedKey"`
+		Enabled    *bool    `json:"enabled"`
 		CreatedAt  *float64 `json:"createdAt"`
 	}
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
@@ -102,7 +102,11 @@ func ValidateKeyDoc(raw string, profile CryptoProfile) error {
 func (s *Service) CreateVaultV2(userID, name, clientRequestID string, requireE2EE bool) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id, created, err := db.CreateUserVaultV2(s.db, userID, name, clientRequestID, requireE2EE, db.MaxVaultsPerUser)
+	limit, err := s.vaultLimitFor(userID)
+	if err != nil {
+		return "", false, err
+	}
+	id, created, err := db.CreateUserVaultV2(s.db, userID, name, clientRequestID, requireE2EE, limit)
 	if err == nil && created {
 		s.log.Info("vault created", "user", userID, "vault", id, "pendingEncryption", requireE2EE)
 	}
@@ -148,7 +152,7 @@ func (s *Service) ClaimVaultInit(scope db.VaultScope, opID string) (*db.VaultIni
 }
 
 // CommitVaultInit 原子提交初始化。resetAuth 是浏览器从 VMK 派生的重置凭证
-//（hex，可空）；服务端只存它的哈希。返回 (结果, 是否重放)。
+// （hex，可空）；服务端只存它的哈希。返回 (结果, 是否重放)。
 func (s *Service) CommitVaultInit(scope db.VaultScope, opID string, expectedVersion int64,
 	keyDoc string, profile CryptoProfile, resetAuth string) (map[string]any, bool, error) {
 	if err := ValidateKeyDoc(keyDoc, profile); err != nil {

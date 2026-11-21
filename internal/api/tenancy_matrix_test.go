@@ -56,6 +56,7 @@ var publicRoutes = map[string]string{
 	// v0.20 配对 v2（ADR-014）：与 /pair、/enroll 同类——新设备此刻没有任何凭据
 	"GET /api/v2/pairings/{id}/envelope":     "只返回密文（密钥在链接 #fragment）；不消费、按 IP 限流、无效一律 404",
 	"POST /api/v2/device-enrollments/redeem": "一次性 enrollment secret 即认证；按 IP 限流、失败减速",
+	"POST /hooks/mail/resend":                "邮件服务商回执：Svix HMAC 签名 + 时间戳窗口校验；未配置密钥时 404",
 }
 
 // parseRoutes 从 router.go 抽出全部注册的路由。

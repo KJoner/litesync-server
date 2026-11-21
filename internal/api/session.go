@@ -373,7 +373,9 @@ func webSessionAllowed(r *http.Request) bool {
 		"/api/v1/history",
 		"/api/v1/version",
 		"/api/v1/vault-key",
-		"/api/v1/whoami":
+		"/api/v1/whoami",
+		"/api/v1/trash", // v0.20 回收站列表（只读；恢复属于内容写入，受 OBSYNC_WEB_EDITING 闸门约束）
+		"/api/v1/changes": // v0.20 网页发现其他设备的修改（只读元数据；网页身份没有设备行，确认游标是空操作）
 		return true
 	}
 	return false
