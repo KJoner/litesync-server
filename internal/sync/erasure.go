@@ -213,7 +213,9 @@ func (s *Service) erasePlaintextPathsLocked(scope db.VaultScope, rs *db.RepoStat
 	if _, err := s.db.Exec(`PRAGMA secure_delete = ON`); err != nil {
 		return nil, fmt.Errorf("secure_delete: %w", err)
 	}
-	if _, err := s.db.Exec(`VACUUM`); err != nil {
+	// db.Vacuum：SQLite 上就是 VACUUM；PG 上只对 LiteSync 自己的表做 VACUUM FULL（整库 VACUUM FULL 会重写
+	// 别的 schema 的表与系统目录，并与库里其他会话的建表事务死锁，见 db/vacuum.go）
+	if err := db.Vacuum(s.db); err != nil {
 		report.Vacuum = "failed: " + err.Error()
 		return nil, fmt.Errorf("vacuum: %w", err)
 	}

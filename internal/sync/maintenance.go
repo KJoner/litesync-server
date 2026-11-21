@@ -496,7 +496,7 @@ func (s *Service) maintainSQLite() (bool, error) {
 		return false, err
 	}
 	if pages > 1000 && freelist*4 > pages {
-		if _, err := s.db.Exec(`VACUUM`); err != nil {
+		if err := db.Vacuum(s.db); err != nil {
 			return false, err
 		}
 		return true, nil

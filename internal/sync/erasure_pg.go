@@ -26,7 +26,7 @@ const erasureReportMetaKey = "migration-erasure-report"
 func applyPostgresErasureCaveats(r *ErasureReport) {
 	r.WalCheckpoint = "not applicable on PostgreSQL: WAL (pg_wal) is managed by the database server and is not truncated by LiteSync"
 	r.Claims.WalTruncated = false
-	r.Vacuum = "VACUUM FULL (tables rewritten into new files; the old files are unlinked by PostgreSQL, not overwritten)"
+	r.Vacuum = "VACUUM FULL on LiteSync's own tables in the current schema (tables rewritten into new files; the old files are unlinked by PostgreSQL, not overwritten)"
 	r.Scanned = []string{}
 	r.Note = "PostgreSQL deployment: only logical tables were scanned for sentinels — the database files, WAL " +
 		"segments, replicas and PostgreSQL base backups live on the database server and were NOT scanned. " +

@@ -901,7 +901,8 @@ OBSYNC_PG_DSN='postgres://…' obsync export-sqlite --out /data/sync.db.from-pos
 
 **PG 部署上如实说明的差异**
 
-- 明文路径擦除（元数据加密迁移的最后一步）在 PG 上照样执行（`VACUUM FULL` 重写表），但报告**不会**
+- 明文路径擦除（元数据加密迁移的最后一步）在 PG 上照样执行：只对当前 schema 里 LiteSync 自己的表逐一
+  `VACUUM FULL` 重写，不碰同一个库里别的 schema、别的应用的表，也不重写系统目录。报告**不会**
   声称 WAL 已截断或数据文件已扫描：PG 的 WAL、流复制副本与 PG 自身的基础备份由数据库服务器管理，
   明文路径可能在其中留存到被回收为止。报告里只断言逻辑表已无哨兵。
 - 完整性巡检里的数据库页级自检（SQLite 的 `integrity_check`）在 PG 上显示为 `not-run`：

@@ -320,9 +320,12 @@ var pgRewrites = []pgRewrite{
 	{regexp.MustCompile(`(?is)^PRAGMA database_list$`), `SELECT 0::bigint, ''::text, ''::text WHERE false`, false},
 	// WAL / 连接级开关：PG 无对应物，空操作
 	{regexp.MustCompile(`(?is)^PRAGMA (journal_mode|synchronous|busy_timeout|foreign_keys|secure_delete|wal_checkpoint)\b.*$`), `SELECT 1`, false},
-	// 擦除后的整库重建：PG 的 VACUUM FULL 重写全部表文件，死元组随之消失
-	{regexp.MustCompile(`(?is)^VACUUM$`), `VACUUM FULL`, false},
+	// 裸 VACUUM 没有登记翻译（见 reBareVacuum）：调用方用 db.Vacuum，PG 上只重建 LiteSync 自己的表
 }
+
+// reBareVacuum：不带表名的 VACUUM。在 PG 上它是整库操作（连接角色是超级用户时还会重写系统目录并持排他锁），
+// 会穿透 schema 隔离、与库里其他会话的建表事务死锁（2026-11-21 CI 40P01）。改写器拒绝它，必须走 db.Vacuum。
+var reBareVacuum = regexp.MustCompile(`(?is)^VACUUM(\s+(FULL|ANALYZE|VERBOSE|FREEZE))*\s*;?$`)
 
 var sqliteOnly = regexp.MustCompile(`(?i)\bPRAGMA\b|\bsqlite_master\b|\bsqlite_sequence\b|\bpragma_[a-z_]+\b|\bVACUUM\s+INTO\b|\bstrftime\s*\(`)
 
@@ -357,6 +360,9 @@ func RewriteForPostgres(q string) (string, error) {
 
 func rewriteForPostgres(q string) (string, error) {
 	trimmed := strings.TrimSpace(q)
+	if reBareVacuum.MatchString(trimmed) {
+		return "", fmt.Errorf("database-wide %q is not allowed on PostgreSQL: use db.Vacuum (LiteSync's own tables only)", trimmed)
+	}
 	for _, r := range pgRewrites {
 		if r.match.MatchString(trimmed) {
 			if r.template {

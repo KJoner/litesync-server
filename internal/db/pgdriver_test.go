@@ -62,9 +62,10 @@ func TestRewriteRegisteredSQLiteStatements(t *testing.T) {
 		`SELECT seq FROM sqlite_sequence WHERE name = 'changes'`:                            "WHERE false",
 		`PRAGMA wal_checkpoint(TRUNCATE)`:                                                   "SELECT 1",
 		`PRAGMA secure_delete = ON`:                                                         "SELECT 1",
-		`VACUUM`:                                                                            "VACUUM FULL",
-		`PRAGMA database_list`:                                                              "WHERE false",
-		"\n\t\tSELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?\n":      "information_schema.tables",
+		// db.Vacuum 发出的「点名表」的 VACUUM FULL 原样通过
+		`VACUUM FULL "t_x"."file_heads", "t_x"."vaults"`:                               "VACUUM FULL",
+		`PRAGMA database_list`:                                                         "WHERE false",
+		"\n\t\tSELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?\n": "information_schema.tables",
 	}
 	for in, want := range cases {
 		got, err := RewriteForPostgres(in)
@@ -83,6 +84,12 @@ func TestRewriteRejectsUnregisteredSQLiteStatements(t *testing.T) {
 		// 页级自检在 PG 上没有等价物：调用方必须显式分支（sync/integrity.go），不能让改写器冒充 ok
 		`PRAGMA integrity_check`,
 		`PRAGMA quick_check(1)`,
+		// 不带表名的 VACUUM 在 PG 上是整库操作（会重写别的 schema 的表与系统目录、与别的会话的建表事务死锁）：
+		// 只能经 db.Vacuum 点名 LiteSync 自己的表
+		`VACUUM`,
+		`VACUUM FULL`,
+		"  vacuum full;  ",
+		`VACUUM ANALYZE`,
 	} {
 		if _, err := RewriteForPostgres(q); err == nil {
 			t.Fatalf("unregistered SQLite statement %q must be rejected on PostgreSQL", q)
