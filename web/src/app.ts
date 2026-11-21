@@ -14,6 +14,7 @@ import {
 	BackupSnapshot,
 	BackupStatus,
 	FileEntry,
+	TrashItem,
 	IntegrityError,
 	IntegrityEvent,
 	login,
@@ -23,7 +24,36 @@ import {
 	Whoami,
 	AdminInvite,
 	AdminUser,
+	accountApi,
+	ACCOUNT_KEY,
+	announceAccount,
+	authConfig,
+	Me,
+	Usage,
 } from "./api";
+import { openDialog, PortalHost, renderAccountCenter, renderLoginPage, renderVaultCenter } from "./portal";
+import {
+	deriveMetaKeys as coreDeriveMetaKeys,
+	exportVmkRaw as coreExportVmkRaw,
+	MetaKeys as CoreMetaKeys,
+	VaultKeyDoc as CoreVaultKeyDoc,
+} from "./vendor/litesync-core/crypto/crypto";
+import { NoteEditor, NoteEditorHost } from "./note-editor";
+import {
+	attachmentLink,
+	attachmentPath,
+	deleteFile,
+	deriveDraftKey,
+	DraftStore,
+	indexedDbBackend,
+	memoryBackend,
+	newTrackedFile,
+	renameFile,
+	RepoBinding,
+	restoreTombstone,
+	saveWithRetry,
+	TrackedFile,
+} from "./write";
 import {
 	decryptFile,
 	lse3Header,
@@ -71,6 +101,21 @@ interface State {
 	 * 但会话内的回退（同一次浏览中服务器先给新版本再给旧版本）必须挡住。
 	 */
 	seenGeneration: Map<string, number>;
+	// ---- v0.20 网页编辑（ADR-015） ----
+	/** /api/v1/info 的写入相关字段（逐请求世代校验要带上它们） */
+	repo?: { repoEpoch: string; formatEpoch: number; minimumEnvelopeVersion: number; encryptionState: string; metaState?: string };
+	/** 可写的仓库密钥（encrypt+decrypt，不可导出；只在内存） */
+	writeKey?: CryptoKey;
+	/** 插件同源的元数据密钥（enc+mac；meta 模式写入用） */
+	coreMeta?: CoreMetaKeys;
+	/** 加密草稿（解锁后才存在；锁定即随内存一起消失） */
+	drafts?: DraftStore;
+	/** 浏览器不允许持久存储（隐私模式等）：草稿只在本页内存里，界面要如实说明 */
+	draftsVolatile?: boolean;
+	/** 账号（统一身份）与网页编辑开关 */
+	account?: Me;
+	/** 当前打开的编辑器（离开/锁定前先把草稿加密落盘） */
+	editor?: NoteEditor;
 }
 
 let S: State | null = null;
@@ -78,9 +123,13 @@ const app = document.getElementById("app")!;
 let blobUrls: string[] = [];
 
 /** 切换视图时立即回收上一个笔记的所有附件 Blob URL，避免大图累积占内存。 */
+/** 当前视图里已解密的附件（路径@revision → blob URL）：分栏预览重绘时复用，不重复下载解密。 */
+const attachmentUrlCache = new Map<string, string>();
+
 function revokeAllBlobs(): void {
 	for (const url of blobUrls) URL.revokeObjectURL(url);
 	blobUrls = [];
+	attachmentUrlCache.clear();
 }
 
 // ---------- 主题 ----------
@@ -185,16 +234,136 @@ function resolveTarget(target: string): string | null {
 }
 
 // ---------- 入口 ----------
+const portalHost: PortalHost = {
+	root: app,
+	toggleTheme,
+	openVault: (vaultId, preset) => {
+		rememberVault(vaultId);
+		if (preset) {
+			// 刚建好的仓库：密钥已在内存里，直接进入（不落盘、不刷新，避免立刻再输一次密码）。
+			// 用 replaceState 改地址：直接赋值 location.hash 会触发门户页的 hashchange → 再跑一遍
+			// 不带密钥的 boot()，两条启动路径赛跑，后完成的那条会把解锁页盖到已进入的工作台上（实测）
+			history.replaceState(null, "", "#/");
+			const api = new Api();
+			api.vaultId = vaultId;
+			void bootVault(api, preset);
+			return;
+		}
+		location.hash = "#/";
+		location.reload(); // 仓库间的密钥/状态彻底隔离：整页重进最干净
+	},
+};
+
+// ---------- 账号命名空间与跨标签页身份变化（验收 TN-05） ----------
+//
+// 浏览器存储里的一切都要按账号分区：同一浏览器换成 B 登录时，B 不能看到 A 留下的任何东西，
+// 也不能拿 A 的选择去发请求。另一个标签页切换 / 退出账号时，本页要立刻发现并清掉可见状态
+// （已解锁的明文、编辑器、撤销栈）——共享的会话 Cookie 已经是 B 的了，再留着 A 的内容就是泄露。
+
+/** 本页面启动时确认的账号（null = 尚未登录 / 已在处理身份变化）。 */
+let bootAccountId: string | null = null;
+
+/** 记住的仓库选择按账号分区：litesync-vault:<账号>。 */
+function vaultKey(): string {
+	return bootAccountId ? `${VAULT_KEY}:${bootAccountId}` : VAULT_KEY;
+}
+
+function rememberedVault(): string {
+	try {
+		return localStorage.getItem(vaultKey()) ?? "";
+	} catch {
+		return ""; // 隐私模式等场景读不了 storage
+	}
+}
+
+function rememberVault(id: string): void {
+	try {
+		localStorage.setItem(vaultKey(), id);
+	} catch {
+		/* ignore */
+	}
+}
+
+function forgetVault(): void {
+	try {
+		localStorage.removeItem(vaultKey());
+	} catch {
+		/* ignore */
+	}
+}
+
+/** 账号变了（另一个标签页登录了别人 / 退出了 / 会话失效）：先把草稿加密落盘，再整页重载清空。 */
+async function identityChanged(): Promise<void> {
+	if (bootAccountId === null) return;
+	bootAccountId = null; // 防重入
+	if (S?.vmk) {
+		await lockNow("账号已在另一个标签页切换或退出");
+		return;
+	}
+	location.reload();
+}
+
+window.addEventListener("storage", (e) => {
+	if (e.key !== ACCOUNT_KEY || bootAccountId === null) return;
+	if ((e.newValue ?? "") !== bootAccountId) void identityChanged();
+});
+document.addEventListener("visibilitychange", () => {
+	if (document.visibilityState !== "visible" || bootAccountId === null) return;
+	void accountApi
+		.me()
+		.then((m) => {
+			if (m.account.id !== bootAccountId) void identityChanged();
+		})
+		.catch((e) => {
+			if (e instanceof AuthError) void identityChanged();
+		});
+});
+
+/**
+ * v0.20：先确认账号身份（统一登录 / API Token 会话），再决定进入哪个页面——
+ * 零仓库账号是正常状态，不能再像以前那样以「当前仓库的 /api/v1/info」作为入口。
+ */
 async function boot(): Promise<void> {
 	applyTheme();
-	const api = new Api();
-	// v0.19：还原本浏览器上次选择的仓库（服务端仍会按成员关系硬校验；
-	// 校验失败（404）会走到登录/错误分支，此时清掉记忆即可）
+	const cfg = await authConfig();
+	let me: Me;
 	try {
-		api.vaultId = localStorage.getItem(VAULT_KEY) ?? "";
-	} catch {
-		/* 隐私模式等场景读不了 storage：用默认仓库 */
+		me = await accountApi.me();
+	} catch (e) {
+		if (e instanceof AuthError) {
+			bootAccountId = null;
+			announceAccount(""); // 未登录：其他标签页若还显示着某个账号的内容，它们会自行清理
+			const err = new URLSearchParams(location.search).get("loginError") ?? undefined;
+			renderLoginPage(portalHost, cfg, err);
+			return;
+		}
+		renderMessage(`无法连接服务器：${e instanceof Error ? e.message : String(e)}`);
+		return;
 	}
+	bootAccountId = me.account.id;
+	announceAccount(me.account.id);
+	try {
+		localStorage.removeItem(VAULT_KEY); // 旧版本留下的不分账号的仓库选择：一次性清理
+	} catch {
+		/* ignore */
+	}
+	const hash = location.hash;
+	window.onhashchange = () => void boot();
+	if (hash.startsWith("#/me")) {
+		await renderAccountCenter(portalHost, me, cfg);
+		return;
+	}
+	if (hash.startsWith("#/vaults") || me.vaultCount === 0 || (!rememberedVault() && (hash === "" || hash === "#/"))) {
+		await renderVaultCenter(portalHost, me);
+		return;
+	}
+	const api = new Api();
+	api.vaultId = rememberedVault();
+	await bootVault(api);
+}
+
+/** 进入一个仓库的笔记工作台（v0.19 起的原有流程）。preset：刚建库时已在内存中的密钥。 */
+async function bootVault(api: Api, preset?: { doc: CoreVaultKeyDoc; vmk: CryptoKey }): Promise<void> {
 	try {
 		const info = await api.info(); // 会话 Cookie 无效 → AuthError → 登录页
 		const vaultDoc = await api.vaultKey();
@@ -203,16 +372,38 @@ async function boot(): Promise<void> {
 				? { vaultId: info.vaultId, keyEpoch: info.keyEpoch! }
 				: undefined;
 		S = { api, files: [], byPath: new Map(), vaultDoc, vmk: null, binding, seenGeneration: new Map(), vaults: [] };
+		S.repo = {
+			repoEpoch: info.repoEpoch ?? "", formatEpoch: info.formatEpoch ?? 1,
+			minimumEnvelopeVersion: info.minimumEnvelopeVersion ?? 0, encryptionState: info.encryptionState ?? "plaintext", metaState: info.metaState,
+		};
+		S.account = await accountApi.me().catch(() => undefined);
 		S.resetAuthConfigured = info.resetAuthConfigured;
 		// 身份（v0.18）：角色决定导航渲染；服务端对 admin API 另有硬关卡
 		S.me = await api.whoami().catch(() => undefined);
 		S.vaults = await api.listVaults();
+		// v0.20：还没完成加密设置的仓库没有可看的内容——回到仓库中心完成设置
+		const cur = S.vaults.find((v) => v.current);
+		if (cur && cur.initState && cur.initState !== "ready") {
+			location.hash = "#/vaults";
+			return;
+		}
 		// §7.5：仓库处于迁移中等非常态时，必须让用户看到——
 		// 此时看到的内容可能是不完整或过渡态的，静默展示等于误导
 		showRepoStateBanner(info.metaState);
 		if (vaultDoc?.enabled) {
 			if (!subtleAvailable()) {
-				renderMessage("此 Vault 已启用端到端加密，浏览器解密需要 HTTPS（或 localhost）访问。");
+				renderMessage("此仓库已启用端到端加密，浏览器解密需要 HTTPS（或 localhost）访问。");
+				return;
+			}
+			if (preset && preset.doc.wrappedKey === vaultDoc.wrappedKey) {
+				// 刚在本页建好的仓库：密钥已在内存里（同一份 keyDoc 才采纳）
+				const raw = await coreExportVmkRaw(preset.vmk);
+				try {
+					await adoptVaultKey(raw);
+				} finally {
+					raw.fill(0);
+				}
+				await enterMain();
 				return;
 			}
 			// VMK 只存在内存：每次进入页面都需要解锁
@@ -222,16 +413,12 @@ async function boot(): Promise<void> {
 		await enterMain();
 	} catch (e) {
 		if (e instanceof AuthError) {
-			renderLogin();
+			await boot(); // 会话失效 → 统一的登录页
 			return;
 		}
 		// v0.19：上次选择的仓库已不存在/无权限（404）→ 清掉记忆回默认仓库重试
 		if (api.vaultId && e instanceof Error && /404/.test(e.message)) {
-			try {
-				localStorage.removeItem(VAULT_KEY);
-			} catch {
-				/* ignore */
-			}
+			forgetVault();
 			api.vaultId = "";
 			await boot();
 			return;
@@ -240,9 +427,9 @@ async function boot(): Promise<void> {
 	}
 }
 
-async function enterMain(): Promise<void> {
+/** 取 snapshot 并在本地解出真实路径（meta 模式：条目是伪名 + 加密元数据）。 */
+async function loadFileList(): Promise<{ sequence: number; files: FileEntry[] }> {
 	const snap = await S!.api.snapshot();
-	// meta 模式（v9.3 三期）：条目是伪名 + 加密元数据 → 本地解出真实路径建树
 	for (const f of snap.files) {
 		if (!f.metaEnc || !f.fileId) continue;
 		f.serverPath = f.path;
@@ -250,10 +437,453 @@ async function enterMain(): Promise<void> {
 		const dec = await decryptMeta(S!.metaKeys, f.metaEnc, S!.binding.vaultId, f.fileId);
 		if (dec) f.path = dec.path;
 	}
-	S!.files = snap.files.filter((f) => isVisible(f.path));
+	return { sequence: snap.sequence, files: snap.files.filter((f) => isVisible(f.path)) };
+}
+
+async function enterMain(): Promise<void> {
+	const list = await loadFileList();
+	S!.files = list.files;
 	S!.byPath = new Map(S!.files.map((f) => [f.path, f]));
+	lastSequence = list.sequence;
 	renderMain();
 	onRoute();
+	window.clearInterval(pollTimer);
+	pollTimer = window.setInterval(() => void pollRemote(), 30_000);
+}
+
+// ---------- 发现其他设备的修改（v0.20） ----------
+//
+// 网页此前只在进入时取一次 snapshot：别的设备新建 / 修改 / 删除的笔记要刷新页面才看得到。
+// 现在每 30 秒（以及标签页回到前台、窗口获得焦点时）问一次 changes 游标——没有新变更时这只是
+// 一个空列表；有变更就重取 snapshot 刷新文件树。正在打开的笔记：没有未保存的修改就直接载入
+// 新版本；有的话不动它，提示「保存时会自动合并」（保存走 CAS → 三方合并 → 合并不了保留双方）。
+let lastSequence = 0;
+let pollTimer = 0;
+let polling = false;
+
+async function pollRemote(): Promise<void> {
+	if (!S || polling || document.visibilityState !== "visible") return;
+	if (S.vaultDoc?.enabled && !S.vmk) return; // 已锁定
+	polling = true;
+	try {
+		const c = await S.api.changes(lastSequence, 1);
+		if (!c.resyncRequired && c.changes.length === 0) return;
+		const list = await loadFileList();
+		lastSequence = list.sequence;
+		S.files = list.files; // 本页新建但还没保存成功的笔记从不进文件列表，这里不会被冲掉
+		S.byPath = new Map(S.files.map((f) => [f.path, f]));
+		renderTree();
+		const ed = S.editor;
+		if (ed) {
+			markActive(ed.file.path);
+			const cur = S.files.find((f) => f.fileId && f.fileId === ed.file.fileId);
+			if (!cur && ed.file.revision > 0) ed.remoteDeleted();
+			else if (cur && cur.revision > ed.file.revision) await ed.remoteChanged();
+		}
+		updateStatus("已载入其他设备的修改");
+	} catch {
+		/* 网络抖动：下一次再问 */
+	} finally {
+		polling = false;
+	}
+}
+document.addEventListener("visibilitychange", () => {
+	if (document.visibilityState === "visible") void pollRemote();
+});
+window.addEventListener("focus", () => void pollRemote());
+
+// ---------- v0.20 网页编辑：密钥、写入绑定、自动锁定 ----------
+
+/**
+ * 解锁后在内存里派生全部密钥（raw 由调用方清零）：
+ *   - vmk：解密 + 加密（不可导出）；metaKeys / coreMeta：路径元数据；resetAuth；
+ *   - drafts：加密草稿（HKDF 派生的独立密钥；命名空间 = 服务器 | 账号 | 仓库）。
+ * 不写任何浏览器存储；锁定 = 整页重载，这些对象随之释放。
+ */
+async function adoptVaultKey(raw: Uint8Array): Promise<void> {
+	S!.vmk = await crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+	S!.writeKey = S!.vmk;
+	S!.metaKeys = await deriveMetaKeys(raw);
+	S!.coreMeta = await coreDeriveMetaKeys(raw);
+	S!.resetAuth = await deriveResetAuth(raw);
+	const draftKey = await deriveDraftKey(raw);
+	let backend;
+	try {
+		backend = indexedDbBackend();
+		await backend.keys("probe"); // 隐私模式等场景打不开 IndexedDB：降级为内存（界面会说明不跨刷新保留）
+		S!.draftsVolatile = false;
+	} catch {
+		backend = memoryBackend();
+		S!.draftsVolatile = true;
+	}
+	const ns = `${location.origin}|${S!.account?.account.id ?? S!.me?.userId ?? "anon"}|${currentVaultId()}`;
+	S!.drafts = new DraftStore(backend, ns, draftKey, `${S!.binding?.vaultId ?? ""}|${S!.binding?.keyEpoch ?? 0}`);
+}
+
+function currentVaultId(): string {
+	return S?.vaults.find((v) => v.current)?.id ?? S?.api.vaultId ?? "";
+}
+
+/** 网页编辑是否可用：服务端开关 + 仓库就绪 + （加密仓库）已解锁。角色由服务端裁决。 */
+function canEdit(): boolean {
+	if (!S || S.account?.features?.webEditing !== true) return false;
+	const enc = S.vaultDoc?.enabled === true;
+	if (enc && !S.writeKey) return false;
+	// 路径加密迁移进行中：只读（服务端对非迁移持有者同样会拒绝写入）
+	if (S.repo?.metaState === "migrating" || S.repo?.metaState === "verifying") return false;
+	return true;
+}
+
+function repoBinding(): RepoBinding {
+	return {
+		vaultId: currentVaultId(),
+		vaultIdentity: S!.binding?.vaultId ?? "",
+		keyEpoch: S!.binding?.keyEpoch ?? 0,
+		repoEpoch: S!.repo?.repoEpoch ?? "",
+		formatEpoch: S!.repo?.formatEpoch ?? 1,
+		minimumEnvelopeVersion: S!.repo?.minimumEnvelopeVersion ?? 0,
+		encrypted: S!.vaultDoc?.enabled === true,
+		metaMode: S!.repo?.metaState === "encrypted",
+	};
+}
+
+function envelopeOf(data: ArrayBuffer): { envelope: TrackedFile["envelope"]; padded: boolean } {
+	const head = new Uint8Array(data, 0, Math.min(5, data.byteLength));
+	const magic = String.fromCharCode(...head.slice(0, 4));
+	if (magic === "LSE4") return { envelope: "LSE4", padded: (head[4] & 1) === 1 };
+	if (magic.startsWith("LSE")) return { envelope: "LSE3", padded: false };
+	return { envelope: "plain", padded: false };
+}
+
+function trackedFor(entry: FileEntry, raw: ArrayBuffer, generation: number | null): TrackedFile {
+	const env = envelopeOf(raw);
+	return {
+		path: entry.path, serverPath: entry.serverPath ?? entry.path, fileId: entry.fileId ?? "",
+		revision: entry.revision,
+		generation: generation ?? (entry.fileId ? S!.seenGeneration.get(entry.fileId) ?? 0 : 0),
+		envelope: env.envelope, padded: env.padded, metaGeneration: entry.metaGeneration ?? 0,
+	};
+}
+
+/** 空闲自动锁定（默认 15 分钟，按实际经过时间判断：后台标签页的计时器暂停也不会漏判）。 */
+const IDLE_KEY = "litesync-idle-minutes";
+let lastActivity = Date.now();
+function idleMinutes(): number {
+	try {
+		const v = Number(localStorage.getItem(IDLE_KEY));
+		return v >= 1 && v <= 240 ? v : 15;
+	} catch {
+		return 15;
+	}
+}
+async function lockNow(reason: string): Promise<void> {
+	if (!S?.vmk) return;
+	const ok = (await S.editor?.lock()) ?? true;
+	S.vmk = null;
+	S.writeKey = undefined;
+	S.drafts = undefined;
+	try {
+		sessionStorage.setItem("litesync-lock-reason", ok ? reason : reason + "（最后一段未保存的输入没能写入本机草稿）");
+	} catch {
+		/* ignore */
+	}
+	location.reload(); // 内存里的密钥、明文、撤销栈、对象 URL 随页面一起释放
+}
+for (const ev of ["keydown", "pointerdown", "wheel"]) {
+	window.addEventListener(ev, () => (lastActivity = Date.now()), { passive: true });
+}
+function checkIdle(): void {
+	if (S?.vmk && S.vaultDoc?.enabled && Date.now() - lastActivity > idleMinutes() * 60_000) void lockNow(`空闲超过 ${idleMinutes()} 分钟，已自动锁定`);
+}
+window.setInterval(checkIdle, 30_000);
+document.addEventListener("visibilitychange", () => {
+	if (document.visibilityState === "visible") checkIdle();
+});
+
+function editorHost(): NoteEditorHost {
+	return {
+		binding: repoBinding,
+		keys: () => (S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null),
+		drafts: () => S?.drafts ?? null,
+		draftsVolatile: () => S?.draftsVolatile === true,
+		renderPreview: (c, t) => renderMarkdownInto(c, S?.editor?.file.path ?? "", t),
+		fetchRemote: async (f) => {
+			const dl = await S!.api.fileWithIdentity(f.serverPath);
+			const plain = await decodeContent(f.path, dl.data, { fileId: dl.fileId, generation: dl.generation });
+			return {
+				text: new TextDecoder("utf-8", { ignoreBOM: true }).decode(plain),
+				revision: dl.revision, generation: dl.generation ?? 0, fileId: dl.fileId ?? f.fileId,
+			};
+		},
+		onSaved: (f, created) => {
+			recordSaved(f, created);
+			// 正在编辑的这篇第一次落到服务器：树里高亮它，去掉「新笔记」提示
+			if (created && S!.editor?.file.fileId === f.fileId) {
+				markActive(f.path);
+				contentEl.querySelector(".new-note-hint")?.remove();
+			}
+		},
+		onAuthExpired: () => {
+			updateStatus("登录已过期：未保存的内容已加密保存在本机，重新登录并解锁后可恢复");
+		},
+		uploadAttachment,
+		showCompare,
+	};
+}
+
+/** 一次成功写入后更新本地索引（文件树、已见世代、底栏）。 */
+function recordSaved(f: TrackedFile, created: boolean, size = 0): void {
+	if (f.fileId) S!.seenGeneration.set(f.fileId, Math.max(S!.seenGeneration.get(f.fileId) ?? 0, f.generation));
+	const cur = S!.byPath.get(f.path);
+	if (cur) {
+		cur.revision = f.revision;
+		cur.fileId = f.fileId;
+		cur.mtime = Date.now();
+	} else if (created) {
+		const entry: FileEntry = { path: f.path, revision: f.revision, hash: "", size, mtime: Date.now(), fileId: f.fileId, serverPath: f.serverPath, metaGeneration: f.metaGeneration };
+		S!.files.push(entry);
+		S!.byPath.set(f.path, entry);
+		renderTree();
+		if (S!.editor) markActive(S!.editor.file.path);
+	}
+	updateStatus();
+}
+
+/**
+ * 附件上传（需求 §7.2「附件上传及引用」）：放在笔记所在文件夹，与笔记同一套加密写入
+ * （新 fileId、LSE3/LSE4、路径加密仓库附 LSM1）；成功后才返回引用文本，
+ * 失败抛错——编辑器里不会出现指向不存在文件的引用。
+ */
+async function uploadAttachment(file: File, notePath: string): Promise<string> {
+	const canonPaths = new Set(S!.files.map((f) => f.path.normalize("NFC").toLowerCase()));
+	const path = attachmentPath(notePath, file.name || "image.png", (c) => canonPaths.has(c));
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	const tracked = newTrackedFile(path, repoBinding());
+	const out = await saveWithRetry(repoBinding(), S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null, tracked, bytes);
+	if (out.kind === "rejected") throw new Error(out.code === "TOO_LARGE" ? "超过服务器允许的单文件大小" : writeError(out.code, out.message));
+	if (out.kind === "conflict") throw new Error("同名文件刚被别的设备创建，请重试");
+	if (out.kind === "auth") throw new Error("登录已过期");
+	if (out.kind === "offline") throw new Error("网络连接失败");
+	recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, true, bytes.length);
+	const name = path.slice(path.lastIndexOf("/") + 1).normalize("NFC").toLowerCase();
+	const unique = S!.files.filter((f) => f.path.slice(f.path.lastIndexOf("/") + 1).normalize("NFC").toLowerCase() === name).length === 1;
+	return attachmentLink(path, unique);
+}
+
+/** 对照两份文本（保留双方之后的处理界面；只读，不改动任何一份）。 */
+function showCompare(title: string, a: { label: string; text: string }, b: { label: string; text: string }): void {
+	const dlg = openDialog(title);
+	dlg.body.append(el("p", "muted small", `「−」只在${a.label}里，「+」只在${b.label}里。确认后在编辑器里合并，再删除不需要的那一份。`));
+	const box = el("pre", "diff-box");
+	const lines = diffLines(a.text, b.text);
+	if (lines === null) box.textContent = "两份差异过大，无法逐行对比。";
+	else
+		for (const line of lines) {
+			const div = el("div", `diff-line diff-${line.type}`);
+			div.textContent = (line.type === "add" ? "+ " : line.type === "del" ? "- " : "  ") + line.text;
+			box.append(div);
+		}
+	dlg.body.append(box);
+}
+
+function mountEditor(container: HTMLElement, tracked: TrackedFile, text: string, created: boolean, mode: "read" | "edit"): NoteEditor {
+	const ed = new NoteEditor(container, editorHost(), tracked, text, created);
+	S!.editor = ed;
+	void ed.setMode(mode);
+	return ed;
+}
+
+/** 已离开、仍在后台上传最后一版的编辑器（按 fileId）。 */
+const backgroundSaves = new Map<string, Promise<void>>();
+
+/** 离开当前笔记：未保存的内容先加密落盘，再在后台上传一次（不阻塞导航）。 */
+async function leaveEditor(): Promise<void> {
+	const ed = S?.editor;
+	if (!ed) return;
+	S!.editor = undefined;
+	const pending = await ed.leave();
+	if (!pending) return;
+	const id = ed.file.fileId;
+	const p = pending.done.finally(() => {
+		if (backgroundSaves.get(id) === p) backgroundSaves.delete(id);
+		if (location.hash === "#/" || location.hash === "") void renderDraftList();
+	});
+	backgroundSaves.set(id, p);
+}
+
+/** 打开一篇笔记前：它若还在后台上传，先等那一轮结束（最多 5 秒），免得读到上传前的版本。 */
+async function settleBackground(fileId: string | undefined): Promise<void> {
+	const p = fileId ? backgroundSaves.get(fileId) : undefined;
+	if (p) await Promise.race([p, new Promise((r) => setTimeout(r, 5000))]);
+}
+
+// 离开页面：还有服务器没确认的内容时让浏览器提示（草稿在输入停顿后已加密落盘）
+window.addEventListener("beforeunload", (e) => {
+	if (S?.editor?.unsynced || backgroundSaves.size > 0) {
+		void S?.editor?.flush();
+		e.preventDefault();
+		e.returnValue = "";
+	}
+});
+document.addEventListener("visibilitychange", () => {
+	if (document.visibilityState === "hidden") void S?.editor?.flush();
+});
+
+/** 首页：本机还有未同步的加密草稿（离线时离开、冲突待处理、新建后未保存成功）。 */
+async function renderDraftList(): Promise<void> {
+	const box = document.getElementById("draft-list");
+	const ds = S?.drafts;
+	if (!box || !ds) return;
+	const keys = await ds.listKeys().catch(() => [] as string[]);
+	const items: { key: string; path: string; savedAt: number; file: TrackedFile }[] = [];
+	for (const k of keys) {
+		if (backgroundSaves.has(k)) continue;
+		const d = await ds.load(k).catch(() => null);
+		if (d) items.push({ key: k, path: d.path, savedAt: d.savedAt, file: d.file });
+	}
+	box.innerHTML = "";
+	if (items.length === 0) return;
+	box.append(el("h2", "section-title", "本机未同步的草稿"));
+	box.append(el("p", "muted small", "这些修改只以加密形式保存在这台设备的浏览器里，还没有到达服务器。打开即可继续同步。"));
+	const list = el("div", "recent-list");
+	for (const it of items.sort((a, b) => b.savedAt - a.savedAt)) {
+		const card = el("button", "recent-card draft-card");
+		card.append(el("div", "recent-title", noteTitle(it.path)), el("div", "muted small", `草稿 ${new Date(it.savedAt).toLocaleString()}`));
+		card.onclick = () => {
+			const existing = S!.files.find((f) => f.fileId === it.key);
+			if (existing) {
+				location.hash = "#/n/" + encodeURIComponent(existing.path);
+				return;
+			}
+			void openDraftAsNew(it.file);
+		};
+		list.append(card);
+	}
+	box.append(list);
+}
+
+/** 从未成功创建的新笔记草稿继续（新 fileId 保持不变，保存时才在服务器上创建）。 */
+async function openDraftAsNew(file: TrackedFile): Promise<void> {
+	await leaveEditor();
+	revokeAllBlobs();
+	markActive(null);
+	contentEl.innerHTML = "";
+	outlineEl.innerHTML = "";
+	const wrap = el("div", "note-wrap");
+	wrap.append(el("div", "note-head"), el("h1", "note-title", noteTitle(file.path)), el("p", "muted small new-note-hint", "新笔记：第一次保存后才会出现在服务器与其他设备上"));
+	const body = el("div", "note-editor");
+	wrap.append(body);
+	contentEl.append(wrap);
+	mountEditor(body, { ...file, revision: 0 }, "", true, "edit");
+}
+
+/** 规范化用户输入的笔记路径（不允许绝对路径、..、隐藏段；补 .md）。 */
+function normalizeNotePath(input: string): string | null {
+	let p = input.trim().replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+/, "");
+	if (!p) return null;
+	if (!/\.[^/.]+$/.test(p)) p += ".md";
+	const segs = p.split("/");
+	if (segs.some((s) => s === "" || s === "." || s === ".." || s.startsWith(".") || s.trim() !== s)) return null;
+	return p;
+}
+
+function writeError(code: string, message: string): string {
+	switch (code) {
+		case "CANONICAL_COLLISION":
+		case "CONFLICT":
+			return "目标位置已有同名文件（大小写或 Unicode 归一后同名也算），请换一个名字。";
+		case "FORBIDDEN":
+			return "你在这个仓库里只有只读权限，或网页编辑未开启。";
+		case "OFFLINE":
+			return "网络连接失败，请稍后重试。";
+		case "QUOTA_EXCEEDED":
+			return "已达到账号的存储配额（历史版本也计入）。删除不需要的文件或清理历史后再试，或联系管理员调整配额。";
+		case "RATE_LIMITED":
+			return "操作太频繁，请稍后再试。";
+		default:
+			return `操作失败（${code}）：${message}`;
+	}
+}
+
+/** 笔记的「更多」菜单：改名/移动、删除（都走同步协议，保留 fileId 与历史）。 */
+function noteMenu(tracked: TrackedFile): HTMLElement {
+	const more = el("details", "note-more");
+	more.append(el("summary", "", "更多"));
+	const menu = el("div", "vault-menu");
+	const rename = el("button", "ghost", "改名 / 移动…");
+	rename.onclick = async () => {
+		more.open = false;
+		const input = prompt("新的路径（可以包含文件夹，例如「工作/周记.md」）", tracked.path);
+		if (input === null) return;
+		const to = normalizeNotePath(input);
+		if (!to) return alert("路径不合法：不能为空、不能以 / 开头、不能包含 .. 或以 . 开头的段。");
+		if (to === tracked.path) return;
+		if (S!.byPath.has(to)) return alert("目标位置已有同名文件。");
+		await S!.editor?.flush();
+		const r = await renameFile(repoBinding(), S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null, S!.editor?.file ?? tracked, to);
+		if (!r.ok) return alert(writeError(r.code, r.message));
+		// 编辑器里的跟踪状态同步更新：之后的内容保存要寻址新位置、以新的对象版本为 CAS 前提
+		if (S!.editor) S!.editor.file = { ...S!.editor.file, path: to, serverPath: r.serverPath, metaGeneration: r.metaGeneration, revision: r.revision };
+		const entry = S!.byPath.get(tracked.path);
+		if (entry) {
+			S!.byPath.delete(tracked.path);
+			entry.path = to;
+			entry.serverPath = r.serverPath;
+			entry.metaGeneration = r.metaGeneration;
+			entry.revision = r.revision;
+			S!.byPath.set(to, entry);
+		}
+		renderTree();
+		markActive(to);
+		const title = contentEl.querySelector(".note-title");
+		if (title) title.textContent = noteTitle(to);
+		const crumb = contentEl.querySelector(".crumb");
+		if (crumb) crumb.textContent = to.replace(/\.md$/i, "").split("/").join(" / ");
+		location.hash = "#/n/" + encodeURIComponent(to);
+	};
+	const del = el("button", "ghost danger-text", "删除…");
+	del.onclick = async () => {
+		more.open = false;
+		if (!confirm(`删除「${noteTitle(tracked.path)}」？\n删除会同步到所有设备；历史版本仍保留，可以在其他设备或通过恢复找回。`)) return;
+		const f = S!.editor?.file ?? tracked;
+		const r = await deleteFile(repoBinding(), f);
+		if (r.kind !== "saved") {
+			return alert(r.kind === "conflict" ? "这篇笔记刚在别处被修改过，请刷新后再删除。" : r.kind === "rejected" ? writeError(r.code, r.message) : "网络连接失败，请稍后重试。");
+		}
+		await S!.drafts?.remove(f.fileId).catch(() => undefined);
+		S!.editor = undefined;
+		S!.files = S!.files.filter((x) => x.path !== tracked.path);
+		S!.byPath.delete(tracked.path);
+		renderTree();
+		location.hash = "#/";
+	};
+	menu.append(rename, del);
+	more.append(menu);
+	return more;
+}
+
+/** 新建笔记：只在编辑器里存在，第一次保存时才在服务器上创建（新 fileId，revision 0）。 */
+async function showNewNote(): Promise<void> {
+	const input = prompt("新笔记的路径（可以包含文件夹）", `未命名 ${new Date().toISOString().slice(0, 10)}.md`);
+	if (input === null) return;
+	const path = normalizeNotePath(input);
+	if (!path) return void alert("路径不合法：不能为空、不能以 / 开头、不能包含 .. 或以 . 开头的段。");
+	if (S!.byPath.has(path)) return void (location.hash = "#/n/" + encodeURIComponent(path));
+	// 撞名按最严解释判断（大小写、Unicode 归一后同名即视为同一文件；服务器同样会拒绝）
+	const canon = (p: string) => p.normalize("NFC").toLowerCase();
+	const clash = S!.files.find((f) => canon(f.path) === canon(path));
+	if (clash) return void alert(`已有同名文件「${clash.path}」（大小写或 Unicode 归一后同名），请换一个名字。`);
+	await leaveEditor();
+	revokeAllBlobs();
+	markActive(null);
+	contentEl.innerHTML = "";
+	outlineEl.innerHTML = "";
+	const wrap = el("div", "note-wrap");
+	wrap.append(el("div", "note-head"), el("h1", "note-title", noteTitle(path)), el("p", "muted small new-note-hint", "新笔记：第一次保存后才会出现在服务器与其他设备上"));
+	const body = el("div", "note-editor");
+	wrap.append(body);
+	contentEl.append(wrap);
+	mountEditor(body, newTrackedFile(path, repoBinding()), "", true, "edit");
 }
 
 /** 内容/历史请求用的服务器路径（meta 模式为伪名）。 */
@@ -277,7 +907,7 @@ function renderMessage(msg: string): void {
 }
 
 function renderLogin(err?: string): void {
-	const sub = el("p", "muted", "Your private vault");
+	const sub = el("p", "muted", "你的私人笔记仓库");
 	const input = el("input") as HTMLInputElement;
 	input.type = "password";
 	input.placeholder = "API Token";
@@ -311,22 +941,38 @@ function renderUnlock(err?: string): void {
 	// 并让「密码其实是另一个仓库的」当场就能切，而不是对着「密码错误」发呆
 	const multi = (S?.vaults.length ?? 0) > 1;
 	const cur = S?.vaults.find((v) => v.current);
+	// UI 规格：一句关键说明 + 密码框 + 明确的错误反馈 + 帮助入口；术语统一用「仓库密码」
 	const sub = el(
 		"p",
 		"muted",
-		multi
-			? `输入仓库「${cur?.name || cur?.id || "默认"}」的 E2EE 密码（在本地解密，密钥不会离开此设备）`
-			: "输入 E2EE 密码解锁（在本地解密，密钥不会离开此设备）",
+		`输入${multi ? `「${cur?.name || cur?.id || "默认"}」的` : ""}仓库密码。它只在这台设备上用来解密，和账号的登录密码不是同一个。`,
 	);
 	const input = el("input") as HTMLInputElement;
 	input.type = "password";
-	input.placeholder = "E2EE Password";
-	const btn = el("button", "primary", "Unlock vault");
+	input.placeholder = "仓库密码";
+	input.setAttribute("aria-label", "仓库密码");
+	input.autocomplete = "current-password";
+	const btn = el("button", "primary", "解锁");
 	const errEl = el("p", "error", err ?? "");
-	const hint = el("p", "muted small", "🔒 Decrypted locally · 会话结束后需重新解锁");
+	errEl.setAttribute("role", "alert");
+	const hint = el("details", "unlock-help");
+	hint.append(
+		el("summary", "muted small", "忘记了仓库密码？"),
+		el("p", "muted small", "服务器从来没有见过仓库密码，所以无法替你找回。如果还有一台已解锁的设备（比如 Obsidian），可以在那台设备上更换仓库密码；否则这个仓库里的内容无法解密。重置账号的登录密码也解不开仓库。"),
+	);
 	const extras: HTMLElement[] = [];
+	// 锁定原因（手动锁定 / 空闲自动锁定）：只显示一次
+	try {
+		const why = sessionStorage.getItem("litesync-lock-reason");
+		if (why) {
+			sessionStorage.removeItem("litesync-lock-reason");
+			extras.push(el("p", "banner info", why + "。未同步的修改已加密保存在本机，解锁后可继续。"));
+		}
+	} catch {
+		/* ignore */
+	}
 	if (multi) {
-		extras.push(el("p", "muted small", "每个仓库的 E2EE 密码相互独立；解锁另一个仓库请先切换："));
+		extras.push(el("p", "muted small", "每个仓库的仓库密码相互独立；要解锁另一个仓库，先在这里切换："));
 		const sel = el("select", "vault-switch") as HTMLSelectElement;
 		for (const v of S!.vaults) {
 			const opt = el("option", "", v.name || v.id) as HTMLOptionElement;
@@ -335,11 +981,7 @@ function renderUnlock(err?: string): void {
 			sel.append(opt);
 		}
 		sel.onchange = () => {
-			try {
-				localStorage.setItem(VAULT_KEY, sel.value);
-			} catch {
-				/* ignore */
-			}
+			rememberVault(sel.value);
 			location.hash = "";
 			location.reload(); // 与主界面切换器同一语义：整页重进，仓库间密钥/状态彻底隔离
 		};
@@ -351,19 +993,14 @@ function renderUnlock(err?: string): void {
 		const raw = await unlockVaultKey(S!.vaultDoc!, input.value);
 		if (!raw) {
 			errEl.textContent = multi
-				? "密码错误。若这是你另一个仓库的密码，请在上方切换到那个仓库再解锁。"
-				: "密码错误";
-			btn.textContent = "Unlock vault";
+				? "仓库密码不对。如果这是你另一个仓库的密码，请先在上方切换到那个仓库。"
+				: "仓库密码不对。注意它不是账号的登录密码。";
+			btn.textContent = "解锁";
 			btn.disabled = false;
 			return;
 		}
 		// VMK 只保留在内存 CryptoKey：不写任何浏览器存储，刷新即需重新解锁
-		S!.vmk = await importVmk(raw);
-		// 元数据密钥（v9.3）：派生后立即清零原始字节
-		S!.metaKeys = await deriveMetaKeys(raw);
-		// 重置凭证（v0.18）：解锁即派生；服务端未登记时自动补登记，
-		// 让「重置 Token 需要 E2EE 密码」这道关卡尽早立起来
-		S!.resetAuth = await deriveResetAuth(raw);
+		await adoptVaultKey(raw);
 		raw.fill(0);
 		if (S!.resetAuthConfigured === false && S!.resetAuth) {
 			void S!.api.putResetAuth(S!.resetAuth).then(() => {
@@ -409,22 +1046,33 @@ function renderMain(): void {
 			if (v.current) opt.selected = true;
 			vaultSel.append(opt);
 		}
-		vaultSel.onchange = () => {
-			try {
-				localStorage.setItem(VAULT_KEY, vaultSel!.value);
-			} catch {
-				/* ignore */
+		vaultSel.onchange = async () => {
+			// 主动切库：草稿落不了盘就暂停切换（需求 §7.3）
+			if (!(await guardVaultLeave())) {
+				vaultSel!.value = currentVaultId();
+				return;
 			}
-			location.hash = "";
+			await leaveEditor();
+			await waitBackgroundSaves();
+			rememberVault(vaultSel!.value);
+			history.replaceState(null, "", "#/");
 			location.reload(); // 仓库间的密钥/状态彻底隔离：整页重进最干净
 		};
 	}
 	const searchWrap = el("div", "search-wrap");
 	searchInput = el("input", "search") as HTMLInputElement;
-	searchInput.placeholder = "🔍 Search vault…";
+	searchInput.placeholder = "🔍 搜索笔记…";
+	searchInput.setAttribute("aria-label", "搜索笔记（回车在正文中搜索）");
 	searchResults = el("div", "search-results");
 	searchResults.hidden = true;
 	searchInput.oninput = () => renderSearch(searchInput.value.trim());
+	searchInput.onkeydown = (e) => {
+		// 回车 = 在正文中搜索（文件名匹配已在下拉里即时显示）
+		if (e.key === "Enter" && searchInput.value.trim() && !e.isComposing) {
+			searchResults.hidden = true;
+			location.hash = `#/search/${encodeURIComponent(searchInput.value.trim())}`;
+		}
+	};
 	searchInput.onblur = () => setTimeout(() => (searchResults.hidden = true), 200);
 	searchInput.onfocus = () => renderSearch(searchInput.value.trim());
 	searchWrap.append(searchInput, searchResults);
@@ -452,10 +1100,15 @@ function renderMain(): void {
 	usersBtn.onclick = () => {
 		location.hash = "#/settings/users";
 	};
-	const accountBtn = el("button", "icon-btn", "👤");
-	accountBtn.title = "账户（重置 API Token）";
+	const vaultsBtn = el("button", "ghost small-btn", "我的仓库");
+	vaultsBtn.title = "返回仓库列表（会锁定当前仓库）";
+	vaultsBtn.onclick = () => {
+		location.hash = "#/vaults";
+	};
+	const accountBtn = el("button", "ghost small-btn", "账号");
+	accountBtn.title = "账号与设备";
 	accountBtn.onclick = () => {
-		location.hash = "#/account";
+		location.hash = "#/me";
 	};
 	const themeBtn = el("button", "icon-btn", "☀");
 	themeBtn.title = "切换主题";
@@ -464,21 +1117,55 @@ function renderMain(): void {
 	lockBtn.title = "锁定（丢弃内存中的密钥）";
 	lockBtn.hidden = !S!.vaultDoc?.enabled;
 	lockBtn.onclick = () => {
-		S!.vmk = null;
-		location.hash = "";
-		location.reload(); // 内存密钥随页面刷新彻底消失
+		// 先把未保存的编辑加密写入本机草稿（有限等待），再丢弃内存里的密钥
+		void lockNow("已锁定");
 	};
 	const outBtn = el("button", "icon-btn", "⏻");
 	outBtn.title = "退出登录";
 	outBtn.onclick = () => {
 		void logout().then(() => {
+			announceAccount(""); // 同一浏览器的其他标签页随之清掉可见内容
 			location.hash = "";
 			location.reload();
 		});
 	};
+	// 次要操作：桌面宽度下与原来一样平铺在顶栏（display: contents）；
+	// 手机宽度下收进「⋯」菜单，顶栏只留 菜单 / 品牌 / 搜索 / 锁定（390px 不出现横向滚动）
+	settingsBtn.dataset.label = "设置";
+	opsBtn.dataset.label = "运维";
+	usersBtn.dataset.label = "用户管理";
+	themeBtn.dataset.label = "切换主题";
+	outBtn.dataset.label = "退出登录";
+	outBtn.classList.add("out-btn");
+	const actions = el("div", "header-actions");
+	actions.id = "header-actions";
+	actions.append(vaultsBtn, usersBtn, opsBtn, settingsBtn, accountBtn, themeBtn, outBtn);
+	const moreBtn = el("button", "icon-btn more-btn", "⋯");
+	moreBtn.title = "更多操作";
+	moreBtn.setAttribute("aria-label", "更多操作");
+	moreBtn.setAttribute("aria-controls", actions.id);
+	moreBtn.setAttribute("aria-expanded", "false");
+	const setMenu = (open: boolean) => {
+		header.classList.toggle("actions-open", open);
+		moreBtn.setAttribute("aria-expanded", String(open));
+	};
+	moreBtn.onclick = (e) => {
+		e.stopPropagation();
+		setMenu(!header.classList.contains("actions-open"));
+	};
+	actions.addEventListener("click", () => setMenu(false));
+	document.addEventListener("click", (e) => {
+		if (!actions.contains(e.target as Node)) setMenu(false);
+	});
+	document.addEventListener("keydown", (e) => {
+		if (e.key === "Escape" && header.classList.contains("actions-open")) {
+			setMenu(false);
+			moreBtn.focus();
+		}
+	});
 	header.append(menuBtn, brand);
 	if (vaultSel) header.append(vaultSel);
-	header.append(searchWrap, spacer, usersBtn, opsBtn, settingsBtn, accountBtn, themeBtn, lockBtn, outBtn);
+	header.append(searchWrap, spacer, actions, lockBtn, moreBtn);
 
 	// 三栏
 	treeEl = el("aside", "tree");
@@ -497,11 +1184,11 @@ function renderMain(): void {
 }
 
 function updateStatus(extra?: string): void {
-	const e2ee = S!.vaultDoc?.enabled ? "E2EE unlocked" : "Plaintext vault";
+	const e2ee = S!.vaultDoc?.enabled ? "已解锁（端到端加密）" : "未加密的旧仓库";
 	const latest = S!.files.reduce((m, f) => Math.max(m, f.mtime), 0);
 	statusEl.textContent =
-		`${e2ee} · ${S!.files.length} files` +
-		(latest ? ` · Updated ${fmtTime(latest)}` : "") +
+		`${e2ee} · ${S!.files.length} 个文件` +
+		(latest ? ` · 更新于 ${fmtTime(latest)}` : "") +
 		(extra ? ` · ${extra}` : "");
 }
 
@@ -532,8 +1219,16 @@ function buildTreeModel(): TreeDir {
 
 function renderTree(): void {
 	treeEl.innerHTML = "";
+	if (canEdit()) {
+		const add = el("button", "ghost tree-new", "＋ 新建笔记");
+		add.onclick = () => void showNewNote();
+		treeEl.append(add);
+	}
 	const root = buildTreeModel();
 	treeEl.append(renderDirChildren(root));
+	const trash = el("a", "tree-trash", "🗑 回收站") as HTMLAnchorElement;
+	trash.href = "#/trash";
+	treeEl.append(trash);
 }
 
 function renderDirChildren(dir: TreeDir): HTMLElement {
@@ -587,14 +1282,145 @@ function renderSearch(query: string): void {
 		searchResults.append(item);
 	}
 	if (hits.length === 0) searchResults.append(el("div", "search-item muted", "没有匹配的文件"));
+	// 正文全文搜索（需求 §7.2）：在本机建索引，不把明文发给服务器
+	const full = el("a", "search-item search-fulltext") as HTMLAnchorElement;
+	full.href = `#/search/${encodeURIComponent(query)}`;
+	full.append(el("div", "", `🔎 在正文中搜索「${query}」`), el("div", "muted small", "在本机解密建索引（回车也可以）"));
+	full.onclick = () => {
+		searchResults.hidden = true;
+	};
+	searchResults.append(full);
 	searchResults.hidden = false;
+}
+
+// ---------- 正文全文搜索（需求 §7.2；验收 KY-03） ----------
+//
+// 只能在已解锁的客户端建索引：逐篇下载密文、在本机解密，正文只存在这个页面的内存里——
+// 锁定、刷新、切换仓库或账号（都会整页重载）即随页面一起释放。大库按需建索引并显示进度；
+// 只重新下载 revision 变了的笔记。搜索本身完全在本地，服务器只看到普通的文件下载。
+const textIndex = new Map<string, { revision: number; text: string }>();
+/** 当前这一轮搜索的编号：离开搜索页（或开始新的搜索）即作废正在进行的建索引。 */
+let searchRun = 0;
+
+async function showSearchPage(q: string): Promise<void> {
+	const run = ++searchRun;
+	revokeAllBlobs();
+	markActive(null);
+	outlineEl.innerHTML = "";
+	contentEl.innerHTML = "";
+	const wrap = el("div", "note-wrap");
+	contentEl.append(wrap);
+	wrap.append(el("h1", "", `搜索「${q}」`));
+	wrap.append(el("p", "muted small", "正文索引只在这个浏览器的内存里建立，锁定、刷新或离开仓库即清除；搜索时不会把任何明文发给服务器。"));
+	const progress = el("p", "muted small search-progress");
+	progress.setAttribute("role", "status");
+	const list = el("div", "search-page-list");
+	wrap.append(progress, list);
+	const notes = S!.files.filter((f) => f.path.toLowerCase().endsWith(".md"));
+	const todo = notes.filter((f) => textIndex.get(f.path)?.revision !== f.revision);
+	let done = notes.length - todo.length;
+	const needle = q.toLowerCase();
+
+	const renderHits = () => {
+		list.innerHTML = "";
+		let n = 0;
+		for (const f of notes) {
+			const text = textIndex.get(f.path)?.text;
+			const pos = text ? text.toLowerCase().indexOf(needle) : -1;
+			if (pos < 0 && !f.path.toLowerCase().includes(needle)) continue;
+			const a = el("a", "search-hit") as HTMLAnchorElement;
+			a.href = `#/n/${encodeURIComponent(f.path)}`;
+			a.append(el("div", "recent-title", noteTitle(f.path)), el("div", "muted small", f.path));
+			if (text && pos >= 0) {
+				// 片段用文本节点拼出来：正文是不可信内容，绝不走 innerHTML
+				const start = Math.max(0, pos - 40);
+				const end = Math.min(text.length, pos + needle.length + 60);
+				const snip = el("div", "search-snippet");
+				snip.append(document.createTextNode((start > 0 ? "…" : "") + text.slice(start, pos)));
+				snip.append(el("mark", "", text.slice(pos, pos + needle.length)));
+				snip.append(document.createTextNode(text.slice(pos + needle.length, end) + (end < text.length ? "…" : "")));
+				a.append(snip);
+			}
+			list.append(a);
+			if (++n >= 100) break;
+		}
+		if (n === 0) list.append(el("p", "muted", done < notes.length ? "还在建立索引…" : "没有找到。"));
+	};
+	const update = () => {
+		progress.textContent = done < notes.length ? `正在本机建立正文索引 ${done}/${notes.length}…` : `已在本机索引 ${notes.length} 篇笔记`;
+	};
+	update();
+	renderHits();
+	let next = 0;
+	const worker = async () => {
+		while (run === searchRun && next < todo.length) {
+			const f = todo[next++];
+			try {
+				const dl = await S!.api.fileWithIdentity(serverPathFor(f.path));
+				const data = await decodeContent(f.path, dl.data, { fileId: dl.fileId, generation: dl.generation });
+				textIndex.set(f.path, { revision: dl.revision || f.revision, text: new TextDecoder().decode(data) });
+			} catch {
+				/* 单篇失败（被删、解不开）：跳过，不中断整体 */
+			}
+			done++;
+			if (run === searchRun && (done % 10 === 0 || done === notes.length)) {
+				update();
+				renderHits();
+			}
+		}
+	};
+	await Promise.all([worker(), worker(), worker(), worker()]);
+	if (run !== searchRun) return;
+	update();
+	renderHits();
 }
 
 // ---------- 路由 ----------
 function onRoute(): void {
+	void routeTo();
+}
+
+/** 最近一次成功进入的地址（离开被拦下时回到这里）。 */
+let lastRoutedHash = "";
+
+/**
+ * 主动切换仓库 / 离开工作台前（需求 §7.3）：未同步的修改必须先加密落盘；
+ * 落不了盘（浏览器存储不可用等）就暂停切换，让用户选择先导出。
+ */
+async function guardVaultLeave(): Promise<boolean> {
+	const ed = S?.editor;
+	if (!ed || !ed.dirty) return true;
+	if (await ed.flush()) return true;
+	if (!confirm("这篇笔记有未同步的修改，而且没能加密保存到本机（浏览器存储不可用）。\n\n确定：先把它导出为文件，再继续\n取消：留在当前页面")) return false;
+	ed.exportText();
+	return true;
+}
+
+/** 整页重载前给后台上传一点时间（最多 ms 毫秒；没完成的仍在加密草稿里）。 */
+async function waitBackgroundSaves(ms = 5000): Promise<void> {
+	if (backgroundSaves.size === 0) return;
+	await Promise.race([Promise.allSettled([...backgroundSaves.values()]), new Promise((r) => setTimeout(r, ms))]);
+}
+
+async function routeTo(): Promise<void> {
 	document.body.classList.remove("sidebar-open");
 	const hash = location.hash;
-	if (hash.startsWith("#/n/")) {
+	const target = hash.startsWith("#/n/") ? decodeURIComponent(hash.slice(4)) : null;
+	// 指向正在编辑的同一篇笔记（点了树里的自己、改名后的 hash 更新）：不打断编辑
+	if (target && S?.editor?.file.path === target && contentEl.querySelector(".edit-bar")) return;
+	const leavingWorkspace = hash.startsWith("#/vaults") || hash.startsWith("#/me");
+	if (leavingWorkspace && !(await guardVaultLeave())) {
+		history.replaceState(null, "", lastRoutedHash || "#/");
+		return;
+	}
+	lastRoutedHash = hash;
+	await leaveEditor();
+	searchRun++; // 离开搜索页：正在进行的建索引就此停下
+	if (hash === "#/trash") {
+		void showTrash();
+	} else if (hash.startsWith("#/search/")) {
+		void showSearchPage(decodeURIComponent(hash.slice("#/search/".length)));
+	} else if (hash.startsWith("#/n/")) {
 		const path = decodeURIComponent(hash.slice(4));
 		void showNote(path);
 	} else if (hash === "#/settings/backup") {
@@ -603,6 +1429,10 @@ function onRoute(): void {
 		void showOpsSettings();
 	} else if (hash === "#/settings/users") {
 		void showUsersAdmin();
+	} else if (leavingWorkspace) {
+		// 离开笔记工作台去账号级页面：整页重载，内存里的密钥与明文随之释放（严格会话解锁）
+		await waitBackgroundSaves();
+		location.reload();
 	} else if (hash === "#/account") {
 		showAccount();
 	} else {
@@ -620,7 +1450,7 @@ function showHome(): void {
 	const hour = new Date().getHours();
 	const greeting = hour < 6 ? "夜深了" : hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好";
 	wrap.append(el("h1", "", greeting));
-	wrap.append(el("p", "muted", "Recent notes"));
+	wrap.append(el("p", "muted", "最近的笔记"));
 	const recent = [...S!.files]
 		.filter((f) => f.path.toLowerCase().endsWith(".md"))
 		.sort((a, b) => b.mtime - a.mtime)
@@ -633,17 +1463,24 @@ function showHome(): void {
 		card.append(
 			el("div", "recent-title", noteTitle(f.path)),
 			el("div", "muted small", dir),
-			el("div", "muted small", `Updated ${fmtTime(f.mtime)}`),
+			el("div", "muted small", `更新于 ${fmtTime(f.mtime)}`),
 		);
 		list.append(card);
 	}
 	wrap.append(list);
+	if (canEdit()) {
+		const drafts = el("div", "draft-list");
+		drafts.id = "draft-list";
+		wrap.append(drafts);
+	}
 	contentEl.append(wrap);
+	void renderDraftList();
 	updateStatus();
 }
 
 // ---------- 笔记视图 ----------
 async function showNote(path: string): Promise<void> {
+	await settleBackground(S!.byPath.get(path)?.fileId);
 	revokeAllBlobs();
 	markActive(path);
 	contentEl.innerHTML = "";
@@ -666,12 +1503,12 @@ async function showNote(path: string): Promise<void> {
 	});
 	const headRow = el("div", "note-head");
 	headRow.append(crumb);
-	const histBtn = el("button", "ghost", "🕘 History");
+	const histBtn = el("button", "ghost", "🕘 历史版本");
 	histBtn.onclick = () => void openHistory(path);
 	headRow.append(histBtn);
 	wrap.append(headRow);
 	wrap.append(el("h1", "note-title", noteTitle(path)));
-	wrap.append(el("p", "muted small", `Last modified ${fmtTime(entry.mtime)} · rev ${entry.revision}`));
+	wrap.append(el("p", "muted small", `最后修改 ${fmtTime(entry.mtime)} · 版本 ${entry.revision}`));
 
 	const body = el("div", "markdown-body");
 	wrap.append(body);
@@ -681,7 +1518,16 @@ async function showNote(path: string): Promise<void> {
 		const dl = await S!.api.fileWithIdentity(serverPathFor(path));
 		const data = await decodeContent(path, dl.data, { fileId: dl.fileId, generation: dl.generation });
 		if (path.toLowerCase().endsWith(".md")) {
-			renderMarkdownInto(body, path, new TextDecoder().decode(data));
+			if (canEdit()) {
+				// ignoreBOM：保留原文的 BOM，只打开不修改时绝不改写任何字节
+				const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(data);
+				const tracked = trackedFor({ ...entry, revision: dl.revision || entry.revision, fileId: dl.fileId ?? entry.fileId }, dl.data, dl.generation);
+				body.className = "note-editor";
+				mountEditor(body, tracked, text, false, "read");
+				headRow.append(noteMenu(tracked));
+			} else {
+				renderMarkdownInto(body, path, new TextDecoder().decode(data));
+			}
 			const items = buildOutline(body);
 			renderOutline(items);
 		} else if (IMAGE_EXT.test(path)) {
@@ -734,6 +1580,12 @@ function renderMarkdownInto(container: HTMLElement, path: string, src: string): 
 		if (!target) return;
 		const finalTarget = target;
 		img.removeAttribute("src");
+		const cacheKey = `${finalTarget}@${S!.byPath.get(finalTarget)?.revision ?? 0}`;
+		const cached = attachmentUrlCache.get(cacheKey);
+		if (cached) {
+			img.src = cached;
+			return;
+		}
 		void (async () => {
 			try {
 				const dlLink = await S!.api.fileWithIdentity(serverPathFor(finalTarget));
@@ -741,7 +1593,9 @@ function renderMarkdownInto(container: HTMLElement, path: string, src: string): 
 					fileId: dlLink.fileId,
 					generation: dlLink.generation,
 				});
-				img.src = trackBlob(new Blob([data]));
+				const url = trackBlob(new Blob([data]));
+				attachmentUrlCache.set(cacheKey, url);
+				img.src = url;
 			} catch {
 				img.alt = `⚠ 无法加载 ${finalTarget}`;
 			}
@@ -752,7 +1606,7 @@ function renderMarkdownInto(container: HTMLElement, path: string, src: string): 
 function renderOutline(items: { level: number; text: string; id: string }[]): void {
 	outlineEl.innerHTML = "";
 	if (items.length === 0) return;
-	outlineEl.append(el("div", "outline-title", "On this page"));
+	outlineEl.append(el("div", "outline-title", "本页目录"));
 	for (const item of items) {
 		// 不用 href="javascript:"（严格 CSP 下被禁止），纯 onclick
 		const a = el("a", `outline-item lv${item.level}`, item.text);
@@ -766,7 +1620,7 @@ async function openHistory(path: string): Promise<void> {
 	closeDrawer();
 	const drawer = el("div", "drawer");
 	drawer.id = "drawer";
-	drawer.append(el("div", "drawer-title", "Version history"));
+	drawer.append(el("div", "drawer-title", "历史版本"));
 	const list = el("div", "drawer-list");
 	drawer.append(list);
 	const closeBtn = el("button", "ghost", "关闭");
@@ -784,8 +1638,9 @@ async function openHistory(path: string): Promise<void> {
 		for (const v of versions) {
 			const row = el("a", "drawer-item");
 			const label =
-				v.revision === cur?.revision ? `● Current (rev ${v.revision})` : `● Revision ${v.revision}`;
-			row.append(el("div", "", `${label} · ${v.action}`));
+				v.revision === cur?.revision ? `● 当前版本（${v.revision}）` : `● 版本 ${v.revision}`;
+			const actionText: Record<string, string> = { upload: "修改", upsert: "修改", create: "新建", delete: "删除", restore: "恢复", rename: "改名", move: "移动" };
+			row.append(el("div", "", `${label} · ${actionText[v.action] ?? v.action}`));
 			row.append(el("div", "muted small", fmtTime(v.createdAt * 1000)));
 			if (v.action !== "delete") {
 				row.onclick = () => void showRevision(path, v);
@@ -805,6 +1660,7 @@ function closeDrawer(): void {
 
 async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	closeDrawer();
+	await leaveEditor(); // 未保存的编辑先加密落盘并后台上传，再离开编辑器
 	revokeAllBlobs();
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
@@ -812,11 +1668,13 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	contentEl.append(wrap);
 
 	const banner = el("div", "banner");
-	banner.append(el("span", "", `Viewing revision ${v.revision} · ${fmtTime(v.createdAt * 1000)}`));
-	const cmpBtn = el("button", "ghost", "Compare with current");
+	banner.append(el("span", "", `正在查看版本 ${v.revision} · ${fmtTime(v.createdAt * 1000)}`));
+	const cmpBtn = el("button", "ghost", "与当前版本对比");
+	const restoreBtn = el("button", "ghost", "恢复到此版本") as HTMLButtonElement;
+	restoreBtn.hidden = true;
 	const backBtn = el("button", "ghost", "返回当前版本");
 	backBtn.onclick = () => void showNote(path);
-	banner.append(cmpBtn, backBtn);
+	banner.append(cmpBtn, restoreBtn, backBtn);
 	wrap.append(banner);
 	wrap.append(el("h1", "note-title", noteTitle(path)));
 	const body = el("div", "markdown-body");
@@ -827,6 +1685,10 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 		// §7.5：历史版本用**版本级** fileId（删除重建过的旧版本属于旧对象）
 		const dlVer = await S!.api.versionWithIdentity(serverPathFor(path), v.revision);
 		const data = await decodeContent(path, dlVer.data, { fileId: dlVer.fileId, historical: true });
+		if (canEdit() && v.revision !== S!.byPath.get(path)?.revision) {
+			restoreBtn.hidden = false;
+			restoreBtn.onclick = () => void restoreVersion(path, v, data, restoreBtn);
+		}
 		if (!path.toLowerCase().endsWith(".md")) {
 			body.innerHTML = "";
 			const a = el("a", "primary-link", "下载此版本") as HTMLAnchorElement;
@@ -843,6 +1705,124 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	}
 }
 
+/**
+ * 恢复到历史版本 = 以该版本的内容写一个**新**版本（需求 §7.3：revision 只前进、fileId 不变，
+ * 当前内容仍留在历史里）。以当前 HEAD 为 CAS 前提、已见世代为下限；期间被别处改动则如实失败。
+ */
+async function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer, btn: HTMLButtonElement): Promise<void> {
+	if (!confirm(`把「${noteTitle(path)}」恢复到 rev ${v.revision} 的内容？\n这会生成一个新版本，当前内容仍保留在历史里。`)) return;
+	btn.disabled = true;
+	try {
+		const entry = S!.byPath.get(path);
+		if (!entry) throw new Error("文件已不存在");
+		await settleBackground(entry.fileId);
+		const dl = await S!.api.fileWithIdentity(serverPathFor(path));
+		await decodeContent(path, dl.data, { fileId: dl.fileId, generation: dl.generation }); // 先按常规校验当前 HEAD（身份 / 世代）
+		const tracked = trackedFor({ ...entry, revision: dl.revision || entry.revision, fileId: dl.fileId ?? entry.fileId }, dl.data, dl.generation);
+		const out = await saveWithRetry(repoBinding(), S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null, tracked, new Uint8Array(plain));
+		if (out.kind !== "saved") {
+			throw new Error(
+				out.kind === "conflict" ? "这篇笔记刚在别处被修改，请重新打开历史再恢复"
+				: out.kind === "rejected" ? writeError(out.code, out.message)
+				: out.kind === "auth" ? "登录已过期" : "网络连接失败",
+			);
+		}
+		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, false);
+		void showNote(path);
+	} catch (e) {
+		alert(`恢复失败：${e instanceof Error ? e.message : String(e)}`);
+		btn.disabled = false;
+	}
+}
+
+// ---------- 回收站（需求 §7.2「删除回收」） ----------
+async function showTrash(): Promise<void> {
+	revokeAllBlobs();
+	markActive(null);
+	outlineEl.innerHTML = "";
+	contentEl.innerHTML = "";
+	const wrap = el("div", "note-wrap");
+	contentEl.append(wrap);
+	wrap.append(el("h1", "", "回收站"));
+	wrap.append(el("p", "muted", "删除的文件在这里保留一段时间。恢复会沿用原来的文件身份和全部历史，并生成一个新版本，所有设备都会收到。"));
+	const list = el("div", "trash-list");
+	wrap.append(list);
+	list.textContent = "加载中…";
+	let items: TrashItem[];
+	try {
+		items = await S!.api.trash();
+	} catch (e) {
+		list.textContent = `加载失败：${e instanceof Error ? e.message : String(e)}`;
+		return;
+	}
+	list.innerHTML = "";
+	const meta = repoBinding().metaMode;
+	if (meta) {
+		wrap.insertBefore(el("p", "banner warn", "这个仓库启用了路径加密：服务器只保留已删除文件的身份，不知道它原来的路径，因此不能在网页恢复。请在 Obsidian 中处理。"), list);
+	}
+	if (items.length === 0) {
+		list.append(el("p", "muted", "回收站是空的。"));
+		return;
+	}
+	const canon = (p: string) => p.normalize("NFC").toLowerCase();
+	for (const it of items) {
+		const row = el("div", "trash-row");
+		const info = el("div", "trash-info");
+		info.append(
+			el("div", "recent-title", meta ? `已删除的文件（${it.fileId.slice(0, 8)}…）` : noteTitle(it.path)),
+			el("div", "muted small", `${meta ? "" : it.path + " · "}删除于 ${fmtTime(it.deletedAt * 1000)}`),
+		);
+		row.append(info);
+		if (!meta && canEdit()) {
+			const btn = el("button", "ghost small-btn", "恢复") as HTMLButtonElement;
+			const clash = S!.files.find((f) => canon(f.path) === canon(it.path));
+			if (!it.restorable) {
+				btn.disabled = true;
+				btn.title = "删除前的内容已被历史清理，无法恢复";
+			} else if (clash) {
+				btn.disabled = true;
+				btn.title = `原位置已有文件「${clash.path}」，请先把它改名或删除`;
+			}
+			btn.onclick = () => void restoreFromTrash(it, btn);
+			row.append(btn);
+		}
+		list.append(row);
+	}
+}
+
+/**
+ * 从回收站恢复（与插件 push.restoreObject 同协议）：
+ *   1. POST restore（revision 连续、fileId 不变、contentGeneration = 删除时 + 1）；
+ *   2. 服务器此时的 HEAD 是删除前的内容（旧世代密文）：取回、解密、以 +1 世代重新加密上传。
+ * 第 2 步失败时内容已经是删除前的版本、可以正常打开；在网页里修改保存一次即可补齐世代。
+ */
+async function restoreFromTrash(it: TrashItem, btn: HTMLButtonElement): Promise<void> {
+	btn.disabled = true;
+	btn.textContent = "恢复中…";
+	try {
+		const b = repoBinding();
+		const keys = S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null;
+		const nextGen = it.contentGeneration + 1;
+		const r = await restoreTombstone(b, it.fileId, { expectedTombstoneRevision: it.deletionRevision, contentGeneration: nextGen, pseudonym: it.path });
+		if (!r.ok) throw new Error(r.code === "CONFLICT" || r.code === "STALE_REVISION" ? "这个文件刚被别的设备恢复或改动过，请刷新回收站" : writeError(r.code, r.message));
+		const restored: TrackedFile = { path: it.path, serverPath: r.path, fileId: it.fileId, revision: r.revision, generation: nextGen, envelope: "LSE3", padded: false, metaGeneration: r.metaGeneration };
+		recordSaved(restored, true); // 已经是 live：先进文件树，第 2 步失败也找得到它
+		const dl = await S!.api.fileWithIdentity(r.path);
+		const plain = await decodeContent(it.path, dl.data, { fileId: dl.fileId, historical: true });
+		const env = envelopeOf(dl.data);
+		const tracked = { ...restored, envelope: env.envelope, padded: env.padded };
+		const out = await saveWithRetry(b, keys, tracked, new Uint8Array(plain));
+		if (out.kind !== "saved") {
+			throw new Error(`已恢复为删除前的内容，但重新加密上传没有完成（${out.kind === "rejected" ? out.code : out.kind}）；打开这篇笔记修改并保存一次即可补齐`);
+		}
+		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, false);
+		location.hash = "#/n/" + encodeURIComponent(it.path);
+	} catch (e) {
+		alert(`恢复：${e instanceof Error ? e.message : String(e)}`);
+		void showTrash();
+	}
+}
+
 async function showDiff(path: string, v: VersionEntry, oldText: string): Promise<void> {
 	revokeAllBlobs();
 	contentEl.innerHTML = "";
@@ -850,7 +1830,7 @@ async function showDiff(path: string, v: VersionEntry, oldText: string): Promise
 	const wrap = el("div", "note-wrap");
 	contentEl.append(wrap);
 	const banner = el("div", "banner");
-	banner.append(el("span", "", `Revision ${v.revision} → Current`));
+	banner.append(el("span", "", `版本 ${v.revision} → 当前版本`));
 	const backBtn = el("button", "ghost", "返回当前版本");
 	backBtn.onclick = () => void showNote(path);
 	banner.append(backBtn);
@@ -906,7 +1886,7 @@ async function showBackupSettings(): Promise<void> {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
-	head.append(el("h1", "note-title", "Backup"));
+	head.append(el("h1", "note-title", "备份"));
 	const backBtn = el("button", "ghost", "← 返回");
 	backBtn.onclick = () => {
 		location.hash = "#/";
@@ -956,7 +1936,7 @@ async function renderBackupInto(box: HTMLElement): Promise<void> {
 function renderAdminUnlock(box: HTMLElement): void {
 	box.innerHTML = "";
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Admin unlock"));
+	card.append(el("h2", "", "管理员验证"));
 	card.append(el("p", "muted small", "备份管理需要管理员权限：请输入 API Token 换取短期 admin 会话（30 分钟）。"));
 	const input = el("input") as HTMLInputElement;
 	input.type = "password";
@@ -985,7 +1965,7 @@ function renderAdminUnlock(box: HTMLElement): void {
 
 function renderBackupStatusCard(box: HTMLElement, st: BackupStatus): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Status"));
+	card.append(el("h2", "", "状态"));
 
 	if (!st.keyAvailable) {
 		card.append(el("p", "error", `备份不可用：${st.keyError ?? "backup-config.key 缺失"}`));
@@ -1008,14 +1988,14 @@ function renderBackupStatusCard(box: HTMLElement, st: BackupStatus): void {
 			: st.configured
 				? "● 已配置 · 自动备份关闭"
 				: "○ 未配置";
-	item("Backup", state, st.enabled && !st.running ? "ok" : "");
+	item("备份", state, st.enabled && !st.running ? "ok" : "");
 	if (st.resticVersion) item("Restic", st.resticVersion);
-	item("Last backup", st.lastCompletedAt ? fmtTime(st.lastCompletedAt * 1000) : "从未");
-	if (st.lastDurationMs) item("Duration", `${(st.lastDurationMs / 1000).toFixed(1)} s`);
-	if (st.lastSnapshotId) item("Snapshot", st.lastSnapshotId.slice(0, 8));
-	item("Next backup", st.enabled && st.nextRunAt ? fmtTime(st.nextRunAt * 1000) : "—");
-	if (st.snapshotCount) item("Snapshots", String(st.snapshotCount));
-	if (st.repositorySize) item("Repository size", `${fmtBytes(st.repositorySize)}（估算）`);
+	item("上次备份", st.lastCompletedAt ? fmtTime(st.lastCompletedAt * 1000) : "从未");
+	if (st.lastDurationMs) item("耗时", `${(st.lastDurationMs / 1000).toFixed(1)} s`);
+	if (st.lastSnapshotId) item("快照", st.lastSnapshotId.slice(0, 8));
+	item("下次备份", st.enabled && st.nextRunAt ? fmtTime(st.nextRunAt * 1000) : "—");
+	if (st.snapshotCount) item("快照数", String(st.snapshotCount));
+	if (st.repositorySize) item("仓库占用", `${fmtBytes(st.repositorySize)}（估算）`);
 	card.append(grid);
 
 	if (st.lastError) {
@@ -1031,10 +2011,10 @@ function renderBackupStatusCard(box: HTMLElement, st: BackupStatus): void {
 		barWrap.append(bar);
 		card.append(
 			barWrap,
-			el("p", "muted small", `Usage ${pct}% · Budget ${fmtBytes(st.budgetBytes)}`),
+			el("p", "muted small", `已用 ${pct}% · 预算 ${fmtBytes(st.budgetBytes)}`),
 		);
 		if (st.repositorySize > st.budgetBytes * 0.8) {
-			card.append(el("p", "warn", "⚠ Backup repository is approaching the configured budget."));
+			card.append(el("p", "warn", "⚠ 备份仓库的占用已接近设定的预算。"));
 		}
 	}
 	box.append(card);
@@ -1082,7 +2062,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 	const pwEl = el("input", "settings-input") as HTMLInputElement;
 	pwEl.type = "password";
 	pwEl.placeholder = cfg.resticPasswordConfigured ? "已配置（留空保持不变）" : "";
-	const genBtn = el("button", "ghost", "Generate");
+	const genBtn = el("button", "ghost", "生成");
 	pwRow.append(pwEl, genBtn);
 	card.append(pwRow);
 	const pwWarn = el("div", "settings-pw-warn");
@@ -1170,7 +2150,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 	};
 
 	const actions = el("div", "settings-actions");
-	const testBtn = el("button", "ghost", "Test connection");
+	const testBtn = el("button", "ghost", "测试连接");
 	testBtn.onclick = async () => {
 		testBtn.disabled = true;
 		try {
@@ -1185,7 +2165,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 			testBtn.disabled = false;
 		}
 	};
-	const saveBtn = el("button", "primary", "Save");
+	const saveBtn = el("button", "primary", "保存");
 	saveBtn.onclick = async () => {
 		saveBtn.disabled = true;
 		try {
@@ -1194,7 +2174,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 			saveBtn.disabled = false;
 		}
 	};
-	const initBtn = el("button", "ghost", "Initialize");
+	const initBtn = el("button", "ghost", "初始化");
 	initBtn.onclick = async () => {
 		initBtn.disabled = true;
 		try {
@@ -1206,7 +2186,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 			initBtn.disabled = false;
 		}
 	};
-	const runBtn = el("button", "primary", "Backup now");
+	const runBtn = el("button", "primary", "立即备份");
 	runBtn.onclick = async () => {
 		runBtn.disabled = true;
 		try {
@@ -1218,7 +2198,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 			runBtn.disabled = false;
 		}
 	};
-	const checkBtn = el("button", "ghost", "Check repository");
+	const checkBtn = el("button", "ghost", "检查仓库");
 	checkBtn.onclick = async () => {
 		checkBtn.disabled = true;
 		try {
@@ -1241,7 +2221,7 @@ function renderBackupConfigForm(box: HTMLElement, cfg: BackupConfigView, st: Bac
 function renderSnapshotsSection(box: HTMLElement, st: BackupStatus): void {
 	if (!st.configured) return;
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Snapshots"));
+	card.append(el("h2", "", "快照"));
 	const list = el("div");
 	const loadBtn = el("button", "ghost", "加载快照列表");
 	loadBtn.onclick = async () => {
@@ -1332,7 +2312,7 @@ async function showOpsSettings(): Promise<void> {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
-	head.append(el("h1", "note-title", "Operations"));
+	head.append(el("h1", "note-title", "运维"));
 	const backBtn = el("button", "ghost", "← 返回");
 	backBtn.onclick = () => {
 		location.hash = "#/";
@@ -1381,7 +2361,7 @@ async function renderOpsInto(box: HTMLElement): Promise<void> {
 function renderOpsUnlock(box: HTMLElement): void {
 	box.innerHTML = "";
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Admin unlock"));
+	card.append(el("h2", "", "管理员验证"));
 	card.append(el("p", "muted small", "运维操作需要管理员权限：请输入 API Token 换取短期 admin 会话（30 分钟）。"));
 	const input = el("input") as HTMLInputElement;
 	input.type = "password";
@@ -1411,7 +2391,7 @@ function renderOpsUnlock(box: HTMLElement): void {
 // 完整性告警放在最上面：它是唯一一类「已经有内容读不出来了」的信号。
 function renderIntegrityCard(box: HTMLElement, events: IntegrityEvent[]): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Integrity"));
+	card.append(el("h2", "", "完整性"));
 	if (events.length === 0) {
 		card.append(el("p", "muted small", "没有完整性事件。"));
 		box.append(card);
@@ -1449,17 +2429,17 @@ function renderIntegrityCard(box: HTMLElement, events: IntegrityEvent[]): void {
 
 function renderMigrationCard(box: HTMLElement, st: AdminMigrationStatus): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Migration"));
+	card.append(el("h2", "", "迁移"));
 	const grid = el("div", "settings-grid");
 	const item = (label: string, value: string, cls = ""): void => {
 		grid.append(el("div", "muted small", label), el("div", cls, value));
 	};
 	const meta = (st.meta ?? {}) as Record<string, unknown>;
-	item("Metadata state", String(meta.metaState ?? meta.state ?? "—"));
-	if (meta.ownerDeviceId) item("Lease holder", String(meta.ownerDeviceId));
-	if (meta.leaseExpiresAt) item("Lease expires", fmtTs(Number(meta.leaseExpiresAt)));
-	if (meta.cutoffSequence) item("Cutoff sequence", String(meta.cutoffSequence));
-	item("blobID domain", st.needsBlobIdMigration ? "待迁移" : "已完成", st.needsBlobIdMigration ? "error" : "");
+	item("元数据状态", String(meta.metaState ?? meta.state ?? "—"));
+	if (meta.ownerDeviceId) item("租约持有者", String(meta.ownerDeviceId));
+	if (meta.leaseExpiresAt) item("租约到期", fmtTs(Number(meta.leaseExpiresAt)));
+	if (meta.cutoffSequence) item("截止序号", String(meta.cutoffSequence));
+	item("blobID 域化", st.needsBlobIdMigration ? "待迁移" : "已完成", st.needsBlobIdMigration ? "error" : "");
 	item(
 		"Vault key rewrap",
 		st.pendingRewrapEpoch > 0 ? `待重新封装（epoch ${st.pendingRewrapEpoch}）` : "无待办",
@@ -1491,7 +2471,7 @@ function renderMigrationCard(box: HTMLElement, st: AdminMigrationStatus): void {
 
 function renderDeviceCard(box: HTMLElement, devices: AdminDevice[]): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Devices"));
+	card.append(el("h2", "", "设备"));
 	card.append(
 		el(
 			"p",
@@ -1546,7 +2526,7 @@ function renderDeviceCard(box: HTMLElement, devices: AdminDevice[]): void {
 
 function renderShareCard(box: HTMLElement, shares: AdminShare[]): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Shares"));
+	card.append(el("h2", "", "分享"));
 	card.append(
 		el(
 			"p",
@@ -1635,7 +2615,7 @@ function renderShareCard(box: HTMLElement, shares: AdminShare[]): void {
 // 真正的切换必须停机后由 CLI 执行，原因见服务端 adminRestorePlan 的注释。
 async function renderRestoreCard(box: HTMLElement): Promise<void> {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Disaster recovery"));
+	card.append(el("h2", "", "灾难恢复"));
 	box.append(card);
 
 	let snapshots: BackupSnapshot[] = [];
@@ -1695,7 +2675,7 @@ function showAccount(): void {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
-	head.append(el("h1", "note-title", "Account"));
+	head.append(el("h1", "note-title", "账户"));
 	const backBtn = el("button", "ghost", "← 返回");
 	backBtn.onclick = () => {
 		location.hash = "#/";
@@ -1706,14 +2686,14 @@ function showAccount(): void {
 	wrap.append(box);
 
 	const who = el("div", "settings-card");
-	who.append(el("h2", "", "Identity"));
+	who.append(el("h2", "", "身份"));
 	const role = S!.me?.role === "admin" ? "管理员" : "用户";
 	who.append(el("p", "", `${S!.me?.name ?? "（未知）"} · ${role}`));
 	box.append(who);
 
 	// 我的仓库（v0.19.x）：此前删除/新建只有 curl，用户找不到管理入口
 	const vc = el("div", "settings-card");
-	vc.append(el("h2", "", "My vaults"));
+	vc.append(el("h2", "", "我的仓库"));
 	vc.append(el("p", "muted small",
 		"名下的远端仓库，彼此完全隔离。新建的仓库是空的：在 Obsidian 插件里" +
 		"重新运行接入向导并选择它，即可把本地笔记初始化上去（必须设置 E2EE）。" +
@@ -1747,7 +2727,7 @@ function showAccount(): void {
 	void renderVaultList(vList, vErr);
 
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Reset API Token"));
+	card.append(el("h2", "", "重置 API Token"));
 	card.append(el("p", "muted small",
 		"怀疑 API Token 泄露时使用：立即作废旧 Token 并撤销你的全部设备凭据。" +
 		"之后每台设备只需在插件设置里填入新 Token → 点「测试连接」即可恢复同步，" +
@@ -1829,7 +2809,7 @@ async function renderVaultList(listEl: HTMLElement, errEl: HTMLElement): Promise
 			void S!.api.deleteVault(v.id, confirmName)
 				.then(() => {
 					if (v.current) {
-						try { localStorage.removeItem(VAULT_KEY); } catch { /* ignore */ }
+						forgetVault();
 						location.hash = "";
 						location.reload();
 						return;
@@ -1851,7 +2831,7 @@ function renderNewToken(
 ): void {
 	box.innerHTML = "";
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "New API Token"));
+	card.append(el("h2", "", "新的 API Token"));
 	card.append(el("p", "", `已撤销 ${res.revokedDevices} 台设备的凭据；旧 Token 与其他登录会话全部失效。`));
 	if (!res.resetAuthEnforced) {
 		card.append(el("p", "muted small", "（本次重置未经 E2EE 密码确认——该 Vault 尚未登记重置凭证。）"));
@@ -1882,7 +2862,7 @@ async function showUsersAdmin(): Promise<void> {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
-	head.append(el("h1", "note-title", "Users"));
+	head.append(el("h1", "note-title", "用户管理"));
 	const backBtn = el("button", "ghost", "← 返回");
 	backBtn.onclick = () => {
 		location.hash = "#/";
@@ -1920,7 +2900,7 @@ async function renderUsersInto(box: HTMLElement): Promise<void> {
 function renderUsersUnlock(box: HTMLElement): void {
 	box.innerHTML = "";
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Admin unlock"));
+	card.append(el("h2", "", "管理员验证"));
 	card.append(el("p", "muted small", "用户管理需要管理员权限：请输入 API Token 换取短期 admin 会话（30 分钟）。"));
 	const input = el("input") as HTMLInputElement;
 	input.type = "password";
@@ -1949,7 +2929,7 @@ function renderUsersUnlock(box: HTMLElement): void {
 
 function renderInviteCard(box: HTMLElement, invites: AdminInvite[]): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Invites"));
+	card.append(el("h2", "", "邀请"));
 	card.append(el("p", "muted small",
 		"邀请链接后缀随机（32 字节）、一次性、默认 24 小时过期。" +
 		"对方打开链接，输入用户名即可注册并拿到自己的 API Token。"));
@@ -2011,19 +2991,62 @@ function renderInviteCard(box: HTMLElement, invites: AdminInvite[]): void {
 	box.append(card);
 }
 
+/** 「存储 1.2 MB / 2 GB · 仓库 1 / 20」；limit 0 = 不限。 */
+function quotaLine(u: Usage): string {
+	const storage = `存储 ${fmtBytes(u.bytesUsed)} / ${u.bytesLimit > 0 ? fmtBytes(u.bytesLimit) : "不限"}（含历史版本）`;
+	const vaults = `仓库 ${u.vaults} / ${u.vaultsLimit > 0 ? u.vaultsLimit : "不限"}`;
+	const custom = u.overrideBytes !== 0 || u.overrideVaults !== 0 ? " · 已单独设置" : "";
+	return `${storage} · ${vaults}${custom}`;
+}
+
+function overrideText(n: number, isBytes: boolean): string {
+	if (n === 0 || n === -1) return String(n);
+	return isBytes ? (n % (1 << 30) === 0 ? `${n / (1 << 30)}GB` : n % (1 << 20) === 0 ? `${n / (1 << 20)}MB` : String(n)) : String(n);
+}
+
+/** 「2GB / 500MB / 1048576 / 0 / -1」→ 字节数（1024 进制）；格式不对返回 null。 */
+function parseSizeInput(s: string): number | null {
+	const m = /^\s*(-1|\d+)\s*(t|g|m|k)?i?b?\s*$/i.exec(s);
+	if (!m) return null;
+	const n = Number(m[1]);
+	if (n === -1) return m[2] ? null : -1;
+	const mult = { t: 2 ** 40, g: 2 ** 30, m: 2 ** 20, k: 2 ** 10 }[(m[2] ?? "").toLowerCase() as "t" | "g" | "m" | "k"] ?? 1;
+	return n * mult;
+}
+
 function renderUserListCard(box: HTMLElement, users: AdminUser[]): void {
 	const card = el("div", "settings-card");
-	card.append(el("h2", "", "Accounts"));
+	card.append(el("h2", "", "账号"));
 	const list = el("div", "settings-list");
 	for (const u of users) {
 		const item = el("div", "settings-item");
 		const label = u.isAdmin ? `${u.name}（管理员）` : u.name;
-		const meta = `${(u as { vaults?: number }).vaults ?? 1} 个仓库 · ${u.devices} 台设备 · ${u.objects} 个文件 · ${fmtBytes(u.bytesUsed)}` +
+		const meta = `${u.vaults ?? 1} 个仓库 · ${u.devices} 台设备 · ${u.objects} 个文件 · ${fmtBytes(u.bytesUsed)}` +
 			(u.lastSeenAt ? ` · 最近活动 ${fmtTime(u.lastSeenAt * 1000)}` : " · 从未活动") +
 			(u.disabled ? " · 已禁用" : "");
 		const info = el("div", "settings-item-main");
 		info.append(el("div", "", label), el("div", "muted small", meta));
+		if (u.usage) info.append(el("div", "muted small", quotaLine(u.usage)));
 		item.append(info);
+		// 配额覆盖值（需求 §12：管理员可管理账号配额）
+		const quotaBtn = el("button", "ghost", "配额…");
+		quotaBtn.onclick = () => {
+			const cur = u.usage;
+			const b = prompt(
+				`${u.name} 的存储上限（含历史版本）\n例如 2GB、500MB；0 = 跟随服务器默认；-1 = 不限`,
+				cur ? overrideText(cur.overrideBytes, true) : "0");
+			if (b === null) return;
+			const v = prompt(`${u.name} 的仓库数上限\n0 = 跟随服务器默认；-1 = 不限`, cur ? String(cur.overrideVaults) : "0");
+			if (v === null) return;
+			const bytes = parseSizeInput(b);
+			const vaults = /^-?\d+$/.test(v.trim()) ? Number(v.trim()) : NaN;
+			if (bytes === null || !(vaults >= -1)) return void alert("格式不对：存储写成 2GB / 500MB / 0 / -1，仓库数写整数、0 或 -1。");
+			void S!.api
+				.setUserQuota(u.userId, bytes, vaults)
+				.then(() => renderUsersInto(box))
+				.catch((e) => alert(`设置配额失败：${e instanceof Error ? e.message : String(e)}`));
+		};
+		item.append(quotaBtn);
 		if (!u.isAdmin) {
 			const disBtn = el("button", "ghost", u.disabled ? "解禁" : "禁用");
 			disBtn.onclick = () => {

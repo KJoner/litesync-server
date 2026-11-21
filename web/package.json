@@ -4,12 +4,23 @@
   "private": true,
   "description": "LiteSync web readonly client",
   "scripts": {
-    "build": "tsc -noEmit -skipLibCheck && node build.mjs"
+    "build": "node scripts/check-core.mjs && tsc -noEmit -skipLibCheck && node build.mjs",
+    "check:core": "node scripts/check-core.mjs",
+    "vendor:core": "node scripts/vendor-core.mjs",
+    "test": "node scripts/run-tests.mjs"
   },
   "devDependencies": {
+    "@codemirror/commands": "^6.9.0",
+    "@codemirror/lang-markdown": "^6.4.0",
+    "@codemirror/language": "^6.11.3",
+    "@codemirror/search": "^6.5.11",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.6",
     "@types/markdown-it": "^14.1.2",
     "esbuild": "^0.25.0",
     "markdown-it": "^14.1.0",
+    "qrcode-generator": "^2.0.4",
+    "style-mod": "4.1.5",
     "typescript": "^5.7.0"
   }
 }

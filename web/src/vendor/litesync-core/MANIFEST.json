@@ -1,0 +1,19 @@
+{
+	"note": "由 web/scripts/vendor-core.mjs 从 LiteSync 插件仓原样复制；不得手改（npm run check:core 校验）",
+	"pluginVersion": "0.20.0",
+	"files": {
+		"crypto/crypto.ts": "1cb2f5269bfc6be34c8134439154f3f719a81954f7db1047bcc635a03e06f729",
+		"crypto/padding.ts": "797b6a0e7ec0d35495271d68b2607dd962e28e7067743b47fcbc3ed35501d9cb",
+		"utils/validate.ts": "7d4f6fb85ae353692139852f40efbe0ee1c85c917ff8dc2e3639012251f22e0e",
+		"merge/diff.ts": "78c362b735d4be78ae16b68be7b056ee101b04b912d134c2f8b2f9d87bae06ab",
+		"merge/markdown/frontmatter.ts": "1670e9dad2edc8505b445fc027f34740796d9589a5449493380a644807d76dd0",
+		"merge/markdown/lists.ts": "4aa77ccd917df3a554d6e03c24687893da2a0ac86fbd6ffaa985bfd7aeff1ac8",
+		"merge/markdown/sections.ts": "4adc73e49b5113a573448f143f34a970831c42be54c34e544908065124055d74",
+		"merge/model.ts": "9620dd8520405eab51b3884789afb2614f40aa6b3aa59ffb6109bdcafb364763",
+		"merge/smart-merge.ts": "321d814e228a15ca7a59f6206bf9991219dd124f378e59e055ed2fa427fb1ceb",
+		"merge/three-way.ts": "38db8f2cc3d47c7358781696be5d9223d0b34f439f6b2ea7052110bd45bcdb56",
+		"merge/token/three-way-token.ts": "6b81f8ea0c30a47c887ef7b464fbf7f3c3c29f473eb3708dc9306491ad872c7e",
+		"merge/token/tokenize.ts": "d141928de75f141cac37779260f250ca04f384d3d22b6fdac287c1be51e4e1fc",
+		"test-vectors/crypto-core-v1.json": "262fb17d669f223baa1a954ac003a9b318618e3e8b19c9ecf6e7eccb7ecc5d0e"
+	}
+}

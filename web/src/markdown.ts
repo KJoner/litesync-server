@@ -11,6 +11,21 @@ export const md = new MarkdownIt({
 const defaultValidate = md.validateLink.bind(md);
 md.validateLink = (url: string) => url.startsWith("vault:") || url.startsWith("#/") || defaultValidate(url);
 
+// 外部图片（需求 §7.4 / 验收 ED-06）：预览**不自动请求**第三方——那会把「谁在什么时候看了哪篇笔记」
+// 连同 URL 里可能带的敏感路径一起交给图片主机。渲染成占位 + 用户主动点开的链接，而不是 <img>。
+// CSP 的 img-src 仍是第二道防线，但不能只靠它：被 CSP 拦下之前浏览器已经尝试过这次加载。
+const defaultImage = md.renderer.rules.image!;
+md.renderer.rules.image = (tokens, idx, options, env, self) => {
+	const token = tokens[idx];
+	const src = token.attrGet("src") ?? "";
+	if (/^(https?:)?\/\//i.test(src)) {
+		const alt = md.utils.escapeHtml(token.content || "外部图片");
+		const href = md.utils.escapeHtml(src);
+		return `<span class="remote-img-blocked">🖼 外部图片「${alt}」未自动加载（<a href="${href}" target="_blank" rel="noopener noreferrer">在新标签页打开</a>）</span>`;
+	}
+	return defaultImage(tokens, idx, options, env, self);
+};
+
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
 /**

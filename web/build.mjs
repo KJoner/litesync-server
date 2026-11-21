@@ -9,7 +9,11 @@ const outdir = join(root, "..", "internal", "web", "dist");
 mkdirSync(outdir, { recursive: true });
 
 await esbuild.build({
-	entryPoints: [join(root, "src", "app.ts"), join(root, "src", "share.ts"), join(root, "src", "pair.ts"), join(root, "src", "join.ts")],
+	entryPoints: [
+		join(root, "src", "app.ts"), join(root, "src", "share.ts"), join(root, "src", "pair.ts"), join(root, "src", "join.ts"),
+		// 网页编辑器（CodeMirror 6）单独成包：只在进入编辑时按需加载
+		join(root, "src", "editor.ts"),
+	],
 	bundle: true,
 	minify: true,
 	format: "iife",

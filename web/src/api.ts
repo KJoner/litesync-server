@@ -15,6 +15,18 @@ export interface FileEntry {
 	serverPath?: string;
 }
 
+export interface TrashItem {
+	fileId: string;
+	/** 删除前最后的寻址名（明文路径仓库 = 真实路径；路径加密仓库 = fileId） */
+	path: string;
+	deletionRevision: number;
+	contentGeneration: number;
+	metaGeneration: number;
+	deletedAt: number;
+	retainUntil?: number;
+	restorable: boolean;
+}
+
 export interface VersionEntry {
 	revision: number;
 	action: string;
@@ -63,6 +75,8 @@ export interface WebVault {
 	bytesUsed: number;
 	encryptionState: string;
 	current: boolean;
+	/** v0.20：初始化状态（ADR-012）；旧服务端没有这个字段 */
+	initState?: "pending_encryption" | "initializing" | "ready";
 }
 
 /** 当前会话的身份（v0.18 多用户）：前端据此渲染角色相关 UI；硬关卡在服务端。 */
@@ -70,6 +84,19 @@ export interface Whoami {
 	role: "admin" | "user";
 	name: string;
 	userId?: string;
+}
+
+/**
+ * 跨标签页广播「本浏览器当前登录的是哪个账号」（空串 = 未登录；验收 TN-05）。
+ * 其他标签页监听 storage 事件，发现账号变了就把可见状态清掉。值没变时不写，免得触发多余的事件。
+ */
+export const ACCOUNT_KEY = "litesync-account";
+export function announceAccount(id: string): void {
+	try {
+		if ((localStorage.getItem(ACCOUNT_KEY) ?? "") !== id) localStorage.setItem(ACCOUNT_KEY, id);
+	} catch {
+		/* 隐私模式等场景写不了 storage：各标签页仍会在可见时自查 */
+	}
 }
 
 export async function logout(): Promise<void> {
@@ -108,6 +135,10 @@ export class Api {
 		repoEpoch?: string;
 		/** 重置凭证是否已登记（v0.18）：false 时解锁后自动补登记 */
 		resetAuthConfigured?: boolean;
+		/** v0.20：写入时逐请求校验用的世代与信封下限 */
+		encryptionState?: string;
+		minimumEnvelopeVersion?: number;
+		capabilities?: string[];
 	}> {
 		const res = await this.req("/api/v1/info");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -208,6 +239,13 @@ export class Api {
 		return res.json();
 	}
 
+	/** 增量变更（只用来判断「有没有新东西」；有就重取 snapshot）。游标过旧时 resyncRequired=true。 */
+	async changes(since: number, limit = 1): Promise<{ latestSequence: number; resyncRequired?: boolean; hasMore: boolean; changes: { sequence: number }[] }> {
+		const res = await this.req(`/api/v1/changes?since=${since}&limit=${limit}`);
+		if (!res.ok) throw new Error(`changes: HTTP ${res.status}`);
+		return res.json();
+	}
+
 	async vaultKey(): Promise<VaultKeyDoc | null> {
 		const res = await this.req("/api/v1/vault-key");
 		if (res.status === 404) return null;
@@ -221,7 +259,7 @@ export class Api {
 	 * 只要 bytes 不够：调用方必须能核对「服务器给的是不是我要的那个对象」，
 	 * 否则一个被攻陷的服务器可以拿另一份内容冒充这个文件。
 	 */
-	async fileWithIdentity(path: string): Promise<{ data: ArrayBuffer; fileId: string | null; generation: number | null }> {
+	async fileWithIdentity(path: string): Promise<{ data: ArrayBuffer; fileId: string | null; generation: number | null; revision: number }> {
 		const res = await this.req(`/api/v1/file?path=${encodeURIComponent(path)}`);
 		if (!res.ok) throw new Error(`file ${path}: HTTP ${res.status}`);
 		const gen = res.headers.get("X-Content-Generation");
@@ -229,11 +267,20 @@ export class Api {
 			data: await res.arrayBuffer(),
 			fileId: res.headers.get("X-File-Id"),
 			generation: gen === null || gen === "" ? null : Number(gen),
+			revision: Number(res.headers.get("X-Revision") ?? 0),
 		};
 	}
 
 	async file(path: string): Promise<ArrayBuffer> {
 		return (await this.fileWithIdentity(path)).data;
+	}
+
+	/** 回收站（v0.20）：仍保留的删除记录。restorable=false 表示删除前的内容已被历史裁剪清掉。 */
+	async trash(): Promise<TrashItem[]> {
+		const res = await this.req("/api/v1/trash");
+		if (!res.ok) throw new Error(`trash: HTTP ${res.status}`);
+		const body = (await res.json()) as { items: TrashItem[] };
+		return body.items ?? [];
 	}
 
 	async history(path: string): Promise<VersionEntry[]> {
@@ -403,6 +450,19 @@ export class Api {
 		}
 	}
 
+	/** 配额覆盖值：0 = 跟随服务器默认，-1 = 不限，>0 = 指定值（字节 / 个数）。 */
+	async setUserQuota(userId: string, bytes: number, vaults: number): Promise<void> {
+		const res = await this.req(`/api/v1/admin/users/${encodeURIComponent(userId)}/quota`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ bytes, vaults }),
+		});
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({} as { message?: string }));
+			throw new Error(body.message ?? `HTTP ${res.status}`);
+		}
+	}
+
 	async deleteUser(userId: string, confirmName: string): Promise<void> {
 		const res = await this.req(`/api/v1/admin/users/${encodeURIComponent(userId)}`, {
 			method: "DELETE",
@@ -428,6 +488,16 @@ export interface AdminInvite {
 }
 
 /** 用户概要（v0.18）：不含任何凭据材料。 */
+/** 账号用量与上限（v0.20 配额；limit 0 = 不限；override：0 = 跟随默认，-1 = 不限）。 */
+export interface Usage {
+	bytesUsed: number;
+	bytesLimit: number;
+	vaults: number;
+	vaultsLimit: number;
+	overrideBytes: number;
+	overrideVaults: number;
+}
+
 export interface AdminUser {
 	userId: string;
 	name: string;
@@ -438,6 +508,8 @@ export interface AdminUser {
 	devices: number;
 	objects: number;
 	bytesUsed: number;
+	vaults?: number;
+	usage?: Usage;
 }
 
 export interface BackupStatus {
@@ -534,3 +606,137 @@ export interface RestorePlan {
 	consequences: string[];
 	whyNotAButton: string;
 }
+
+// ---------------------------------------------------------------- v0.20 公开化（/auth、/api/v2）
+
+/** 服务端返回的结构化错误（按 code 分支，永不解析 message）。 */
+export class ApiCodeError extends Error {
+	constructor(
+		readonly status: number,
+		readonly code: string,
+		message: string,
+		readonly retryable = false,
+	) {
+		super(message);
+		this.name = "ApiCodeError";
+	}
+}
+
+export interface AuthConfig {
+	oidc: boolean;
+	legacyTokenLogin: boolean;
+	registrationMode: "closed" | "invite" | "open";
+	accountConsoleUrl?: string;
+}
+
+export interface Me {
+	account: { id: string; displayName: string; email: string; emailVerified: boolean };
+	role: "admin" | "user";
+	permissions: string[];
+	vaultCount: number;
+	onboarding: { state: "needs_first_vault" | "ready" };
+	identity: { linked: boolean };
+	session: { kind: "oidc" | "token" | "device"; legacyLogin: boolean };
+	features: { oidc: boolean; registrationMode: string; webEditing?: boolean };
+	accountConsoleUrl?: string;
+	usage?: Usage;
+}
+
+export interface VaultCard {
+	id: string;
+	name: string;
+	createdAt: number;
+	fileCount: number;
+	bytesUsed: number;
+	updatedAt: number;
+	encryptionState: string;
+	initState: "pending_encryption" | "initializing" | "ready";
+	vaultIdentity: string;
+	current: boolean;
+}
+
+export interface InitStatus {
+	vaultId: string;
+	vaultIdentity: string;
+	initState: "pending_encryption" | "initializing" | "ready";
+	initVersion: number;
+	leaseActive: boolean;
+	keyDocPresent: boolean;
+	cryptoProfile: { protocolVersion: number; keyDocVersion: number; writeEnvelope: string };
+	created?: boolean;
+	replayed?: boolean;
+}
+
+export interface PairingGrantResp {
+	grantId: string;
+	enrollmentSecret: string;
+	expiresAt: number;
+	vault: { vaultId: string; vaultIdentity: string; displayName: string };
+	accountLabel: string;
+	protocolVersion: number;
+	requiredCapabilities: string[];
+	trust: { mode: string; repoEpoch: string; headSequence: number };
+}
+
+export interface AccountDevice {
+	id: string;
+	name: string;
+	platform: string;
+	vaultId: string;
+	vaultName: string;
+	createdAt: number;
+	lastSeenAt: number;
+	revoked: boolean;
+	clientVersion: string;
+}
+
+/** 公开的登录配置（不需要会话）。 */
+export async function authConfig(): Promise<AuthConfig> {
+	const res = await fetch("/auth/config");
+	if (!res.ok) return { oidc: false, legacyTokenLogin: true, registrationMode: "closed" };
+	return res.json();
+}
+
+/**
+ * /api/v2 请求：只有 401 视为「需要登录」（AuthError）；其余错误带着 code 抛出，
+ * 由调用方按 code 给出准确提示——不把 403 EMAIL_NOT_VERIFIED 之类误当成掉线。
+ */
+export async function v2<T>(method: string, path: string, body?: unknown, vaultId = ""): Promise<T> {
+	const headers: Record<string, string> = {};
+	if (body !== undefined) headers["Content-Type"] = "application/json";
+	if (vaultId) headers["X-Vault-ID"] = vaultId;
+	const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+	if (res.status === 401) throw new AuthError();
+	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+	if (!res.ok) {
+		throw new ApiCodeError(res.status, String(data.code ?? "HTTP_" + res.status),
+			String(data.message ?? data.error ?? `HTTP ${res.status}`), Boolean(data.retryable));
+	}
+	return data as T;
+}
+
+export const accountApi = {
+	me: () => v2<Me>("GET", "/api/v2/me"),
+	vaults: async (): Promise<VaultCard[]> => (await v2<{ vaults: VaultCard[] }>("GET", "/api/v1/vaults")).vaults ?? [],
+	createVault: (name: string, clientRequestId: string) =>
+		v2<InitStatus & { name: string }>("POST", "/api/v2/vaults", { name, clientRequestId }),
+	initStatus: (id: string) => v2<InitStatus>("GET", `/api/v2/vaults/${encodeURIComponent(id)}/initialization`),
+	initClaim: (id: string, opId: string) =>
+		v2<InitStatus>("POST", `/api/v2/vaults/${encodeURIComponent(id)}/initialization`, { phase: "claim", opId }),
+	initCommit: (id: string, body: Record<string, unknown>) =>
+		v2<InitStatus>("POST", `/api/v2/vaults/${encodeURIComponent(id)}/initialization`, { phase: "commit", ...body }),
+	renameVault: (id: string, name: string) => v2<unknown>("PATCH", `/api/v1/vaults/${encodeURIComponent(id)}`, { name }),
+	deleteVault: (id: string, confirmName: string) =>
+		v2<unknown>("DELETE", `/api/v1/vaults/${encodeURIComponent(id)}`, { confirmName }),
+	pairingGrant: (id: string) => v2<PairingGrantResp>("POST", `/api/v2/vaults/${encodeURIComponent(id)}/pairing-grants`),
+	uploadPairing: (vaultId: string, grantId: string, ciphertext: string) =>
+		v2<{ pairId: string; expiresAt: number }>("POST", "/api/v2/pairings", { grantId, ciphertext, vaultId }, vaultId),
+	deletePairing: (vaultId: string, pairId: string) =>
+		v2<unknown>("DELETE", `/api/v2/pairings/${encodeURIComponent(pairId)}`, undefined, vaultId),
+	pairingAlive: async (pairId: string): Promise<boolean> =>
+		(await fetch(`/api/v2/pairings/${encodeURIComponent(pairId)}/envelope`)).ok,
+	devices: async (): Promise<AccountDevice[]> => (await v2<{ devices: AccountDevice[] }>("GET", "/api/v2/devices")).devices ?? [],
+	revokeDevice: (id: string) => v2<unknown>("DELETE", `/api/v2/devices/${encodeURIComponent(id)}`),
+	logout: () => v2<unknown>("POST", "/auth/logout"),
+	logoutAll: () => v2<{ revokedDevices: number; endSessionUrl?: string }>("POST", "/api/v2/account/logout-all"),
+};
