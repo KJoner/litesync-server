@@ -216,7 +216,8 @@ func TestUpgradeFromSingleRowRepoState(t *testing.T) {
 	raw.Close()
 
 	// 升级
-	d, err := db.Open(path)
+	// 旧单行 repo_state 的升级只发生在 SQLite 文件库上：两种测试模式下都固定用 SQLite
+	d, err := db.OpenSQLiteFile(path)
 	if err != nil {
 		t.Fatalf("升级失败：%v", err)
 	}
@@ -241,7 +242,7 @@ func TestUpgradeFromSingleRowRepoState(t *testing.T) {
 	}
 	// 重复打开必须幂等
 	d.Close()
-	d2, err := db.Open(path)
+	d2, err := db.OpenSQLiteFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}

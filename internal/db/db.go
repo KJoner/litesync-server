@@ -4,6 +4,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"testing"
 
 	_ "modernc.org/sqlite"
 )
@@ -21,7 +22,27 @@ func Open(path string) (*sql.DB, error) {
 }
 
 // OpenWithSync 打开数据库；syncFull=false 时使用 synchronous=NORMAL（牺牲掉电持久性）。
+//
+// 测试二进制里设置了 LITESYNC_TEST_PG_DSN 时改用 PostgreSQL（每个文件路径映射到一个
+// 独立 schema），让同一套测试在两种库上各跑一遍（批次 G）。testing.Testing() 保证
+// 生产进程即使误设了这个变量也不会被重定向到测试库。
 func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
+	if dsn := testPostgresDSN(); dsn != "" && testing.Testing() {
+		return openTestPostgres(dsn, path)
+	}
+	return openSQLite(path, syncFull)
+}
+
+// OpenSQLiteFile 明确打开一个 SQLite 文件库（不受测试的 PG 重定向影响）。
+//
+// 用途：① migrate-to-pg 读取源库；② 专门测试「旧 SQLite 文件库升级路径」的用例
+// （v5 → v6、单行 repo_state → 每仓库一行）——PG 库永远不会处于那些旧格式，
+// 这些用例在两种测试模式下都应该照常针对 SQLite 运行，而不是被跳过。
+func OpenSQLiteFile(path string) (*sql.DB, error) {
+	return openSQLite(path, true)
+}
+
+func openSQLite(path string, syncFull bool) (*sql.DB, error) {
 	d, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -46,29 +67,39 @@ func OpenWithSync(path string, syncFull bool) (*sql.DB, error) {
 		}
 	}
 
-	if _, err := d.Exec(schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema + vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema + mailSchema); err != nil {
+	if err := initSchema(d); err != nil {
 		d.Close()
-		return nil, fmt.Errorf("init schema: %w", err)
+		return nil, err
+	}
+	return d, nil
+}
+
+// allSchema 是全部表的 DDL（SQLite 方言；PG 下由驱动层映射类型，见 pgdriver.go）。
+func allSchema() string {
+	return schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema +
+		vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema + mailSchema
+}
+
+// initSchema 建表并执行全部幂等迁移（SQLite 与 PostgreSQL 共用同一条路径）。
+func initSchema(d *sql.DB) error {
+	if _, err := d.Exec(allSchema()); err != nil {
+		return fmt.Errorf("init schema: %w", err)
 	}
 	if err := migrateColumns(d); err != nil {
-		d.Close()
-		return nil, fmt.Errorf("migrate columns: %w", err)
+		return fmt.Errorf("migrate columns: %w", err)
 	}
 	if err := migrateJournalKindCheck(d); err != nil {
-		d.Close()
-		return nil, fmt.Errorf("migrate journal kind: %w", err)
+		return fmt.Errorf("migrate journal kind: %w", err)
 	}
 	// §10.2：repo_state 从单行实例级表改为按 Vault 划分。
 	// 必须在 initRepoState 之前——后者要按 vault_id 查询。
 	if err := migrateRepoStatePerVault(d); err != nil {
-		d.Close()
-		return nil, fmt.Errorf("migrate repo state: %w", err)
+		return fmt.Errorf("migrate repo state: %w", err)
 	}
 	if err := initRepoState(d, LegacyDefaultScope()); err != nil {
-		d.Close()
-		return nil, fmt.Errorf("init repo state: %w", err)
+		return fmt.Errorf("init repo state: %w", err)
 	}
-	return d, nil
+	return nil
 }
 
 // columnMigration 描述一次「缺列则补」的迁移。

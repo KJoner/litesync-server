@@ -108,13 +108,16 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 func (s *Service) maintainIntegrity() (int, error) {
 	issues := 0
 
-	var check string
-	if err := s.db.QueryRow(`PRAGMA quick_check(1)`).Scan(&check); err != nil {
-		return issues, err
-	}
-	if check != "ok" {
-		issues++
-		s.log.Error("integrity: sqlite quick_check failed", "result", check)
+	// 批次 G：quick_check 是 SQLite 的页级自检；PG 上由数据库服务器负责（见 Scrub 的说明），跳过
+	if !db.IsPostgres(s.db) {
+		var check string
+		if err := s.db.QueryRow(`PRAGMA quick_check(1)`).Scan(&check); err != nil {
+			return issues, err
+		}
+		if check != "ok" {
+			issues++
+			s.log.Error("integrity: sqlite quick_check failed", "result", check)
+		}
 	}
 
 	// v0.18：scrub 覆盖全部 Vault 的 HEAD

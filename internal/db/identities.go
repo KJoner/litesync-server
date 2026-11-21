@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // 统一身份映射（v0.20 公开化 / ADR-011）。
@@ -145,7 +144,7 @@ func LinkIdentity(q dbtx, issuer, subject, userID string, p IdentityProfile, now
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		issuer, subject, userID, truncate(p.Email, 254), boolInt(p.EmailVerified),
 		truncate(p.DisplayName, 128), now, now)
-	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+	if err != nil && IsUniqueViolation(err) {
 		// 并发：另一个请求刚抢先建立了映射——按冲突处理，绝不覆盖
 		return ErrIdentityTaken
 	}
@@ -195,7 +194,7 @@ func CreateOIDCUserWithInvite(d *sql.DB, issuer, subject string, p IdentityProfi
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		issuer, subject, userID, truncate(p.Email, 254), boolInt(p.EmailVerified),
 		truncate(p.DisplayName, 128), now, now); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if IsUniqueViolation(err) {
 			tx.Rollback() //nolint:errcheck
 			existing, gerr := GetIdentity(d, issuer, subject)
 			if gerr != nil || existing == nil {

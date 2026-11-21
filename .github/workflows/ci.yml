@@ -19,3 +19,26 @@ jobs:
         run: go test ./...
       - name: Build
         run: go build ./...
+
+  # 批次 G：同一套测试在 PostgreSQL 上再跑一遍（db.Open 的测试重定向 + 每测试独立 schema）。
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          # C 排序：与 SQLite 的字节序比较一致（OpenPostgres 拒绝其他排序规则）
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test on PostgreSQL
+        env:
+          LITESYNC_TEST_PG_ADMIN_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+        run: scripts/test-pg.sh ./...

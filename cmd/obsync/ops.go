@@ -46,6 +46,13 @@ const opsUsage = `obsync 运维命令：
   blobid migrate                 dry-run：只报告要改名多少个，不动任何文件
   blobid migrate --confirm       真正执行（**不可逆**，执行前请先 backup create）
 
+  migrate-to-pg --dry-run        只读源 SQLite：逐表行数与每仓库摘要（批次 G）
+  migrate-to-pg                  SQLite → OBSYNC_PG_DSN：目标须为空；已完成则只校验；JSON 报告
+  export-sqlite --out PATH       PostgreSQL → 新 SQLite 文件并校验（切换后的回退路径）
+
+  PostgreSQL 部署的 backup restore：恢复写入 OBSYNC_PG_RESTORE_DSN 指向的**新的空库**，
+  旧库原样保留作为退路；导入、校验与全部仓库的 repoEpoch 旋转在同一个事务里完成。
+
 restore 会做四件事，缺一不可：
   1. 用快照内容替换数据目录；
   2. 旋转 repoEpoch —— 所有客户端的游标与 baseRevision 随之作废；
@@ -68,6 +75,10 @@ func runOps(args []string) (handled bool, err error) {
 		return true, opsMigration(args[1:])
 	case "blobid":
 		return true, opsBlobID(args[1:])
+	case "migrate-to-pg":
+		return true, runMigrateToPG(args[1:])
+	case "export-sqlite":
+		return true, runExportSQLite(args[1:])
 	case "ops", "help", "-h", "--help":
 		fmt.Print(opsUsage)
 		return true, nil
@@ -81,7 +92,7 @@ func openDataDir() (*syncsvc.Service, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	database, err := db.Open(filepath.Join(cfg.DataDir, "sync.db"))
+	database, _, err := openDatabase(cfg.DataDir, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -279,7 +290,7 @@ func opsBackup(args []string) error {
 		return fmt.Errorf("备份未配置：请设置 OBSYNC_BACKUP_KEY_FILE（该文件必须位于数据目录之外）")
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	database, err := db.Open(filepath.Join(cfg.DataDir, "sync.db"))
+	database, dbc, err := openDatabase(cfg.DataDir, true)
 	if err != nil {
 		return err
 	}
@@ -320,9 +331,72 @@ func opsBackup(args []string) error {
 				"恢复必须带 --new-epoch：不旋转 repoEpoch 的话，客户端会沿用旧游标，" +
 					"静默漏掉恢复点之后的所有变更")
 		}
+		if dbc.IsPostgres() {
+			return restoreToPostgres(ctx, mgr, cfg.DataDir, id, dbc.PostgresDSN)
+		}
+		// SQLite：恢复要把整个数据目录挪开——先关掉本进程对 sync.db 的句柄（备份配置已在
+		// backup.New 时读进内存，恢复过程不再访问它）。Windows 上目录里有打开的文件就无法改名；
+		// Linux 上能改名，但这个句柄会一直指向被挪走的旧库。
+		database.Close()
 		return restoreWithNewEpoch(ctx, mgr, cfg.DataDir, id)
 	}
 	return fmt.Errorf("未知的 backup 子命令：%s", args[0])
+}
+
+// restoreToPostgres：PostgreSQL 部署的恢复（批次 G / MG-04）。恢复目标是
+// OBSYNC_PG_RESTORE_DSN 指向的**新的空库**；当前库（OBSYNC_PG_DSN）只用来读备份配置，
+// 原样保留——恢复错快照时它就是退路（对应 SQLite 部署「旧数据目录挪开而不是删除」）。
+func restoreToPostgres(ctx context.Context, mgr *backup.Manager, dataDir, snapshotID, currentDSN string) error {
+	target := os.Getenv("OBSYNC_PG_RESTORE_DSN")
+	if target == "" {
+		return fmt.Errorf("PostgreSQL 部署的恢复需要 OBSYNC_PG_RESTORE_DSN：指向一个新建的空库" +
+			"（CREATE DATABASE ... LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0）；当前库保持不动作为退路")
+	}
+	if target == currentDSN {
+		return fmt.Errorf("OBSYNC_PG_RESTORE_DSN 不能与 OBSYNC_PG_DSN 相同：恢复只写入一个新的空库")
+	}
+	tdb, err := db.OpenPostgresRaw(target)
+	if err != nil {
+		return err
+	}
+	defer tdb.Close()
+	fmt.Fprintf(os.Stderr, "即将从快照 %s 恢复：Blob 数据目录 → %s，元数据 → OBSYNC_PG_RESTORE_DSN（新库）。\n", snapshotID, dataDir)
+	fmt.Fprintln(os.Stderr, "请确认服务已停止；导入、校验与全部仓库的 repoEpoch 旋转在同一个事务里完成。")
+	res, err := mgr.RestoreToPostgres(ctx, snapshotID, tdb)
+	if err != nil {
+		return fmt.Errorf("恢复失败: %w", err)
+	}
+	if res.PreviousDataDir != "" {
+		fmt.Printf("原数据目录已挪到 %s（确认恢复无误后再删除）\n", res.PreviousDataDir)
+	}
+	fmt.Printf("元数据已导入并逐表校验：%d 张表、%d 行。\n", len(res.Import.Tables), res.Import.TotalRows)
+	for _, r := range res.RotatedEpochs {
+		fmt.Printf("repo epoch rotated (vault %s): %s → %s\n", r.VaultID, short(r.OldEpoch), short(r.NewEpoch))
+	}
+	reportMissingBlobs(res)
+	fmt.Printf("恢复完成，用时 %d ms。下一步：把 OBSYNC_PG_DSN 改为恢复目标库（即 OBSYNC_PG_RESTORE_DSN 的值）后启动服务。\n", res.DurationMs)
+	fmt.Println("客户端下次同步会进入灾备合并：服务器恢复出来的内容与客户端本地较新的内容都会保留。")
+	return nil
+}
+
+func reportMissingBlobs(res *backup.RestoreResult) {
+	switch {
+	case res.MissingBlobs < 0:
+		fmt.Println("警告：Blob 核对没有完成（见日志）；请运行 obsync integrity scan。")
+	case res.MissingBlobs > 0:
+		fmt.Printf("警告：恢复出的元数据引用了 %d 个 blob，其中 %d 个在数据目录里找不到（示例：%v）。"+
+			"这些对象的内容不可读；请运行 obsync integrity scan 并从其他备份或设备补回。\n",
+			res.ReferencedBlobs, res.MissingBlobs, res.MissingSample)
+	default:
+		fmt.Printf("Blob 核对：元数据引用的 %d 个 blob 全部在位。\n", res.ReferencedBlobs)
+	}
+}
+
+func short(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }
 
 // cliQuiescer：运维命令运行时服务是停的，没有并发写入需要静默，锁是直通的。
@@ -351,12 +425,15 @@ func restoreWithNewEpoch(ctx context.Context, mgr *backup.Manager, dataDir, snap
 		fmt.Printf("原数据目录已挪到 %s\n", res.PreviousDataDir)
 		fmt.Println("（确认恢复无误后再删除它——恢复错快照时那是唯一的退路）")
 	}
+	reportMissingBlobs(res)
 	// 旋转 epoch：这一步不能省，也不能延后到服务启动之后——
-	// 中间任何一次客户端同步都会带着作废的游标进来
-	if err := rotateEpoch(); err != nil {
-		return fmt.Errorf("恢复成功但 repoEpoch 旋转失败（必须手工执行 obsync rotate-epoch）: %w", err)
+	// 中间任何一次客户端同步都会带着作废的游标进来。
+	// 批次 G 修正：旋转**全部**仓库。之前调用的 rotateEpoch() 按 os.Args 判断 --all，
+	// 从 `backup restore` 进来时只转了 default——多仓库部署里其他仓库的客户端会沿用旧游标。
+	if err := rotateAllAfterRestore(dataDir); err != nil {
+		return fmt.Errorf("恢复成功但 repoEpoch 旋转失败（必须手工执行 obsync rotate-epoch --all）: %w", err)
 	}
-	fmt.Println("恢复完成，repoEpoch 已旋转。")
+	fmt.Println("恢复完成，全部仓库的 repoEpoch 已旋转。")
 	fmt.Println("客户端下次同步会进入灾备合并：服务器恢复出来的内容与客户端本地较新的内容都会保留。")
 	return nil
 }

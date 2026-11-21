@@ -169,7 +169,8 @@ func buildV5DB(t *testing.T) string {
 
 func openMigrated(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	d, err := db.Open(path)
+	// 旧 SQLite 文件库的升级路径：PG 库永远不处于 v5 格式，两种测试模式下都固定用 SQLite
+	d, err := db.OpenSQLiteFile(path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

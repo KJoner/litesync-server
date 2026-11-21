@@ -295,6 +295,13 @@ func TestManagerStagingContent(t *testing.T) {
 	if mf.Format != 1 || mf.LatestSequence != 42 || mf.LitesyncVersion != "test" {
 		t.Fatalf("bad manifest: %+v", mf)
 	}
+	wantDB, wantFmt := "sqlite", "sqlite-vacuum-into"
+	if db.IsPostgres(m.db) {
+		wantDB, wantFmt = "postgres", "sqlite-export"
+	}
+	if mf.Database != wantDB || mf.DBFormat != wantFmt || mf.MissingBlobs != 0 {
+		t.Fatalf("manifest must record the snapshot method and blob check: %+v", mf)
+	}
 	// manifest 绝不能包含 secrets
 	for _, secret := range []string{"s3cret-key", "restic-pw"} {
 		if strings.Contains(string(raw), secret) {
@@ -302,7 +309,8 @@ func TestManagerStagingContent(t *testing.T) {
 		}
 	}
 	// staging 的 sync.db 是可独立打开的一致快照
-	sdb, err := db.Open(filepath.Join(staging, "sync.db"))
+	// 无论部署用哪种库，staging 里的 sync.db 都是一个 SQLite 文件（批次 G：PG 部署是导出件）
+	sdb, err := db.OpenSQLiteFile(filepath.Join(staging, "sync.db"))
 	if err != nil {
 		t.Fatalf("staged sync.db unreadable: %v", err)
 	}

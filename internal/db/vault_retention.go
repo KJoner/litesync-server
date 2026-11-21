@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"errors"
+	"time"
 )
 
 // 每 Vault 的保留策略覆盖（v0.16.0 / 计划书 §10.2）。
@@ -65,13 +66,13 @@ func SetVaultRetention(q dbtx, s VaultScope, r VaultRetention) error {
 	_, err := q.Exec(
 		`INSERT INTO vault_retention
 		   (vault_id, history_days, history_max_per_file, attachment_days, attachment_max, updated_at)
-		 VALUES (?, ?, ?, ?, ?, strftime('%s','now'))
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id) DO UPDATE SET
 		   history_days = excluded.history_days,
 		   history_max_per_file = excluded.history_max_per_file,
 		   attachment_days = excluded.attachment_days,
 		   attachment_max = excluded.attachment_max,
 		   updated_at = excluded.updated_at`,
-		s.ID(), r.HistoryDays, r.HistoryMaxPerFile, r.AttachmentDays, r.AttachmentMax)
+		s.ID(), r.HistoryDays, r.HistoryMaxPerFile, r.AttachmentDays, r.AttachmentMax, time.Now().Unix())
 	return err
 }

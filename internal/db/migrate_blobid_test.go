@@ -225,12 +225,7 @@ func TestBlobIDMigrationRollsBackRenameWhenRepointFails(t *testing.T) {
 	// 注入手法：用触发器让 object_versions 的 UPDATE 必然 ABORT。
 	// 这样 repoint 事务在「file_heads 已改、object_versions 未改」处失败，
 	// 正好是最危险的那一刻——文件已经改了名，引用却还没跟上。
-	if _, err := d.Exec(`
-		CREATE TRIGGER block_repoint BEFORE UPDATE OF blob_id ON object_versions
-		BEGIN SELECT RAISE(ABORT, 'injected repoint failure'); END`); err != nil {
-		t.Fatal(err)
-	}
-
+	installRepointFailure(t, d)
 	rep, err := db.MigrateBlobIDs(d, scope, secret, blobs, true, quietLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -262,9 +257,7 @@ func TestBlobIDMigrationRollsBackRenameWhenRepointFails(t *testing.T) {
 	assertNoDanglingRefs(t, d, blobDir)
 
 	// 4) 去掉注入后续跑必须能收敛：失败是可重试的，不是终态
-	if _, err := d.Exec(`DROP TRIGGER block_repoint`); err != nil {
-		t.Fatal(err)
-	}
+	removeRepointFailure(t, d)
 	rep2, err := db.MigrateBlobIDs(d, scope, secret, blobs, true, quietLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -328,5 +321,33 @@ func TestBlobIDMigrationRejectsBadInput(t *testing.T) {
 	}
 	if _, err := db.MigrateBlobIDs(d, db.LegacyDefaultScope(), nil, blobs, true, quietLogger()); err == nil {
 		t.Fatal("空 secret 必须被拒——那会让 HMAC 退化成一个固定密钥，存在性泄露就回来了")
+	}
+}
+
+// installRepointFailure 让 object_versions.blob_id 的任何 UPDATE 必然失败（故障注入）。
+// 两种库的触发器语法不同，语义相同：repoint 事务在「file_heads 已改、object_versions 未改」处中止。
+func installRepointFailure(t *testing.T, d *sql.DB) {
+	t.Helper()
+	ddl := `CREATE TRIGGER block_repoint BEFORE UPDATE OF blob_id ON object_versions
+		BEGIN SELECT RAISE(ABORT, 'injected repoint failure'); END`
+	if db.IsPostgres(d) {
+		ddl = `CREATE OR REPLACE FUNCTION block_repoint_fn() RETURNS trigger LANGUAGE plpgsql AS
+			$fn$ BEGIN RAISE EXCEPTION 'injected repoint failure'; END $fn$;
+			CREATE TRIGGER block_repoint BEFORE UPDATE OF blob_id ON object_versions
+			FOR EACH ROW EXECUTE FUNCTION block_repoint_fn();`
+	}
+	if _, err := d.Exec(ddl); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func removeRepointFailure(t *testing.T, d *sql.DB) {
+	t.Helper()
+	q := `DROP TRIGGER block_repoint`
+	if db.IsPostgres(d) {
+		q = `DROP TRIGGER block_repoint ON object_versions`
+	}
+	if _, err := d.Exec(q); err != nil {
+		t.Fatal(err)
 	}
 }

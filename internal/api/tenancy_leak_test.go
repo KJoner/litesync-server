@@ -243,7 +243,7 @@ func TestWhoamiRevealsNothingAboutOtherTenants(t *testing.T) {
 	devToken, _ := e.enrollDevice(t, "laptop")
 	if _, err := e.db.Exec(
 		`INSERT INTO vaults (vault_id, owner_id, name, secret, created_at)
-		 VALUES ('other-tenant', 'someone-else', 'Their Notes', x'00', 0)`); err != nil {
+		 VALUES ('other-tenant', 'someone-else', 'Their Notes', ?, 0)`, []byte{0}); err != nil {
 		t.Fatal(err)
 	}
 	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/api/v1/whoami", nil)

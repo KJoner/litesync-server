@@ -257,6 +257,10 @@ func (s *Service) erasePlaintextPathsLocked(scope db.VaultScope, rs *db.RepoStat
 	}}
 	report.Claims.BackupsCleaned = false
 
+	// 批次 G：PG 上流水线照跑，但 SQLite 专属的断言不成立——如实改写（见 erasure_pg.go）
+	if db.IsPostgres(s.db) {
+		applyPostgresErasureCaveats(report)
+	}
 	if err := s.writeErasureReport(report); err != nil {
 		s.log.Warn("erasure report write failed", "error", err)
 	}
@@ -298,6 +302,13 @@ func (s *Service) databasePath() (string, error) {
 
 // writeErasureReport 把报告写到数据目录（与库同级）。
 func (s *Service) writeErasureReport(r *ErasureReport) error {
+	if db.IsPostgres(s.db) {
+		data, err := json.MarshalIndent(r, "", "  ")
+		if err != nil {
+			return err
+		}
+		return s.writeErasureReportPG(data)
+	}
 	dbPath, err := s.databasePath()
 	if err != nil || dbPath == "" {
 		return err
@@ -312,6 +323,9 @@ func (s *Service) writeErasureReport(r *ErasureReport) error {
 
 // ErasureReportJSON 读取最近一次擦除报告（管理接口用）。
 func (s *Service) ErasureReportJSON() ([]byte, error) {
+	if db.IsPostgres(s.db) {
+		return s.erasureReportPG()
+	}
 	dbPath, err := s.databasePath()
 	if err != nil || dbPath == "" {
 		return nil, ErrNotFound

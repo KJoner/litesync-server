@@ -23,6 +23,10 @@ import (
 // 需要的那天才发现出了问题的一件事。
 //
 // 没装 restic 时自动跳过（安装：go install github.com/restic/restic/cmd/restic@latest）。
+//
+// 批次 G：这两条演练测的是 **SQLite 部署**的恢复路径（数据目录里的 sync.db 被替换），
+// 因此在两种测试模式下都固定用 SQLite 文件库（db.OpenSQLiteFile）。PostgreSQL 部署的
+// 恢复路径由 restore_drill_pg_test.go 覆盖。
 
 func resticAvailable(t *testing.T) string {
 	t.Helper()
@@ -65,7 +69,7 @@ func seedDataDir(t *testing.T, dataDir string) map[string]string {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(filepath.Join(dataDir, "sync.db"))
+	database, err := db.OpenSQLiteFile(filepath.Join(dataDir, "sync.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +114,7 @@ func TestDrillRealResticBackupAndRestore(t *testing.T) {
 	if err := os.WriteFile(keyFile, []byte(strings.Repeat("ab", 32)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(filepath.Join(dataDir, "sync.db"))
+	database, err := db.OpenSQLiteFile(filepath.Join(dataDir, "sync.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +188,7 @@ func TestDrillRealResticBackupAndRestore(t *testing.T) {
 	t.Logf("验收 1：%d 个 blob 全部逐字节一致", len(want))
 
 	// 验收 2：数据库回来了，且 head_sequence 是备份时的值
-	restored, oerr := db.Open(filepath.Join(dataDir, "sync.db"))
+	restored, oerr := db.OpenSQLiteFile(filepath.Join(dataDir, "sync.db"))
 	if oerr != nil {
 		t.Fatalf("恢复后数据库打不开：%v", oerr)
 	}
@@ -228,7 +232,7 @@ func TestDrillRestoreBadSnapshotLeavesDataIntact(t *testing.T) {
 	if err := os.WriteFile(keyFile, []byte(strings.Repeat("ab", 32)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(filepath.Join(dataDir, "sync.db"))
+	database, err := db.OpenSQLiteFile(filepath.Join(dataDir, "sync.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

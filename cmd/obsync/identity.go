@@ -15,8 +15,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,15 +22,7 @@ import (
 )
 
 func openDataDB() (*sql.DB, error) {
-	dataDir := os.Getenv("OBSYNC_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-	dbPath := filepath.Join(dataDir, "sync.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil, fmt.Errorf("database not found at %s (set OBSYNC_DATA_DIR): %w", dbPath, err)
-	}
-	return db.Open(dbPath)
+	return openExistingDB() // OBSYNC_DB=sqlite|postgres（批次 G）
 }
 
 func maskEmail(e string) string {

@@ -464,8 +464,9 @@ func PriorContentHash(q dbtx, s VaultScope, fileID string) (string, error) {
 func BlobReferenced(q dbtx, blobID string) (bool, error) {
 	var n int64
 	err := q.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM object_versions WHERE blob_id = ?)
-		     OR EXISTS(SELECT 1 FROM file_heads WHERE blob_id = ?)`,
+		// CASE 包一层：PG 的 EXISTS 是布尔，SQLite 是整数；统一成 0/1 两种库都能扫进 int64
+		`SELECT CASE WHEN EXISTS(SELECT 1 FROM object_versions WHERE blob_id = ?)
+		     OR EXISTS(SELECT 1 FROM file_heads WHERE blob_id = ?) THEN 1 ELSE 0 END`,
 		blobID, blobID,
 	).Scan(&n)
 	return n != 0, err

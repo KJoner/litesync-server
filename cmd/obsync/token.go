@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/KJoner/litesync-server/internal/db"
 )
@@ -51,15 +50,7 @@ func runToken(args []string) error {
 		}
 	}
 
-	dataDir := os.Getenv("OBSYNC_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-	dbPath := filepath.Join(dataDir, "sync.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return fmt.Errorf("database not found at %s (set OBSYNC_DATA_DIR): %w", dbPath, err)
-	}
-	database, err := db.Open(dbPath)
+	database, err := openExistingDB() // OBSYNC_DB=sqlite|postgres（批次 G）
 	if err != nil {
 		return err
 	}

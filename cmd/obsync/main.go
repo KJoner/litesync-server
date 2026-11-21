@@ -71,15 +71,7 @@ func main() {
 }
 
 func rotateEpoch() error {
-	dataDir := os.Getenv("OBSYNC_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-	dbPath := filepath.Join(dataDir, "sync.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return fmt.Errorf("database not found at %s (set OBSYNC_DATA_DIR): %w", dbPath, err)
-	}
-	database, err := db.Open(dbPath)
+	database, err := openExistingDB() // OBSYNC_DB=sqlite|postgres（批次 G）
 	if err != nil {
 		return err
 	}
@@ -125,12 +117,19 @@ func run() error {
 	}
 	os.Chmod(cfg.DataDir, 0o700) //nolint:errcheck // 已存在目录也收紧；Windows 上是 no-op
 	dbPath := filepath.Join(cfg.DataDir, "sync.db")
-	database, err := db.OpenWithSync(dbPath, cfg.DurabilityStrict)
+	// 批次 G：OBSYNC_DB=sqlite（默认，数据目录里的 sync.db）| postgres（OBSYNC_PG_DSN）
+	database, dbc, err := openDatabase(cfg.DataDir, cfg.DurabilityStrict)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer database.Close()
-	os.Chmod(dbPath, 0o600) //nolint:errcheck
+	logger.Info("metadata database", "driver", dbc.String())
+	if dbc.Warning != "" {
+		logger.Warn(dbc.Warning)
+	}
+	if !dbc.IsPostgres() {
+		os.Chmod(dbPath, 0o600) //nolint:errcheck
+	}
 
 	store, err := storage.New(filepath.Join(cfg.DataDir, "vaults", "default"))
 	if err != nil {

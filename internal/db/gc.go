@@ -21,13 +21,15 @@ CREATE TABLE IF NOT EXISTS gc_candidates (
 
 // MarkGCCandidate 记录「本轮认为这个 blob 无引用」，返回它累计被确认了几轮。
 // 返回 >= 2 时调用方才允许删除。
+// 右侧必须写成 gc_candidates.rounds：PG 里未限定的列名在 DO UPDATE SET 中有歧义
+// （既可指现有行也可指 excluded），会整句报错；限定写法两种库都接受。
 func MarkGCCandidate(q dbtx, blobID string, now int64) (int, error) {
 	if now == 0 {
 		now = time.Now().Unix()
 	}
 	if _, err := q.Exec(`
 		INSERT INTO gc_candidates (blob_id, first_seen_at, rounds) VALUES (?, ?, 1)
-		ON CONFLICT(blob_id) DO UPDATE SET rounds = rounds + 1`, blobID, now); err != nil {
+		ON CONFLICT(blob_id) DO UPDATE SET rounds = gc_candidates.rounds + 1`, blobID, now); err != nil {
 		return 0, err
 	}
 	var rounds int

@@ -121,6 +121,11 @@ func (m *Manager) saveStatusLocked() {
 		return
 	}
 	if err := db.SetMeta(m.db, statusMetaKey, string(raw), time.Now().Unix()); err != nil {
+		// CLI 的 SQLite 恢复会在恢复前关掉本进程的库句柄（数据目录要整体挪开）：此时没有
+		// 「当前库」可写，状态本来也只属于被挪走的旧库——不算错误，不吓唬运维
+		if strings.Contains(err.Error(), "database is closed") {
+			return
+		}
 		m.log.Warn("save backup status", "error", err)
 	}
 }

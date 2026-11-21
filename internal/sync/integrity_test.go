@@ -253,7 +253,12 @@ func TestScrubCleanRepository(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.DBCheck != "ok" {
+	// 健康库的页级自检结果：SQLite 是 "ok"；PG 上页级检查归数据库服务器，如实为「未执行」（批次 G）
+	wantDBCheck := "ok"
+	if db.IsPostgres(s.DB()) {
+		wantDBCheck = syncsvc.DBCheckNotRunPostgres
+	}
+	if rep.DBCheck != wantDBCheck {
 		t.Fatalf("integrity_check: %s", rep.DBCheck)
 	}
 	if rep.Issues != 0 {

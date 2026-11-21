@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // 服务端密钥（v0.16.0 / 计划书 §10.5、ADR-010 §7）。
@@ -51,8 +52,8 @@ func EnsureServerSecret(d *sql.DB, id string) ([]byte, error) {
 		return nil, fmt.Errorf("generate server secret: %w", err)
 	}
 	if _, err := d.Exec(
-		`INSERT INTO server_secrets (id, secret, created_at) VALUES (?, ?, strftime('%s','now'))
-		 ON CONFLICT(id) DO NOTHING`, id, fresh); err != nil {
+		`INSERT INTO server_secrets (id, secret, created_at) VALUES (?, ?, ?)
+		 ON CONFLICT(id) DO NOTHING`, id, fresh, time.Now().Unix()); err != nil {
 		return nil, err
 	}
 	// 回读：另一个进程抢先写入时用它写的那把，别用我们刚生成的
@@ -76,8 +77,8 @@ func RotateServerSecret(d *sql.DB, id string) error {
 		return err
 	}
 	_, err := d.Exec(
-		`INSERT INTO server_secrets (id, secret, created_at) VALUES (?, ?, strftime('%s','now'))
+		`INSERT INTO server_secrets (id, secret, created_at) VALUES (?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET secret = excluded.secret, created_at = excluded.created_at`,
-		id, fresh)
+		id, fresh, time.Now().Unix())
 	return err
 }

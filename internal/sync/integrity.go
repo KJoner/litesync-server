@@ -113,11 +113,14 @@ func (s *Service) Scrub(full bool) (*ScrubReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// SQLite 全量 integrity_check（quick_check 的严格版）
-	if err := s.db.QueryRow(`PRAGMA integrity_check`).Scan(&rep.DBCheck); err != nil {
+	// SQLite 全量 integrity_check（quick_check 的严格版）。
+	// 批次 G：PG 没有应用层可调用的等价物（页校验靠 data_checksums，索引校验靠 amcheck，
+	// 都是数据库服务器的职责）——如实写「未执行」，不冒充 ok，也不计为问题
+	if db.IsPostgres(s.db) {
+		rep.DBCheck = DBCheckNotRunPostgres
+	} else if err := s.db.QueryRow(`PRAGMA integrity_check`).Scan(&rep.DBCheck); err != nil {
 		return nil, err
-	}
-	if rep.DBCheck != "ok" {
+	} else if rep.DBCheck != "ok" {
 		rep.Issues++
 		rep.Details = append(rep.Details, "sqlite integrity_check: "+rep.DBCheck)
 		s.log.Error("scrub: sqlite integrity_check failed", "result", rep.DBCheck)

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/KJoner/litesync-server/internal/db"
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 // 端到端演练（v0.14.0-RC / 计划书 §8.8 门槛 5、6、9）。
@@ -136,7 +137,7 @@ func TestDrillIntegrityScanOnRealRepository(t *testing.T) {
 	report, _ := json.MarshalIndent(body, "", "  ")
 	t.Logf("integrity scan --full 输出：\n%s", report)
 
-	if body["dbCheck"] != "ok" {
+	if body["dbCheck"] != healthyDBCheck(e) {
 		t.Fatalf("SQLite integrity_check 未通过：%v", body["dbCheck"])
 	}
 	if issues, _ := body["issues"].(float64); issues != 0 {
@@ -199,7 +200,7 @@ func TestDrillMetadataMigration(t *testing.T) {
 		if r.StatusCode != http.StatusOK {
 			t.Fatalf("[%s] scan = %d", stage, r.StatusCode)
 		}
-		if scan["dbCheck"] != "ok" {
+		if scan["dbCheck"] != healthyDBCheck(e) {
 			t.Fatalf("[%s] DB 校验失败：%v", stage, scan["dbCheck"])
 		}
 		if issues, _ := scan["issues"].(float64); issues != 0 {
@@ -396,4 +397,13 @@ func TestDrillEpochRotationBlocksStaleClients(t *testing.T) {
 		!bytes.Equal(got, []byte("恢复点之前的内容")) {
 		t.Fatal("旋转 epoch 不得影响已有内容")
 	}
+}
+
+// healthyDBCheck：健康库的页级自检应有的结果。SQLite 是 "ok"；PG 上页级检查归数据库服务器，
+// 扫描如实报告「未执行」而不是冒充 ok（批次 G）。
+func healthyDBCheck(e *testEnv) string {
+	if db.IsPostgres(e.db) {
+		return syncsvc.DBCheckNotRunPostgres
+	}
+	return "ok"
 }
