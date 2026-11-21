@@ -32,21 +32,77 @@ type Device struct {
 	// 靠只有设备名的列表答不了。
 	Platform string
 	LastIP   string
+	// AuthEpoch（v0.20.1 / ADR-019 §2.2）：签发这台设备凭据时账号的授权代次。
+	// 账号代次前进（退出全部设备、停用、中心停用……）之后它就再也对不上，校验即失败——
+	// 判定发生在校验时，撤销与兑换并发也不会留下有效凭据。
+	AuthEpoch int64
 }
 
 const deviceColumns = `id, name, token_hash, scopes, created_at, last_seen_at, revoked,
-	signing_public_key, vault_id, user_id, client_version, client_protocol, platform, last_ip`
+	signing_public_key, vault_id, user_id, client_version, client_protocol, platform, last_ip, auth_epoch`
+
+// deviceColumnsD 同 deviceColumns，带表别名 d（与 users 联查时避免同名列歧义）。
+const deviceColumnsD = `d.id, d.name, d.token_hash, d.scopes, d.created_at, d.last_seen_at, d.revoked,
+	d.signing_public_key, d.vault_id, d.user_id, d.client_version, d.client_protocol, d.platform, d.last_ip, d.auth_epoch`
 
 func scanDevice(sc interface{ Scan(...any) error }) (*Device, error) {
 	d := &Device{}
 	var revoked int64
 	if err := sc.Scan(&d.DeviceID, &d.Name, &d.TokenHash, &d.Scopes, &d.CreatedAt,
 		&d.LastSeenAt, &revoked, &d.SigningPublicKey, &d.VaultID, &d.UserID,
-		&d.ClientVersion, &d.ClientProtocol, &d.Platform, &d.LastIP); err != nil {
+		&d.ClientVersion, &d.ClientProtocol, &d.Platform, &d.LastIP, &d.AuthEpoch); err != nil {
 		return nil, err
 	}
 	d.Revoked = revoked != 0
 	return d, nil
+}
+
+// DeviceAuth 是认证用的设备视图：设备行 + 其账号此刻的授权代次与停用状态。
+type DeviceAuth struct {
+	Device
+	UserExists   bool
+	UserDisabled bool
+	UserEpoch    int64
+}
+
+// Valid 是 ADR-019 R-1 的设备形态：未单独撤销 **且** 凭据代次 == 账号当前代次 **且** 账号未停用。
+//
+// 设备行指向的账号行不存在时按「代次 0、未停用」处理（v0.16 之前的单用户库里设备先于
+// 账号行存在；删除账号时 DeleteUserCascade 会连设备一起删掉，正常数据里不会出现孤儿设备）。
+// 这样任何被撤销过的账号（代次 ≥ 1）都不可能因为「查不到账号」而让旧设备复活。
+func (d *DeviceAuth) Valid() bool {
+	return !d.Revoked && !d.UserDisabled && d.AuthEpoch == d.UserEpoch
+}
+
+func scanDeviceAuth(row *sql.Row) (*DeviceAuth, error) {
+	var a DeviceAuth
+	var revoked, disabled, exists int64
+	err := row.Scan(&a.DeviceID, &a.Name, &a.TokenHash, &a.Scopes, &a.CreatedAt,
+		&a.LastSeenAt, &revoked, &a.SigningPublicKey, &a.VaultID, &a.UserID,
+		&a.ClientVersion, &a.ClientProtocol, &a.Platform, &a.LastIP, &a.Device.AuthEpoch,
+		&a.UserEpoch, &disabled, &exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.Revoked, a.UserDisabled, a.UserExists = revoked != 0, disabled != 0, exists != 0
+	return &a, nil
+}
+
+const deviceAuthSelect = `SELECT ` + deviceColumnsD + `,
+	COALESCE(u.auth_epoch, 0), COALESCE(u.disabled, 0), CASE WHEN u.user_id IS NULL THEN 0 ELSE 1 END
+	FROM devices d LEFT JOIN users u ON u.user_id = d.user_id`
+
+// GetDeviceAuthByTokenHash 按凭据哈希取设备与其账号状态（任何状态都返回；不存在返回 (nil, nil)）。
+func GetDeviceAuthByTokenHash(q dbtx, tokenHash string) (*DeviceAuth, error) {
+	return scanDeviceAuth(q.QueryRow(deviceAuthSelect+` WHERE d.token_hash = ?`, tokenHash))
+}
+
+// GetDeviceAuthByID 按设备 id 取设备与其账号状态（短期票每次回查用）。
+func GetDeviceAuthByID(q dbtx, deviceID string) (*DeviceAuth, error) {
+	return scanDeviceAuth(q.QueryRow(deviceAuthSelect+` WHERE d.id = ?`, deviceID))
 }
 
 // GetDeviceByID 按设备 id 查找；不存在返回 (nil, nil)。
@@ -73,10 +129,10 @@ func InsertDevice(q dbtx, d *Device) error {
 	// 是正确语义；多用户路径（v0.18 起）都会显式带上 (vault, user)。
 	// 没有这条绑定，「重置 Token / 移除成员时撤销他的设备」无从谈起。
 	_, err := q.Exec(
-		`INSERT INTO devices (id, name, token_hash, scopes, created_at, last_seen_at, revoked, vault_id, user_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO devices (id, name, token_hash, scopes, created_at, last_seen_at, revoked, vault_id, user_id, platform, auth_epoch)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.DeviceID, d.Name, d.TokenHash, d.Scopes, d.CreatedAt, d.LastSeenAt, revoked,
-		defaultIfEmpty(d.VaultID, DefaultVaultID), defaultIfEmpty(d.UserID, AdminUserID),
+		defaultIfEmpty(d.VaultID, DefaultVaultID), defaultIfEmpty(d.UserID, AdminUserID), d.Platform, d.AuthEpoch,
 	)
 	return err
 }
@@ -223,12 +279,16 @@ func TouchDevice(q dbtx, deviceID string, now int64) error {
 }
 
 // InsertEnrollment 保存一次性注册凭据（只存 hash）。
-func InsertEnrollment(q dbtx, id, secretHash, scopes string, now, expiresAt int64, vaultID, userID string) error {
+//
+// authEpoch 是**签发者凭据**的授权代次（ADR-019 §2.2）：用的是发起请求的那张会话 / 设备 /
+// Token 上记的代次，而不是此刻账号的代次——否则一个在「退出全部设备」之前通过校验的旧会话，
+// 可以在撤销提交之后插进来一张属于新代次的授权。
+func InsertEnrollment(q dbtx, id, secretHash, scopes string, now, expiresAt int64, vaultID, userID string, authEpoch int64) error {
 	_, err := q.Exec(
-		`INSERT INTO enrollments (id, secret_hash, scopes, created_at, expires_at, vault_id, user_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO enrollments (id, secret_hash, scopes, created_at, expires_at, vault_id, user_id, auth_epoch)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, secretHash, scopes, now, expiresAt,
-		defaultIfEmpty(vaultID, DefaultVaultID), defaultIfEmpty(userID, AdminUserID),
+		defaultIfEmpty(vaultID, DefaultVaultID), defaultIfEmpty(userID, AdminUserID), authEpoch,
 	)
 	return err
 }
@@ -239,18 +299,20 @@ type EnrollmentGrant struct {
 	Scopes  string
 	VaultID string
 	UserID  string
+	// AuthEpoch：签发时的账号授权代次；新设备继承它（ADR-019 §2.2）
+	AuthEpoch int64
 }
 
 // ConsumeEnrollment 原子消费注册凭据（一次性）：有效则标记 consumed 并返回授予内容。
-// 不存在 / 已消费 / 已过期返回 (nil, nil)。
-func ConsumeEnrollment(q dbtx, secretHash string, now int64) (*EnrollmentGrant, error) {
+// 不存在 / 已消费 / 已过期 / 已撤销 / 代次与 wantEpoch 不符返回 (nil, nil)。
+func ConsumeEnrollment(q dbtx, secretHash string, now, wantEpoch int64) (*EnrollmentGrant, error) {
 	g := &EnrollmentGrant{}
 	err := q.QueryRow(
 		`UPDATE enrollments SET consumed_at = ?
-		 WHERE secret_hash = ? AND consumed_at = 0 AND revoked = 0 AND expires_at > ?
-		 RETURNING scopes, vault_id, user_id`,
-		now, secretHash, now,
-	).Scan(&g.Scopes, &g.VaultID, &g.UserID)
+		 WHERE secret_hash = ? AND consumed_at = 0 AND revoked = 0 AND expires_at > ? AND auth_epoch = ?
+		 RETURNING scopes, vault_id, user_id, auth_epoch`,
+		now, secretHash, now, wantEpoch,
+	).Scan(&g.Scopes, &g.VaultID, &g.UserID, &g.AuthEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
 )
@@ -79,10 +80,6 @@ func runToken(args []string) error {
 	if err != nil {
 		return err
 	}
-	if vaultID == "" {
-		return fmt.Errorf("用户 %s 没有专属 Vault，数据不一致", user.UserID)
-	}
-	scope := db.ScopeFromAuth(vaultID)
 
 	var token string
 	if fromEnv {
@@ -101,23 +98,35 @@ func runToken(args []string) error {
 		token = db.TokenPrefix + hex.EncodeToString(raw)
 	}
 
+	eventID, err := db.NewEventID()
+	if err != nil {
+		return err
+	}
 	tx, err := database.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	// v0.20.1（ADR-019）：重置 = 退出本产品的全部设备 + 新 Token。授权代次 +1：名下全部仓库的
+	// 设备、未领取的连接链接、其他网页会话与旧 Token 一起失效；新 Token 属于新代次
+	out, err := db.RevokeAccountTx(tx, db.RevokeParams{
+		UserID: user.UserID, EventID: eventID, Scope: db.RevocationScopeProduct,
+		Reason: "token-reset", Origin: "cli", Now: time.Now().Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	revoked := out.RevokedDevices
 	gen, err := db.SetUserToken(tx, user.UserID, db.HashToken(token))
 	if err != nil {
 		return err
 	}
-	revoked, err := db.RevokeDevicesOfUser(tx, scope, user.UserID)
-	if err != nil {
-		return err
-	}
-	if err := db.AppendAudit(tx, scope, "cli:"+user.UserID, "token-reset",
-		fmt.Sprintf("user=%s devices=%d generation=%d via=cli fromEnv=%v",
-			user.UserID, revoked, gen, fromEnv)); err != nil {
-		return err
+	if vaultID != "" { // 零仓库账号没有可挂的审计链；撤销事件表里已有记录
+		if err := db.AppendAudit(tx, db.ScopeFromAuth(vaultID), "cli:"+user.UserID, "token-reset",
+			fmt.Sprintf("user=%s devices=%d grants=%d generation=%d authEpoch=%d via=cli fromEnv=%v",
+				user.UserID, revoked, out.RevokedGrants, gen, out.AuthEpoch, fromEnv)); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -128,7 +137,7 @@ func runToken(args []string) error {
 	} else {
 		fmt.Printf("新的 API Token（明文只显示这一次，服务器只存哈希）：\n\n  %s\n\n", token)
 	}
-	fmt.Printf("已撤销该用户 %d 台设备的凭据；其全部网页会话已作废。\n", revoked)
+	fmt.Printf("已撤销该用户 %d 台设备的凭据、%d 个未领取的连接链接；其全部网页会话已作废。\n", revoked, out.RevokedGrants)
 	fmt.Println("每台设备：在插件设置里填入新 Token → 点「测试连接」即可恢复同步。")
 	if !fromEnv && user.UserID == db.AdminUserID {
 		fmt.Println("提醒：.env 里的 OBSYNC_TOKEN 从现在起无效（以数据库为准）；建议同步更新它，避免日后困惑。")

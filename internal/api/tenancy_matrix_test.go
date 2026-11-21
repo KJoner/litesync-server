@@ -57,6 +57,12 @@ var publicRoutes = map[string]string{
 	"GET /api/v2/pairings/{id}/envelope":     "只返回密文（密钥在链接 #fragment）；不消费、按 IP 限流、无效一律 404",
 	"POST /api/v2/device-enrollments/redeem": "一次性 enrollment secret 即认证；按 IP 限流、失败减速",
 	"POST /hooks/mail/resend":                "邮件服务商回执：Svix HMAC 签名 + 时间戳窗口校验；未配置密钥时 404",
+	// v0.20.1 账号撤销（ADR-019）：动作 C 之后本产品的会话已全部失效，结果页只能凭 C 响应里的
+	// 一次性 statusToken（32B 随机，库里只存哈希，30 分钟）查看 / 重发**这一个**撤销事件；
+	// 它不授予任何读写，按 IP 限流，无效一律 404
+	"GET /api/v2/revocation-status/{eventId}":         "一次性 statusToken 即认证；只返回该撤销事件的状态（时间、产品、状态、错误类别），不含令牌",
+	"POST /api/v2/revocation-status/{eventId}/resend": "一次性 statusToken 即认证；只能重新投递该撤销事件（只会造成更多撤销，不授予任何权限）",
+	"POST /api/internal/v1/account-revocations":       "跨产品撤销事件：HMAC-SHA256 签名 + 5 分钟时间窗 + eventId 去重 + 单独限流；只能撤销不能授予；未配置共享密钥时 404",
 }
 
 // parseRoutes 从 router.go 抽出全部注册的路由。

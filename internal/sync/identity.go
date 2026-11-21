@@ -2,7 +2,6 @@ package sync
 
 import (
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/db"
@@ -174,22 +173,4 @@ func (s *Service) EndAllSessions(userID string) error {
 	defer s.mu.Unlock()
 	_, err := db.BumpSessionGeneration(s.db, userID)
 	return err
-}
-
-// LogoutEverywhere 「退出所有产品与设备」（需求 §3.2）：全部网页会话失效 +
-// 撤销该用户名下全部设备凭据（各仓库）。返回撤销的设备数。
-//
-// 这是有代价的：每台 Obsidian 都需要重新连接。界面在执行前必须讲清楚。
-func (s *Service) LogoutEverywhere(userID string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := db.BumpSessionGeneration(s.db, userID); err != nil {
-		return 0, err
-	}
-	n, err := db.RevokeAllDevicesOfUser(s.db, userID)
-	if err == nil {
-		s.log.Info("logout everywhere", "user", userID, "revokedDevices", n)
-		s.notify(userID, "logout-everywhere", map[string]string{"revokedDevices": fmt.Sprint(n)})
-	}
-	return n, err
 }

@@ -43,6 +43,9 @@ func (h *handlers) issueAccessToken(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, syncsvc.ErrAccessTokenInvalid):
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
+	case errors.Is(err, syncsvc.ErrDeviceRevoked):
+		writeDeviceRevoked(w)
+		return
 	case err != nil:
 		h.internalError(w, "issue access token", err)
 		return

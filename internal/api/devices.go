@@ -65,10 +65,12 @@ func (h *handlers) createDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	me := identityFrom(r)
 	var vaultID, userID string
+	var epoch int64
 	if me != nil {
-		vaultID, userID = me.VaultID, me.UserID
+		vaultID, userID, epoch = me.VaultID, me.UserID, me.AuthEpoch
 	}
-	cred, err := h.svc.CreateDevice(req.Name, vaultID, userID)
+	// 新设备记签发者（这张 API Token）的授权代次（ADR-019 §2.2）
+	cred, err := h.svc.CreateDeviceAt(req.Name, vaultID, userID, epoch)
 	if err != nil {
 		h.internalError(w, "device create", err)
 		return
@@ -85,11 +87,12 @@ func (h *handlers) createEnrollment(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) //nolint:errcheck // body 可为空
 	me := identityFrom(r)
 	var vaultID, userID, actorDevice string
+	var epoch int64
 	if me != nil {
-		vaultID, userID, actorDevice = me.VaultID, me.UserID, me.DeviceID
+		vaultID, userID, actorDevice, epoch = me.VaultID, me.UserID, me.DeviceID, me.AuthEpoch
 	}
-	id, secret, expiresAt, err := h.svc.CreateEnrollment(
-		time.Duration(req.TTLSeconds)*time.Second, vaultID, userID, actorDevice)
+	id, secret, expiresAt, err := h.svc.CreateEnrollmentAt(
+		time.Duration(req.TTLSeconds)*time.Second, vaultID, userID, actorDevice, epoch)
 	if err != nil {
 		h.internalError(w, "enrollment create", err)
 		return

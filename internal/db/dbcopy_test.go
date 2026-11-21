@@ -106,6 +106,7 @@ func fillColumns(t *testing.T, d *sql.DB, table string) []fillCol {
 var checkValues = map[string]string{
 	"status": "queued", "kind": "object", "stage": "pending", "encryption_state": "plaintext",
 	"meta_state": "plain", "object_state": "live", "action": "upsert", "role": "owner",
+	"delivery_state": "pending", // revocation_deliveries（ADR-019）
 }
 
 // fillGeneric 给每张表写 n 行按列类型合成的数据。

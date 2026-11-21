@@ -74,6 +74,10 @@ type AccessClaims struct {
 	Scopes    string `json:"s"` // 逗号分隔
 	IssuedAt  int64  `json:"i"`
 	ExpiresAt int64  `json:"e"`
+	// UserID / AuthEpoch：校验时从设备行回查填入（不进票据本身）——中心状态检查与
+	// 「签发者代次」需要它们（ADR-019）
+	UserID    string `json:"-"`
+	AuthEpoch int64  `json:"-"`
 }
 
 // HasScope 报告这张票是否带某个权限。
@@ -90,14 +94,18 @@ func (c *AccessClaims) HasScope(scope string) bool {
 //
 // requested 为空表示「沿用设备自己的全部 scope」；否则必须是设备 scope 的子集。
 func (s *Service) IssueAccessToken(deviceID string, requested []string, ttl time.Duration) (string, *AccessClaims, error) {
-	dev, err := db.GetDeviceByID(s.db, deviceID)
+	a, err := db.GetDeviceAuthByID(s.db, deviceID)
 	if err != nil {
 		return "", nil, err
 	}
-	if dev == nil || dev.Revoked {
-		// 已撤销的设备换不到票。这是撤销生效的第一道闸
+	if a == nil {
 		return "", nil, ErrAccessTokenInvalid
 	}
+	if !a.Valid() {
+		// 已撤销（单独撤销或账号授权代次已前进）的设备换不到票。这是撤销生效的第一道闸
+		return "", nil, ErrDeviceRevoked
+	}
+	dev := &a.Device
 
 	granted := dev.Scopes
 	if len(requested) > 0 {
@@ -129,6 +137,8 @@ func (s *Service) IssueAccessToken(deviceID string, requested []string, ttl time
 		Scopes:    granted,
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(ttl).Unix(),
+		UserID:    dev.UserID,
+		AuthEpoch: dev.AuthEpoch,
 	}
 
 	secret, err := s.tokenSigningSecret()
@@ -177,16 +187,20 @@ func (s *Service) VerifyAccessToken(token string) (*AccessClaims, error) {
 		return nil, ErrAccessTokenExpired
 	}
 
-	// 撤销即时生效：设备没了/被撤销，在途的票立刻作废
-	dev, err := db.GetDeviceByID(s.db, claims.DeviceID)
+	// 撤销即时生效：设备没了/被撤销/账号授权代次已前进，在途的票立刻作废（ADR-019 R-1）
+	a, err := db.GetDeviceAuthByID(s.db, claims.DeviceID)
 	if err != nil {
 		return nil, err
 	}
-	if dev == nil || dev.Revoked {
+	if a == nil {
 		return nil, ErrAccessTokenInvalid
 	}
+	if !a.Valid() {
+		return nil, ErrDeviceRevoked
+	}
 	// 设备 scope 事后被收窄的话，票也跟着收窄——票不能比签发它的凭据更大
-	claims.Scopes = intersectScopes(claims.Scopes, dev.Scopes)
+	claims.Scopes = intersectScopes(claims.Scopes, a.Scopes)
+	claims.UserID, claims.AuthEpoch = a.UserID, a.Device.AuthEpoch
 	return claims, nil
 }
 

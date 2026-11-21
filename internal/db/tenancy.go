@@ -93,7 +93,19 @@ type User struct {
 	IsAdmin         bool
 	Disabled        bool
 	LastSeenAt      int64
+	// AuthEpoch（v0.20.1 / ADR-019 §2.2）：账号授权代次，只增不减。网页会话、设备凭据、
+	// 待领取授权与 API Token 在签发时记下它，每次校验都要求「凭据代次 == 账号当前代次」。
+	// 动作 B / C / D、管理员停用、Token 重置在一个事务里把它 +1。
+	AuthEpoch int64
+	// TokenAuthEpoch：当前 API Token 签发时的账号代次（≠ AuthEpoch 即视为已撤销）。
+	TokenAuthEpoch int64
+	// CentralCheckedAt：最近一次确认「身份中心里这个账号仍然启用」的时刻（Unix 秒；
+	// 中心状态检查成功、统一登录成功、会话刷新成功都算）。0 = 从未确认。
+	CentralCheckedAt int64
 }
+
+// TokenValid 报告 API Token 是否仍属于当前授权代次（ADR-019 R-1）。
+func (u *User) TokenValid() bool { return u.TokenAuthEpoch == u.AuthEpoch }
 
 // Vault 是一个独立的同步仓库。
 //

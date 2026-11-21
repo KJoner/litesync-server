@@ -55,6 +55,10 @@ type handlers struct {
 	publicLimiter *ipLimiter
 	// limiter：已认证请求的按身份限流 + 上传并发（需求 §12）
 	limiter *identityLimiter
+	// central：动作 D 的中心状态检查（ADR-019 §2.5；未配置只读服务账号时为 nil）
+	central *centralChecker
+	// internalLimiter：跨产品撤销接收端的按 IP 限流（ADR-019 §2.4「单独限流」）
+	internalLimiter *ipLimiter
 }
 
 // New 构建完整的 HTTP handler。
@@ -62,7 +66,9 @@ type handlers struct {
 func New(opts Options, svc *syncsvc.Service) http.Handler {
 	h := &handlers{svc: svc, opts: opts, web: newSessionStore(), trusted: parseTrustedProxies(opts.TrustedProxies)}
 	h.rp = newOIDCRP(opts.OIDC, svc)
+	h.central = newCentralChecker(h.rp, svc, opts.Logger)
 	h.publicLimiter = newIPLimiter(30, time.Minute)
+	h.internalLimiter = newIPLimiter(120, time.Minute)
 	h.limiter = newIdentityLimiter(opts.RatePerUserPerMin, opts.UploadConcurrencyPerUser)
 
 	// v0.18 启动对账：管理员账号与 Token 哈希落库（幂等）。
@@ -201,7 +207,16 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("POST /auth/logout", h.oidcLogout)
 	mux.HandleFunc("POST /auth/backchannel-logout", h.backchannelLogout)
 	mux.HandleFunc("GET /api/v2/me", h.me)
+	// 账号撤销的三种范围（ADR-019）：A = /auth/logout；B / C 与撤销事件的查看、重新发送
+	mux.HandleFunc("POST /api/v2/account/logout-devices", h.logoutDevices)
 	mux.HandleFunc("POST /api/v2/account/logout-all", h.logoutAll)
+	mux.HandleFunc("GET /api/v2/account/revocations", h.accountRevocations)
+	mux.HandleFunc("POST /api/v2/account/revocations/{eventId}/retry", h.retryRevocation)
+	// C 之后会话已全部失效：结果页凭一次性 statusToken 查看 / 重发这一个事件（公开路径，按 IP 限流）
+	mux.HandleFunc("GET /api/v2/revocation-status/{eventId}", h.revocationStatus)
+	mux.HandleFunc("POST /api/v2/revocation-status/{eventId}/resend", h.revocationStatusResend)
+	// 产品之间的撤销事件接收端（ADR-019 §2.4；HMAC 签名即认证，单独限流，未配置时 404）
+	mux.HandleFunc("POST /api/internal/v1/account-revocations", h.peerRevocationInbound)
 	mux.HandleFunc("GET /api/v2/devices", h.accountDevices)
 	mux.HandleFunc("DELETE /api/v2/devices/{id}", h.accountRevokeDevice)
 

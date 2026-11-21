@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	gosync "sync"
 	"time"
+
+	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
 
 // Web 会话（v4）：浏览器不再持有根 API Token。
@@ -41,6 +44,8 @@ type sessionInfo struct {
 	vaultID string
 	// tokenGeneration：创建会话时的用户 Token 世代
 	tokenGeneration int64
+	// authEpoch：创建会话时的账号授权代次（ADR-019）；B / C / D / 停用之后对不上即失效
+	authEpoch int64
 	// oidc：统一登录建立的会话才有（v0.20 / ADR-011）——复核状态与 back-channel
 	// logout 的 sid。指针共享，自带锁；API Token 网页登录的会话为 nil。
 	oidc *oidcSessionState
@@ -119,10 +124,10 @@ func (s *sessionStore) revokeWhere(match func(sessionInfo) bool) int {
 	return n
 }
 
-// adoptGeneration 把请求携带的会话迁移到新的 Token 世代。
-// 重置 Token 的世代 +1 会作废该用户全部会话；唯独**发起重置的这一个**要活下来，
+// adoptGeneration 把请求携带的会话迁移到新的 Token 世代与授权代次。
+// 重置 Token 会作废该用户全部会话（世代 +1、代次 +1）；唯独**发起重置的这一个**要活下来，
 // 否则新 Token 还没来得及展示，页面就被登出了。
-func (s *sessionStore) adoptGeneration(r *http.Request, userID string, generation int64) {
+func (s *sessionStore) adoptGeneration(r *http.Request, userID string, generation, authEpoch int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, name := range []string{sessionCookieName, adminCookieName} {
@@ -132,6 +137,7 @@ func (s *sessionStore) adoptGeneration(r *http.Request, userID string, generatio
 		}
 		if info, ok := s.sessions[c.Value]; ok && info.userID == userID {
 			info.tokenGeneration = generation
+			info.authEpoch = authEpoch
 			s.sessions[c.Value] = info
 		}
 	}
@@ -260,6 +266,11 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := h.svc.AuthUserByToken(strings.TrimSpace(req.Token))
+	if errors.Is(err, syncsvc.ErrTokenRevoked) {
+		time.Sleep(300 * time.Millisecond)
+		writeAPITokenRevoked(w)
+		return
+	}
 	if err != nil {
 		h.internalError(w, "session login", err)
 		return
@@ -285,7 +296,7 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	base := sessionInfo{
 		userID: u.UserID, name: u.Name, isAdmin: u.IsAdmin, vaultID: vaultID,
-		tokenGeneration: u.TokenGeneration, authTime: time.Now(),
+		tokenGeneration: u.TokenGeneration, authEpoch: u.AuthEpoch, authTime: time.Now(),
 	}
 	h.setSessionCookie(w, r, sessionCookieName, h.web.create(base), int(sessionTTL.Seconds()))
 	if req.Admin {
@@ -349,7 +360,12 @@ func webSessionAllowed(r *http.Request) bool {
 	switch {
 	case r.Method == http.MethodGet && (r.URL.Path == "/api/v2/me" || r.URL.Path == "/api/v2/devices"):
 		return true
-	case r.Method == http.MethodPost && r.URL.Path == "/api/v2/account/logout-all":
+	// 账号撤销的 B / C 与「最近的撤销」（ADR-019）
+	case r.Method == http.MethodPost && (r.URL.Path == "/api/v2/account/logout-all" || r.URL.Path == "/api/v2/account/logout-devices"):
+		return true
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v2/account/revocations":
+		return true
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v2/account/revocations/") && strings.HasSuffix(r.URL.Path, "/retry"):
 		return true
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v2/devices/"):
 		return true

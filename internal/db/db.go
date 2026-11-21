@@ -77,7 +77,8 @@ func openSQLite(path string, syncFull bool) (*sql.DB, error) {
 // allSchema 是全部表的 DDL（SQLite 方言；PG 下由驱动层映射类型，见 pgdriver.go）。
 func allSchema() string {
 	return schema + integritySchema + gcSchema + checkpointSchema + tenancySchema + serverSecretsSchema +
-		vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema + mailSchema
+		vaultRetentionSchema + invitesSchema + identitySchema + vaultInitSchema + mailSchema +
+		revocationSchema
 }
 
 // initSchema 建表并执行全部幂等迁移（SQLite 与 PostgreSQL 共用同一条路径）。
@@ -210,6 +211,14 @@ func migrateColumns(d *sql.DB) error {
 		// 用户级配额覆盖值（需求 §12）：0 = 跟随服务器默认，-1 = 不限，>0 = 指定值
 		{"users", "quota_bytes", `ALTER TABLE users ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0`, false},
 		{"users", "quota_vaults", `ALTER TABLE users ADD COLUMN quota_vaults INTEGER NOT NULL DEFAULT 0`, false},
+
+		// --- v0.20.1 账号撤销（ADR-019 §2.2 / §7：纯新增，默认 0）---
+		// 存量账号与凭据都是 0，升级后全部仍然有效；只有 B / C / D / 停用 / Token 重置会让代次前进。
+		{"users", "auth_epoch", `ALTER TABLE users ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`, false},
+		{"users", "token_auth_epoch", `ALTER TABLE users ADD COLUMN token_auth_epoch INTEGER NOT NULL DEFAULT 0`, false},
+		{"users", "central_checked_at", `ALTER TABLE users ADD COLUMN central_checked_at INTEGER NOT NULL DEFAULT 0`, false},
+		{"devices", "auth_epoch", `ALTER TABLE devices ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`, false},
+		{"enrollments", "auth_epoch", `ALTER TABLE enrollments ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`, false},
 	}
 
 	for _, m := range migrations {

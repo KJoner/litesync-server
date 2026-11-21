@@ -211,9 +211,13 @@ func RegisterInvitedUser(d *sql.DB, inviteSecret, name string, now int64) (*NewU
 	return reg, nil
 }
 
-// SetUserDisabledCascade 禁用/解禁用户（v11 设计 §5.7）。
-// 禁用在同一事务里完成三件事：置禁用位、撤销全部设备、会话世代 +1；
-// 数据全部保留，解禁后用户重新接入即可。返回撤销的设备数。
+// SetUserDisabledCascade 禁用/解禁用户（v11 设计 §5.7；v0.20.1 起停用 = 动作 B，ADR-019 §2.1）。
+//
+// 停用在同一事务里完成：置禁用位 + 授权代次 +1（全部网页会话、设备凭据、待领取授权与
+// API Token 一起失效，记一条 reason=admin-disable 的撤销事件）。数据全部保留。
+// 重新启用**只**清禁用位：代次只增不减，任何旧凭据都不会复活（R-2）——用户重新登录、
+// 重新连接设备；只用 API Token 的旧账号需要 `obsync token reset --user <名>` 换发新 Token。
+// 返回撤销的设备数。
 func SetUserDisabledCascade(d *sql.DB, userID string, disabled bool, actor string) (int, error) {
 	u, err := GetUser(d, userID)
 	if err != nil {
@@ -238,17 +242,28 @@ func SetUserDisabledCascade(d *sql.DB, userID string, disabled bool, actor strin
 		return 0, err
 	}
 	revoked := 0
-	if disabled && vaultID != "" {
-		scope := VaultScope{vaultID: vaultID}
-		if revoked, err = RevokeDevicesOfUser(tx, scope, userID); err != nil {
+	if disabled {
+		eventID, err := NewEventID()
+		if err != nil {
 			return 0, err
 		}
-		// 会话世代 +1（token_hash 原样写回）：已登录的网页会话立即失效
-		if _, err := SetUserToken(tx, userID, u.TokenHash); err != nil {
+		out, err := RevokeAccountTx(tx, RevokeParams{
+			UserID: userID, EventID: eventID, Scope: RevocationScopeProduct,
+			Reason: "admin-disable", Origin: "litesync", Now: time.Now().Unix(),
+		})
+		if err != nil {
 			return 0, err
 		}
-		if err := AppendAudit(tx, scope, actor, "user-disabled",
-			fmt.Sprintf("user=%s devices=%d", userID, revoked)); err != nil {
+		revoked = out.RevokedDevices
+		if vaultID != "" {
+			if err := AppendAudit(tx, VaultScope{vaultID: vaultID}, actor, "user-disabled",
+				fmt.Sprintf("user=%s devices=%d grants=%d authEpoch=%d", userID, revoked, out.RevokedGrants, out.AuthEpoch)); err != nil {
+				return 0, err
+			}
+		}
+	} else if vaultID != "" {
+		if err := AppendAudit(tx, VaultScope{vaultID: vaultID}, actor, "user-enabled",
+			fmt.Sprintf("user=%s (old credentials stay revoked)", userID)); err != nil {
 			return 0, err
 		}
 	}

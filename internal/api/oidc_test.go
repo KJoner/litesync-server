@@ -47,6 +47,29 @@ type pendingCode struct {
 	claims                                       map[string]any
 }
 
+// mockAccess 是模拟身份服务签发的一张 access token（不透明字符串 → 归属与权限）。
+type mockAccess struct {
+	sub     string
+	service bool // client credentials 签发的服务账号令牌
+	// manageAccount：用户令牌带 aud=account 与 account/manage-account（Keycloak：client 的作用域映射里
+	// 加了 account/manage-account 才会有，fullScopeAllowed=false）
+	manageAccount bool
+	// viewUsers：服务账号令牌带 realm-management/view-users（服务账号授予 + client 作用域映射都要有）
+	viewUsers bool
+}
+
+// mockUser 是模拟身份服务里一个用户的状态（管理端查询 / 停用 / 删除）。
+type mockUser struct {
+	disabled bool
+	deleted  bool
+}
+
+const (
+	mockRealm          = "test"
+	testStatusClientID = "litesync-status"
+	testStatusSecret   = "status-client-secret-not-real"
+)
+
 type mockIdP struct {
 	t      *testing.T
 	srv    *httptest.Server
@@ -55,9 +78,27 @@ type mockIdP struct {
 	mu     gosync.Mutex
 	codes  map[string]*pendingCode
 	rts    map[string]string // refresh token → sub
+	ats    map[string]mockAccess
+	users  map[string]*mockUser
+	sids   map[string][]string // sub → 这个主体的 SSO 会话 sid（每次登录一个）
 	issuer string
 	// 篡改钩子：在签发 ID Token 前修改 claims（返回 false 表示用错误的密钥签名）
 	tamper func(claims map[string]any) (sameKey bool)
+
+	// ---- ADR-019：Account REST API 与只读管理端查询（行为按 Keycloak 26.8.1 实测建模） ----
+	// userTokensLackManageAccount：client 没有 account/manage-account 作用域映射 → Account API 403
+	userTokensLackManageAccount bool
+	// serviceLacksViewUsers：服务账号没有 view-users（或没进作用域映射）→ 管理端查询 403
+	serviceLacksViewUsers bool
+	// adminDown：管理端接口不可达（503）；adminDelay：每次查询前等待（模拟超时）
+	adminDown  bool
+	adminDelay time.Duration
+	adminCalls int
+	// sessionsEnded：每个主体被 DELETE /account/sessions 结束过几次
+	sessionsEnded map[string]int
+	// backchannelURL：非空时，结束会话后像 Keycloak 一样对每个会话向依赖方发 back-channel logout
+	backchannelURL  string
+	backchannelSent []int // 每次回调的 HTTP 状态
 }
 
 func newMockIdP(t *testing.T) *mockIdP {
@@ -66,9 +107,12 @@ func newMockIdP(t *testing.T) *mockIdP {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &mockIdP{t: t, key: key, kid: "test-kid", codes: map[string]*pendingCode{}, rts: map[string]string{}}
+	m := &mockIdP{t: t, key: key, kid: "test-kid", codes: map[string]*pendingCode{}, rts: map[string]string{},
+		ats: map[string]mockAccess{}, users: map[string]*mockUser{}, sids: map[string][]string{},
+		sessionsEnded: map[string]int{}}
+	realm := "/realms/" + mockRealm
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET "+realm+"/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
 			"issuer":                                m.issuer,
 			"authorization_endpoint":                m.issuer + "/authorize",
@@ -80,13 +124,15 @@ func newMockIdP(t *testing.T) *mockIdP {
 			"subject_types_supported":               []string{"public"},
 		})
 	})
-	mux.HandleFunc("GET /jwks", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET "+realm+"/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &m.key.PublicKey, KeyID: m.kid, Algorithm: "RS256", Use: "sig"}}}
 		json.NewEncoder(w).Encode(set) //nolint:errcheck
 	})
-	mux.HandleFunc("POST /token", m.token)
+	mux.HandleFunc("POST "+realm+"/token", m.token)
+	mux.HandleFunc("DELETE "+realm+"/account/sessions", m.accountDeleteSessions)
+	mux.HandleFunc("GET /admin"+realm+"/users/{id}", m.adminGetUser)
 	m.srv = httptest.NewServer(mux)
-	m.issuer = m.srv.URL
+	m.issuer = m.srv.URL + realm
 	t.Cleanup(m.srv.Close)
 	return m
 }
@@ -130,6 +176,18 @@ func oauthErr(w http.ResponseWriter, code string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": code}) //nolint:errcheck
 }
 
+// userGoneLocked：停用或删除的用户不能再换令牌（Keycloak 同样拒绝 refresh）。
+func (m *mockIdP) userGoneLocked(sub string) bool {
+	u := m.users[sub]
+	return u != nil && (u.disabled || u.deleted)
+}
+
+func (m *mockIdP) issueAccessLocked(a mockAccess) string {
+	at := "at-" + hex.EncodeToString(randBytes(12))
+	m.ats[at] = a
+	return at
+}
+
 func (m *mockIdP) token(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		oauthErr(w, "invalid_request")
@@ -139,13 +197,22 @@ func (m *mockIdP) token(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		id, secret = r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json") // 真实身份服务都会带；缺了它 oauth2 会按表单解析
+	if r.PostForm.Get("grant_type") == "client_credentials" {
+		if id != testStatusClientID || secret != testStatusSecret {
+			oauthErr(w, "invalid_client")
+			return
+		}
+		at := m.issueAccessLocked(mockAccess{service: true, viewUsers: !m.serviceLacksViewUsers})
+		json.NewEncoder(w).Encode(map[string]any{"access_token": at, "token_type": "Bearer", "expires_in": 300}) //nolint:errcheck
+		return
+	}
 	if id != testClientID || secret != testClientSecret {
 		oauthErr(w, "invalid_client")
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	w.Header().Set("Content-Type", "application/json") // 真实身份服务都会带；缺了它 oauth2 会按表单解析
 	switch r.PostForm.Get("grant_type") {
 	case "authorization_code":
 		pc := m.codes[r.PostForm.Get("code")]
@@ -169,15 +236,25 @@ func (m *mockIdP) token(w http.ResponseWriter, r *http.Request) {
 		if m.tamper != nil {
 			sameKey = m.tamper(claims)
 		}
+		if sid, _ := claims["sid"].(string); sid != "" {
+			known := false
+			for _, s := range m.sids[pc.sub] {
+				known = known || s == sid
+			}
+			if !known {
+				m.sids[pc.sub] = append(m.sids[pc.sub], sid)
+			}
+		}
 		rt := "rt-" + hex.EncodeToString(randBytes(16))
 		m.rts[rt] = pc.sub
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"access_token": "at-" + hex.EncodeToString(randBytes(8)), "token_type": "Bearer", "expires_in": 300,
+			"access_token": m.issueAccessLocked(mockAccess{sub: pc.sub, manageAccount: !m.userTokensLackManageAccount}),
+			"token_type":   "Bearer", "expires_in": 300,
 			"refresh_token": rt, "id_token": m.sign(claims, !sameKey),
 		})
 	case "refresh_token":
 		sub, ok := m.rts[r.PostForm.Get("refresh_token")]
-		if !ok {
+		if !ok || m.userGoneLocked(sub) {
 			oauthErr(w, "invalid_grant")
 			return
 		}
@@ -187,12 +264,113 @@ func (m *mockIdP) token(w http.ResponseWriter, r *http.Request) {
 		claims := m.baseClaims(sub, "")
 		delete(claims, "nonce")
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"access_token": "at-" + hex.EncodeToString(randBytes(8)), "token_type": "Bearer", "expires_in": 300,
+			"access_token": m.issueAccessLocked(mockAccess{sub: sub, manageAccount: !m.userTokensLackManageAccount}),
+			"token_type":   "Bearer", "expires_in": 300,
 			"refresh_token": rt, "id_token": m.sign(claims, false),
 		})
 	default:
 		oauthErr(w, "unsupported_grant_type")
 	}
+}
+
+func (m *mockIdP) bearer(r *http.Request) (mockAccess, bool) {
+	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.ats[tok]
+	return a, ok
+}
+
+// accountDeleteSessions 模拟 Keycloak Account REST API `DELETE /realms/{realm}/account/sessions?current=true`
+//（26.8.1 实测：用户本人令牌 + manage-account → 204；该用户全部会话结束，refresh 一律 invalid_grant，
+// 并对每个会话向依赖方发 back-channel logout，logout token 带 sid、没有设备语义）。
+func (m *mockIdP) accountDeleteSessions(w http.ResponseWriter, r *http.Request) {
+	a, ok := m.bearer(r)
+	switch {
+	case !ok:
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	case a.service || !a.manageAccount:
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	m.mu.Lock()
+	for rt, s := range m.rts {
+		if s == a.sub {
+			delete(m.rts, rt)
+		}
+	}
+	m.sessionsEnded[a.sub]++
+	sids := append([]string(nil), m.sids[a.sub]...)
+	delete(m.sids, a.sub)
+	target := m.backchannelURL
+	m.mu.Unlock()
+	if target != "" {
+		for _, sid := range sids {
+			now := time.Now()
+			tok := m.sign(map[string]any{
+				"iss": m.issuer, "aud": testClientID, "sub": a.sub, "sid": sid, "typ": "Logout",
+				"iat": now.Unix(), "exp": now.Add(2 * time.Minute).Unix(), "jti": hex.EncodeToString(randBytes(8)),
+				"events": map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}},
+			}, false)
+			resp, err := http.PostForm(target, url.Values{"logout_token": {tok}})
+			code := 0
+			if err == nil {
+				code = resp.StatusCode
+				resp.Body.Close()
+			}
+			m.mu.Lock()
+			m.backchannelSent = append(m.backchannelSent, code)
+			m.mu.Unlock()
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// adminGetUser 模拟 `GET /admin/realms/{realm}/users/{sub}`（只读服务账号；启用 200 enabled:true、
+// 停用 enabled:false、删除 404；令牌缺 view-users → 403——那是配置错误，不是用户被停用）。
+func (m *mockIdP) adminGetUser(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	m.adminCalls++
+	delay, down := m.adminDelay, m.adminDown
+	m.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+	}
+	if down {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	a, ok := m.bearer(r)
+	switch {
+	case !ok:
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	case !a.service || !a.viewUsers:
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	sub := r.PathValue("id")
+	m.mu.Lock()
+	u := m.users[sub]
+	m.mu.Unlock()
+	if u != nil && u.deleted {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"id": sub, "username": sub, "enabled": u == nil || !u.disabled}) //nolint:errcheck
+}
+
+// setUser 在身份中心里停用 / 恢复 / 删除一个用户（管理员操作的模拟）。
+func (m *mockIdP) setUser(sub string, disabled, deleted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.users[sub] = &mockUser{disabled: disabled, deleted: deleted}
 }
 
 // revokeAll 撤销某主体的全部 refresh token（模拟账号冻结 / 在身份服务里退出全部）。
@@ -254,6 +432,12 @@ type oidcEnv struct {
 }
 
 func newOIDCEnv(t *testing.T, mode string, legacy bool) *oidcEnv {
+	return newOIDCEnvWith(t, mode, legacy, nil)
+}
+
+// newOIDCEnvWith 允许测试调整 api.Options（中心状态检查的服务账号等）；svcSetup 在服务启动前执行
+//（例如配置跨产品撤销）。
+func newOIDCEnvWith(t *testing.T, mode string, legacy bool, tweak func(o *api.Options, svc *syncsvc.Service)) *oidcEnv {
 	t.Helper()
 	idp := newMockIdP(t)
 	dir := t.TempDir()
@@ -270,14 +454,18 @@ func newOIDCEnv(t *testing.T, mode string, legacy bool) *oidcEnv {
 
 	ts := httptest.NewUnstartedServer(nil)
 	publicURL := "http://" + ts.Listener.Addr().String()
-	ts.Config.Handler = api.New(api.Options{
+	opts := api.Options{
 		Token: testToken, MaxFileSize: 1 << 20, Version: "test", Logger: logger,
 		OIDC: api.OIDCOptions{
 			Issuer: idp.issuer, ClientID: testClientID, ClientSecret: testClientSecret,
 			PublicURL: publicURL, RegistrationMode: mode, HTTPClient: idp.srv.Client(),
 		},
 		LegacyTokenLogin: legacy,
-	}, svc)
+	}
+	if tweak != nil {
+		tweak(&opts, svc)
+	}
+	ts.Config.Handler = api.New(opts, svc)
 	ts.Start()
 	t.Cleanup(ts.Close)
 	return &oidcEnv{testEnv: &testEnv{ts: ts, svc: svc, db: database}, idp: idp}
@@ -586,11 +774,13 @@ func TestOIDCRevalidationAndLogoutAll(t *testing.T) {
 		t.Fatalf("cross-origin logout-all = %d, want 403", resp.StatusCode)
 	}
 	resp, body := c.send(http.MethodPost, "/api/v2/account/logout-all", e.ts.URL, nil)
-	if resp.StatusCode != http.StatusOK || body["revokedDevices"].(float64) != 1 {
+	local, _ := body["local"].(map[string]any)
+	if resp.StatusCode != http.StatusOK || local == nil || local["revokedDevices"].(float64) != 1 {
 		t.Fatalf("logout-all = %d %v", resp.StatusCode, body)
 	}
-	if es, _ := body["endSessionUrl"].(string); !strings.HasPrefix(es, e.idp.issuer+"/logout?") {
-		t.Fatalf("logout-all must hand back the IdP end-session URL, got %q", es)
+	// 动作 C 的身份中心一步真的执行了（模拟身份服务的 Account REST API），且如实报告
+	if ic, _ := body["identityCenter"].(map[string]any); ic == nil || ic["state"] != "done" {
+		t.Fatalf("identity-center step must report its real state, got %v", body)
 	}
 	if code := whoamiStatus(t, e.testEnv, cred.Token); code != http.StatusUnauthorized {
 		t.Fatalf("device after logout-all whoami = %d, want 401", code)

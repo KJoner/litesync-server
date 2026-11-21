@@ -2,6 +2,7 @@ package sync
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -25,7 +26,9 @@ import (
 type TokenResetResult struct {
 	Token             string
 	RevokedDevices    int
+	RevokedGrants     int
 	Generation        int64
+	AuthEpoch         int64
 	ResetAuthEnforced bool
 }
 
@@ -62,12 +65,21 @@ func (s *Service) EnsureAdminAccount(envToken string) (db.AdminTokenReconcile, e
 		s.log.Warn("OBSYNC_TOKEN has been superseded by a rotated admin token; " +
 			"the environment variable is currently ignored " +
 			"(run `obsync token reset --from-env` to force it back)")
+	case db.AdminTokenRevoked:
+		s.log.Warn("管理员 API Token（OBSYNC_TOKEN）已随「退出本产品的全部设备」等操作作废，重启不会让它恢复；" +
+			"需要继续使用时运行 `obsync token reset --from-env`（或 `obsync token reset` 换一个新的）")
 	}
 	return rec, nil
 }
 
+// ErrTokenRevoked：API Token 曾有效、已随账号授权代次前进而作废（退出本产品的全部设备、
+// 管理员停用、中心停用……，ADR-019 R-1）。与「查无此 Token」分开告知，客户端才能给出
+// 「重新登录后重置 API Token，或在服务器上运行 obsync token reset」的指引。
+var ErrTokenRevoked = errors.New("api token has been revoked")
+
 // AuthUserByToken 校验用户 Token；有效则返回用户并节流更新最近活动时间。
-// 无效、已禁用一律返回 (nil, nil)——同响应，不泄露账号状态。
+// 无效、已禁用一律返回 (nil, nil)——同响应，不泄露账号状态；授权代次已前进的
+// 返回 ErrTokenRevoked。
 func (s *Service) AuthUserByToken(token string) (*db.User, error) {
 	if token == "" {
 		return nil, nil
@@ -80,6 +92,9 @@ func (s *Service) AuthUserByToken(token string) (*db.User, error) {
 	}
 	if u.Disabled {
 		return nil, nil
+	}
+	if !u.TokenValid() {
+		return nil, ErrTokenRevoked
 	}
 	now := time.Now().Unix()
 	if now-u.LastSeenAt > 300 {
@@ -111,6 +126,13 @@ func (s *Service) UserTokenGeneration(userID string) (int64, error) {
 		return 0, nil
 	}
 	return u.TokenGeneration, nil
+}
+
+// UserSessionState 返回网页会话每次校验要比较的账号状态（会话世代 + 授权代次 + 停用位）。
+func (s *Service) UserSessionState(userID string) (db.SessionState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return db.UserSessionState(s.db, userID)
 }
 
 // ResetUserToken 轮换用户的 API Token（v11 设计 §3.4 的作废矩阵）。
@@ -145,37 +167,47 @@ func (s *Service) ResetUserToken(scope db.VaultScope, targetUserID, submittedRes
 	}
 	token = db.TokenPrefix + token
 
+	eventID, err := db.NewEventID()
+	if err != nil {
+		return nil, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	gen, err := db.SetUserToken(tx, targetUserID, db.HashToken(token))
+	// v0.20.1（ADR-019）：重置 = 动作 B + 新 Token。授权代次 +1 让全部设备、待领取授权、
+	// 旧 API Token 与其他网页会话一起失效（以前只撤销已有设备，未领取的连接链接仍能换出设备）
+	out, err := db.RevokeAccountTx(tx, db.RevokeParams{
+		UserID: targetUserID, EventID: eventID, Scope: db.RevocationScopeProduct,
+		Reason: "token-reset", Origin: "litesync", Now: time.Now().Unix(),
+	})
 	if err != nil {
 		return nil, err
 	}
-	// v0.19：撤销范围按「人」——名下所有仓库的所有设备（Token 属于人）
-	revoked, err := db.RevokeAllDevicesOfUser(tx, targetUserID)
+	// 新 Token 属于新代次（SetUserToken 同时把会话世代 +1）
+	gen, err := db.SetUserToken(tx, targetUserID, db.HashToken(token))
 	if err != nil {
 		return nil, err
 	}
 	// 审计只记身份与动作；绝不记 Token 本身或它的哈希
 	if err := db.AppendAudit(tx, scope, actor, "token-reset",
-		fmt.Sprintf("user=%s devices=%d generation=%d resetAuthEnforced=%v",
-			targetUserID, revoked, gen, enforced)); err != nil {
+		fmt.Sprintf("user=%s devices=%d grants=%d generation=%d authEpoch=%d resetAuthEnforced=%v",
+			targetUserID, out.RevokedDevices, out.RevokedGrants, gen, out.AuthEpoch, enforced)); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	s.log.Warn("api token reset", "user", targetUserID, "revokedDevices", revoked,
-		"resetAuthEnforced", enforced)
+	s.log.Warn("api token reset", "user", targetUserID, "revokedDevices", out.RevokedDevices,
+		"revokedGrants", out.RevokedGrants, "resetAuthEnforced", enforced)
 	s.notify(targetUserID, "token-reset", map[string]string{
-		"revokedDevices": fmt.Sprint(revoked), "eventId": fmt.Sprintf("gen-%d", gen),
+		"revokedDevices": fmt.Sprint(out.RevokedDevices), "eventId": fmt.Sprintf("gen-%d", gen),
 	})
 	return &TokenResetResult{
-		Token: token, RevokedDevices: revoked, Generation: gen, ResetAuthEnforced: enforced,
+		Token: token, RevokedDevices: out.RevokedDevices, RevokedGrants: out.RevokedGrants,
+		Generation: gen, AuthEpoch: out.AuthEpoch, ResetAuthEnforced: enforced,
 	}, nil
 }
 

@@ -57,13 +57,14 @@ type PairingGrant struct {
 
 // CreatePairingGrant 为调用者的仓库发行一次性设备 grant。
 // 仓库必须已完成加密初始化；新设备的归属 = (该仓库, 发行者本人)。
-func (s *Service) CreatePairingGrant(scope db.VaultScope, userID, actorDeviceID string) (*PairingGrant, error) {
+// issuerEpoch 是发行者凭据（会话 / 设备）上记的授权代次（ADR-019 §2.2）。
+func (s *Service) CreatePairingGrant(scope db.VaultScope, userID, actorDeviceID string, issuerEpoch int64) (*PairingGrant, error) {
 	if ready, err := s.VaultReady(scope); err != nil {
 		return nil, err
 	} else if !ready {
 		return nil, ErrVaultNotReady
 	}
-	id, secret, expiresAt, err := s.CreateEnrollment(pairingGrantTTL, scope.ID(), userID, actorDeviceID)
+	id, secret, expiresAt, err := s.CreateEnrollmentAt(pairingGrantTTL, scope.ID(), userID, actorDeviceID, issuerEpoch)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +103,11 @@ func (s *Service) CreatePairingV2(scope db.VaultScope, userID, grantID, cipherte
 	if g == nil || g.VaultID != scope.ID() || g.UserID != userID || g.ConsumedAt != 0 || g.Revoked || g.ExpiresAt <= now {
 		return "", 0, ErrGrantNotFound
 	}
+	if alive, err := s.grantEpochCurrentLocked(g); err != nil {
+		return "", 0, err
+	} else if !alive {
+		return "", 0, ErrGrantNotFound
+	}
 	pairID, err := randomHex(16)
 	if err != nil {
 		return "", 0, err
@@ -133,8 +139,24 @@ func (s *Service) PairingEnvelope(pairID string) (string, int64, error) {
 		if g == nil || g.ConsumedAt != 0 || g.Revoked || g.ExpiresAt <= now {
 			return "", 0, ErrPairingNotFound
 		}
+		// 账号已执行「退出全部设备」/ 已停用：链接随授权一起失效（ADR-019）
+		if alive, err := s.grantEpochCurrentLocked(g); err != nil {
+			return "", 0, err
+		} else if !alive {
+			return "", 0, ErrPairingNotFound
+		}
 	}
 	return ct, expiresAt, nil
+}
+
+// grantEpochCurrentLocked 报告授权的签发代次是否仍等于账号当前代次、账号是否未停用
+//（ADR-019 R-1 的授权形态）。调用方持有 s.mu。
+func (s *Service) grantEpochCurrentLocked(g *db.EnrollmentRow) (bool, error) {
+	st, err := db.UserSessionState(s.db, g.UserID)
+	if err != nil {
+		return false, err
+	}
+	return !st.Disabled && g.AuthEpoch == st.AuthEpoch, nil
 }
 
 // RedeemParams 是一次兑换请求。
@@ -252,10 +274,20 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 	if row == nil || row.VaultID != scope.ID() {
 		return nil, ErrEnrollmentInvalid
 	}
+	// ADR-019 §2.2：兑换与「响应丢失重放」都先核对代次与停用状态——账号执行过
+	// 退出全部设备 / 被停用 / 中心停用之后，旧链接既换不出新凭据，也取不回旧结果
+	u, err := db.GetUser(s.db, row.UserID)
+	if err != nil {
+		return nil, err
+	}
+	grantAlive := u != nil && !u.Disabled && row.AuthEpoch == u.AuthEpoch
 	if row.ConsumedAt != 0 {
 		// 响应丢失后的重试：同 secret + 同 exchangeId + 窗口内 → 原样返回
 		if row.ExchangeID != "" && row.ExchangeID == p.ExchangeID &&
 			row.ReplayCiphertext != "" && row.ReplayExpiresAt > now.Unix() {
+			if !grantAlive {
+				return nil, ErrPairingRevoked
+			}
 			plain, err := openReplay(p.Secret, p.ExchangeID, row.ID, row.ReplayCiphertext)
 			if err != nil {
 				return nil, ErrPairingUsed
@@ -264,13 +296,19 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 			if err := json.Unmarshal(plain, &res); err != nil {
 				return nil, err
 			}
+			// 兑换出的那台设备已被单独撤销：重放一张已死的凭据没有意义，如实告知
+			if dev, err := db.GetDeviceAuthByID(s.db, res.DeviceID); err != nil {
+				return nil, err
+			} else if dev == nil || !dev.Valid() {
+				return nil, ErrPairingRevoked
+			}
 			res.Replayed = true
 			return &res, nil
 		}
 		return nil, ErrPairingUsed
 	}
 	switch {
-	case row.Revoked:
+	case row.Revoked || !grantAlive:
 		return nil, ErrPairingRevoked
 	case row.ExpiresAt <= now.Unix():
 		return nil, ErrPairingExpired
@@ -281,11 +319,6 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 		return nil, err
 	} else if !ok {
 		return nil, ErrVaultNotReady
-	}
-	if u, err := db.GetUser(s.db, row.UserID); err != nil {
-		return nil, err
-	} else if u == nil || u.Disabled {
-		return nil, ErrPairingRevoked
 	}
 	identity, err := s.vaultIdentityLocked(scope)
 	if err != nil {
@@ -298,12 +331,19 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 
 	var res *RedeemResult
 	err = s.inTx(func(tx *sql.Tx) error {
-		g, err := db.ConsumeEnrollmentV2(tx, hash, p.ExchangeID, now.Unix())
+		g, err := db.ConsumeEnrollmentV2(tx, hash, p.ExchangeID, now.Unix(), row.AuthEpoch)
 		if err != nil {
 			return err
 		}
 		if g == nil {
 			return ErrPairingUsed // 并发：另一个兑换刚抢先成功
+		}
+		// 事务内复核账号代次：多连接部署里撤销可能刚好提交。即使这里没拦住（撤销在本事务
+		// 提交前一刻才提交），新设备记的也是旧代次，下一次校验即失败（R-4）
+		if cur, err := db.UserAuthEpoch(tx, g.UserID); err != nil {
+			return err
+		} else if cur != g.AuthEpoch {
+			return ErrPairingRevoked
 		}
 		deviceID, err := randomHex(8)
 		if err != nil {
@@ -316,7 +356,7 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 		if err := db.InsertDeviceTx(tx, &db.Device{
 			DeviceID: deviceID, Name: name, TokenHash: sha256Hex([]byte(token)),
 			Scopes: g.Scopes, CreatedAt: now.Unix(), LastSeenAt: now.Unix(),
-			VaultID: g.VaultID, UserID: g.UserID, Platform: p.Platform,
+			VaultID: g.VaultID, UserID: g.UserID, Platform: p.Platform, AuthEpoch: g.AuthEpoch,
 		}); err != nil {
 			return err
 		}

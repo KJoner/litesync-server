@@ -44,12 +44,13 @@ func (h *handlers) tokenReset(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, "token reset", err)
 		return
 	}
-	// 世代 +1 作废了该用户的全部网页会话；唯独发起重置的这个要活下来，
-	// 否则新 Token 还没展示页面就被登出了
-	h.web.adoptGeneration(r, me.UserID, res.Generation)
+	// 世代 +1、授权代次 +1 作废了该用户的全部网页会话、设备与待领取授权；唯独发起重置的
+	// 这个会话要活下来，否则新 Token 还没展示页面就被登出了
+	h.web.adoptGeneration(r, me.UserID, res.Generation, res.AuthEpoch)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":             res.Token,
 		"revokedDevices":    res.RevokedDevices,
+		"revokedGrants":     res.RevokedGrants,
 		"resetAuthEnforced": res.ResetAuthEnforced,
 	})
 }

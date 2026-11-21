@@ -24,16 +24,18 @@ type EnrollmentRow struct {
 	ExchangeID       string
 	ReplayCiphertext string
 	ReplayExpiresAt  int64
+	// AuthEpoch：签发时的账号授权代次（ADR-019）；兑换与重放都要求它仍等于账号当前代次
+	AuthEpoch int64
 }
 
 const enrollmentRowColumns = `id, scopes, vault_id, user_id, expires_at, consumed_at, revoked,
-	exchange_id, replay_ciphertext, replay_expires_at`
+	exchange_id, replay_ciphertext, replay_expires_at, auth_epoch`
 
 func scanEnrollment(sc interface{ Scan(...any) error }) (*EnrollmentRow, error) {
 	e := &EnrollmentRow{}
 	var revoked int
 	err := sc.Scan(&e.ID, &e.Scopes, &e.VaultID, &e.UserID, &e.ExpiresAt, &e.ConsumedAt, &revoked,
-		&e.ExchangeID, &e.ReplayCiphertext, &e.ReplayExpiresAt)
+		&e.ExchangeID, &e.ReplayCiphertext, &e.ReplayExpiresAt, &e.AuthEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -60,15 +62,16 @@ func GetEnrollmentByID(q dbtx, id string) (*EnrollmentRow, error) {
 	return scanEnrollment(q.QueryRow(`SELECT `+enrollmentRowColumns+` FROM enrollments WHERE id = ?`, id))
 }
 
-// ConsumeEnrollmentV2 原子消费 grant 并记录 exchangeID；已被消费/撤销/过期返回 (nil, nil)。
-func ConsumeEnrollmentV2(q dbtx, secretHash, exchangeID string, now int64) (*EnrollmentGrant, error) {
+// ConsumeEnrollmentV2 原子消费 grant 并记录 exchangeID；已被消费/撤销/过期、或代次与
+// wantEpoch 不符返回 (nil, nil)。
+func ConsumeEnrollmentV2(q dbtx, secretHash, exchangeID string, now, wantEpoch int64) (*EnrollmentGrant, error) {
 	g := &EnrollmentGrant{}
 	err := q.QueryRow(
 		`UPDATE enrollments SET consumed_at = ?, exchange_id = ?
-		 WHERE secret_hash = ? AND consumed_at = 0 AND revoked = 0 AND expires_at > ?
-		 RETURNING scopes, vault_id, user_id`,
-		now, exchangeID, secretHash, now,
-	).Scan(&g.Scopes, &g.VaultID, &g.UserID)
+		 WHERE secret_hash = ? AND consumed_at = 0 AND revoked = 0 AND expires_at > ? AND auth_epoch = ?
+		 RETURNING scopes, vault_id, user_id, auth_epoch`,
+		now, exchangeID, secretHash, now, wantEpoch,
+	).Scan(&g.Scopes, &g.VaultID, &g.UserID, &g.AuthEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

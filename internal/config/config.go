@@ -118,6 +118,82 @@ type Config struct {
 	// MailDailyBudget（OBSYNC_MAIL_DAILY_BUDGET，默认 500；0 = 不限）：全局每 24 小时
 	// 最多发出的通知邮件数；超出的延后发送（不丢弃），并记 WARN。
 	MailDailyBudget int
+
+	// ---- v0.20.1 账号撤销（ADR-019） ----
+
+	// PeerRevocationURL / PeerRevocationSecret（OBSYNC_PEER_REVOCATION_URL / _SECRET）：
+	// 跨产品撤销。URL 是另一个产品的内部地址（例如 compose 网络里的 http://nexus:8787，接口路径
+	// /api/internal/v1/account-revocations 自动补上）；Secret 是两个产品相同的共享密钥（≥ 32 字节，
+	// 按字符串原始字节作 HMAC 密钥）。两者都设置才启用「退出所有产品与设备」的跨产品一步与接收端；
+	// 只设置一个直接拒绝启动。
+	PeerRevocationURL    string
+	PeerRevocationSecret string
+	// OIDCStatusClientID / OIDCStatusClientSecret（OBSYNC_OIDC_STATUS_CLIENT_ID / _SECRET）：
+	// 中心状态检查（动作 D）用的**只读**服务账号——client credentials，只授 realm-management 的
+	// view-users（client 的作用域映射里也要加上它）。两者都设置才启用；**开放公众注册必须配置**。
+	OIDCStatusClientID     string
+	OIDCStatusClientSecret string
+	// OIDCAdminAPIURL（OBSYNC_OIDC_ADMIN_API_URL，可选）：Keycloak 管理接口基址
+	// https://host/admin/realms/<realm>；默认从 OBSYNC_OIDC_ISSUER 推导（/realms/ → /admin/realms/）。
+	OIDCAdminAPIURL string
+}
+
+// CentralStatusCheckEnabled 报告是否配置了中心状态检查（ADR-019 §2.5）。
+func (c *Config) CentralStatusCheckEnabled() bool {
+	return c.OIDCEnabled() && c.OIDCStatusClientID != "" && c.OIDCStatusClientSecret != ""
+}
+
+// PeerRevocationEnabled 报告是否配置了跨产品撤销（ADR-019 §2.4）。
+func (c *Config) PeerRevocationEnabled() bool {
+	return c.PeerRevocationURL != "" && c.PeerRevocationSecret != ""
+}
+
+// loadRevocation 解析 ADR-019 的配置。半套配置直接拒绝启动——「以为配好了其实没生效」
+// 比启动失败更糟；开放注册而没有中心状态检查同样拒绝（ADR-019 §2.5：开放公众注册前必须配置）。
+func loadRevocation(cfg *Config) error {
+	cfg.PeerRevocationURL = strings.TrimRight(strings.TrimSpace(os.Getenv("OBSYNC_PEER_REVOCATION_URL")), "/")
+	cfg.PeerRevocationSecret = os.Getenv("OBSYNC_PEER_REVOCATION_SECRET")
+	switch {
+	case cfg.PeerRevocationURL == "" && cfg.PeerRevocationSecret == "":
+	case cfg.PeerRevocationURL == "" || cfg.PeerRevocationSecret == "":
+		return fmt.Errorf("peer revocation is half-configured: OBSYNC_PEER_REVOCATION_URL and OBSYNC_PEER_REVOCATION_SECRET must both be set (or neither)")
+	default:
+		u, err := url.Parse(cfg.PeerRevocationURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("invalid OBSYNC_PEER_REVOCATION_URL: %q (use http(s)://host[:port], e.g. http://nexus:8787)", cfg.PeerRevocationURL)
+		}
+		if len(cfg.PeerRevocationSecret) < 32 {
+			return fmt.Errorf("OBSYNC_PEER_REVOCATION_SECRET is too short (%d bytes); use at least 32 random bytes, the same value on both products", len(cfg.PeerRevocationSecret))
+		}
+	}
+
+	cfg.OIDCStatusClientID = strings.TrimSpace(os.Getenv("OBSYNC_OIDC_STATUS_CLIENT_ID"))
+	cfg.OIDCStatusClientSecret = os.Getenv("OBSYNC_OIDC_STATUS_CLIENT_SECRET")
+	cfg.OIDCAdminAPIURL = strings.TrimRight(strings.TrimSpace(os.Getenv("OBSYNC_OIDC_ADMIN_API_URL")), "/")
+	if (cfg.OIDCStatusClientID == "") != (cfg.OIDCStatusClientSecret == "") {
+		return fmt.Errorf("central status check is half-configured: OBSYNC_OIDC_STATUS_CLIENT_ID and OBSYNC_OIDC_STATUS_CLIENT_SECRET must both be set (or neither)")
+	}
+	if cfg.OIDCStatusClientID != "" && !cfg.OIDCEnabled() {
+		return fmt.Errorf("OBSYNC_OIDC_STATUS_CLIENT_ID is set but unified sign-in (OBSYNC_OIDC_*) is not configured")
+	}
+	if cfg.OIDCAdminAPIURL != "" {
+		u, err := url.Parse(cfg.OIDCAdminAPIURL)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && !isLoopbackHost(u.Hostname())) {
+			return fmt.Errorf("invalid OBSYNC_OIDC_ADMIN_API_URL: %q (https://host/admin/realms/<realm>; https required outside localhost)", cfg.OIDCAdminAPIURL)
+		}
+	}
+	if cfg.CentralStatusCheckEnabled() && cfg.OIDCAdminAPIURL == "" {
+		iu, _ := url.Parse(cfg.OIDCIssuer) //nolint:errcheck // 已在 loadPublicLaunch 校验
+		if !strings.Contains(iu.Path, "/realms/") {
+			return fmt.Errorf("cannot derive the identity-center admin API from OBSYNC_OIDC_ISSUER=%q (no /realms/<realm>); set OBSYNC_OIDC_ADMIN_API_URL", cfg.OIDCIssuer)
+		}
+	}
+	if cfg.OIDCEnabled() && cfg.RegistrationMode == "open" && !cfg.CentralStatusCheckEnabled() {
+		return fmt.Errorf("OBSYNC_REGISTRATION_MODE=open requires the central status check (ADR-019 §2.5): " +
+			"set OBSYNC_OIDC_STATUS_CLIENT_ID / OBSYNC_OIDC_STATUS_CLIENT_SECRET to a read-only service account (realm-management/view-users); " +
+			"without it, an account disabled or deleted in the identity center keeps its device credentials")
+	}
+	return nil
 }
 
 // OIDCEnabled 报告是否配置了统一登录。
@@ -425,6 +501,9 @@ func Load() (*Config, error) {
 	}
 
 	if err := loadPublicLaunch(cfg); err != nil {
+		return nil, err
+	}
+	if err := loadRevocation(cfg); err != nil {
 		return nil, err
 	}
 

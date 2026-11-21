@@ -197,6 +197,23 @@ func run() error {
 	if _, err := svc.EnsureAdminAccount(cfg.Token); err != nil {
 		return fmt.Errorf("reconcile admin account: %w", err)
 	}
+	// v0.20.1 账号撤销（ADR-019）：跨产品事件与中心状态检查。未配置时如实告知能力缺口
+	if cfg.PeerRevocationEnabled() {
+		svc.SetPeerRevocation(syncsvc.PeerRevocationConfig{URL: cfg.PeerRevocationURL, Secret: cfg.PeerRevocationSecret})
+		logger.Info("cross-product revocation enabled", "peer", "nexus")
+		if !cfg.OIDCEnabled() {
+			logger.Warn("跨产品撤销已配置但未启用统一登录：没有可按 (issuer, subject) 匹配的账号，收到的事件只会记为 unknown-identity")
+		}
+	} else if cfg.OIDCEnabled() {
+		logger.Warn("跨产品撤销未配置（OBSYNC_PEER_REVOCATION_URL / OBSYNC_PEER_REVOCATION_SECRET）：" +
+			"「退出所有产品与设备」不会通知另一个产品（Nexus Portal），账户中心会把这一步显示为「未配置」")
+	}
+	if cfg.CentralStatusCheckEnabled() {
+		logger.Info("central account status check enabled (read-only service account)", "client", cfg.OIDCStatusClientID)
+	} else if cfg.OIDCEnabled() {
+		logger.Warn("中心状态检查未配置（OBSYNC_OIDC_STATUS_CLIENT_ID / _SECRET）：身份中心停用或删除用户后，" +
+			"只有网页会话会在刷新复核时结束，已连接的设备不会自动失效，需要在产品里撤销；开放公众注册前必须配置")
+	}
 	// v0.18 实测事故的自检：残留的「enabled 密钥文档 + plaintext 仓库」矛盾会挡停新设备
 	svc.CheckE2eeConsistency()
 	// 存量数据的域化迁移是**告警**而不是硬门槛：混合状态读写都正确
@@ -226,6 +243,8 @@ func run() error {
 
 	bkp := backup.New(database, svc, backup.NewRunner(""), cfg.DataDir, version, cfg.BackupKeyFile, logger)
 	bkp.StartScheduler(ctx)
+	// 跨产品撤销事件的后台重试（5 s、15 s、30 s…，7 天后记为失败；未配置时不启动）
+	svc.StartRevocationWorker(ctx)
 
 	// v0.20：产品通知邮件（ADR-018）。默认 log 渠道（不外发），配置了才真正投递
 	mailCfg := mail.Config{
@@ -263,6 +282,10 @@ func run() error {
 			ClientSecret:     cfg.OIDCClientSecret,
 			PublicURL:        cfg.PublicURL,
 			RegistrationMode: cfg.RegistrationMode,
+			// ADR-019 §2.5：中心状态检查的只读服务账号（未配置则不检查）
+			StatusClientID:     cfg.OIDCStatusClientID,
+			StatusClientSecret: cfg.OIDCStatusClientSecret,
+			AdminAPIURL:        cfg.OIDCAdminAPIURL,
 		},
 		LegacyTokenLogin:     cfg.LegacyTokenLogin,
 		RequireE2EENewVaults: cfg.RequireE2EENewVaults,

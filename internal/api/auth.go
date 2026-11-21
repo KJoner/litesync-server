@@ -42,11 +42,32 @@ type authIdentity struct {
 	Restricted bool
 	// idTokenHint：全局退出时交给身份服务的 id_token_hint（只在本进程内存中）。
 	idTokenHint string
+	// oidc：统一登录会话的复核状态（动作 C 用会话里的 refresh token 换用户本人的 access token）
+	oidc *oidcSessionState
 	// authTime：网页会话完成认证的时刻（发行配对等敏感操作的「近期认证」判定）
 	authTime time.Time
 	// AuditDevice：没有设备凭据的身份（网页会话）在审计与写入归属里用的服务端标识，
 	// 形如 "web-<userId 哈希前 12 位>"。客户端自报的 X-Device-ID 永远不作数。
 	AuditDevice string
+	// AuthEpoch：本次所用凭据（会话 / 设备 / 短期票 / API Token）签发时的账号授权代次
+	//（ADR-019）。这个身份再签发的授权、设备一律记**它**，而不是账号此刻的代次。
+	AuthEpoch int64
+	// OwnerUserID：凭据所属账号（设备与短期票也填；中心状态检查用）
+	OwnerUserID string
+}
+
+// writeDeviceRevoked：设备凭据（或由它换来的短期票）曾有效、已被撤销。
+func writeDeviceRevoked(w http.ResponseWriter) {
+	writeCoded(w, http.StatusUnauthorized, CodeTokenRevoked,
+		"这台设备的授权已被撤销（被单独撤销，或账号执行了「退出全部设备」、被停用）。"+
+			"本地还没同步的内容会保留在设备上；请在网页账户中心重新生成连接链接接入，或填入新的 API Token 重新连接。", false)
+}
+
+// writeAPITokenRevoked：API Token 曾有效、已随账号授权代次前进而作废。
+func writeAPITokenRevoked(w http.ResponseWriter) {
+	writeCoded(w, http.StatusUnauthorized, CodeTokenRevoked,
+		"这个 API Token 已作废（账号执行了「退出全部设备」、重置或被停用）。"+
+			"请用统一账号登录网页后重置 API Token，或由管理员在服务器上运行 obsync token reset。", false)
 }
 
 // webContentWrite：网页编辑需要的内容写路由（ADR-015；OBSYNC_WEB_EDITING 开启时才对会话放行）。
@@ -229,11 +250,17 @@ func vaultRequired(r *http.Request) bool {
 
 // sessionIdentity 把网页会话转成认证身份；ok=false 时响应已写好。
 func (h *handlers) sessionIdentity(w http.ResponseWriter, r *http.Request, cookieID string, info sessionInfo, admin bool) (*authIdentity, bool) {
-	if info.oidc != nil && h.rp != nil && !h.rp.revalidate(r.Context(), info.oidc) {
-		// 身份服务明确拒绝了复核（冻结、全局退出、会话撤销）：本会话作废
-		h.web.revoke(cookieID)
-		writeCoded(w, http.StatusUnauthorized, CodeAuthRequired, "session ended; sign in again", false)
-		return nil, false
+	if info.oidc != nil && h.rp != nil {
+		valid, refreshed := h.rp.revalidate(r.Context(), info.oidc)
+		if !valid {
+			// 身份服务明确拒绝了复核（冻结、全局退出、会话撤销）：本会话作废（动作 A）
+			h.web.revoke(cookieID)
+			writeCoded(w, http.StatusUnauthorized, CodeAuthRequired, "登录已结束（身份中心的会话已退出或失效），请重新登录。", false)
+			return nil, false
+		}
+		if refreshed {
+			h.central.markOK(info.userID, oidcNow())
+		}
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead && !h.sameOrigin(r) {
 		writeCoded(w, http.StatusForbidden, CodeForbidden, "cross-origin request rejected", false)
@@ -260,13 +287,18 @@ func (h *handlers) sessionIdentity(w http.ResponseWriter, r *http.Request, cooki
 		}
 	}
 	id := &authIdentity{UserID: info.userID, Name: info.name, IsAdmin: info.isAdmin || admin, VaultID: chosen, authTime: info.authTime,
-		AuditDevice: webAuditDevice(info.userID)}
+		AuditDevice: webAuditDevice(info.userID), AuthEpoch: info.authEpoch, OwnerUserID: info.userID}
 	if info.oidc != nil {
 		id.ViaOIDC = true
 		id.Restricted = !info.oidc.emailVerified
 		info.oidc.mu.Lock()
 		id.idTokenHint = info.oidc.idToken
 		info.oidc.mu.Unlock()
+		id.oidc = info.oidc
+	}
+	if !h.centralGate(w, r, id, true) {
+		h.web.revoke(cookieID)
+		return nil, false
 	}
 	return id, true
 }
@@ -291,10 +323,14 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 				claims, err := svc.VerifyAccessToken(bearer)
 				if err != nil {
 					// 过期与伪造分开告知：过期是客户端可以自行处理的正常状态
-					//（拿长期凭据再换一张），伪造则没什么可解释的
-					if errors.Is(err, syncsvc.ErrAccessTokenExpired) {
+					//（拿长期凭据再换一张），伪造则没什么可解释的；签发它的设备已被撤销
+					// 则直接给撤销码，免得客户端再拿一张必然被拒的长期凭据去换票
+					switch {
+					case errors.Is(err, syncsvc.ErrAccessTokenExpired):
 						writeErr(w, http.StatusUnauthorized, "access token expired; exchange a new one")
-					} else {
+					case errors.Is(err, syncsvc.ErrDeviceRevoked):
+						writeDeviceRevoked(w)
+					default:
 						writeErr(w, http.StatusUnauthorized, "unauthorized")
 					}
 					return
@@ -311,11 +347,15 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 						"access tokens cannot be exchanged for new ones; use the device credential")
 					return
 				}
-				ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
+				id := &authIdentity{
 					DeviceID: claims.DeviceID, Scopes: claims.Scopes,
 					VaultID: claims.VaultID, ViaAccessToken: true,
-				})
-				next.ServeHTTP(w, r.WithContext(ctx))
+					AuthEpoch: claims.AuthEpoch, OwnerUserID: claims.UserID,
+				}
+				if !h.centralGate(w, r, id, false) {
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 				return
 			}
 			// 设备 Token：按 scope 校验（撤销后立即失效）
@@ -327,10 +367,9 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 			d, derr := svc.AuthDeviceWithClient(bearer, clientVer, clientProto,
 				platform, clientIP(r, trusted))
 			if errors.Is(derr, syncsvc.ErrDeviceRevoked) {
-				// 「曾有效、已被撤销」与「查无此凭据」分开告知：前者是 Token 重置或
-				// 设备撤销的正常后果，客户端要给的是「填新 Token 重新接入」的指引
-				writeCoded(w, http.StatusUnauthorized, CodeTokenRevoked,
-					"device credential has been revoked; enter the new API token and reconnect", false)
+				// 「曾有效、已被撤销」与「查无此凭据」分开告知：前者是设备撤销、退出全部
+				// 设备、停用的正常后果，客户端要给的是「重新接入」的指引（并保留本地待发内容）
+				writeDeviceRevoked(w)
 				return
 			}
 			if derr == nil && d != nil {
@@ -344,15 +383,24 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 				if ok := enforceVault(w, svc, vaultID); !ok {
 					return
 				}
-				ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
+				id := &authIdentity{
 					DeviceID: d.DeviceID, Name: d.Name, Scopes: d.Scopes, VaultID: vaultID,
-				})
-				next.ServeHTTP(w, r.WithContext(ctx))
+					AuthEpoch: d.AuthEpoch, OwnerUserID: d.UserID,
+				}
+				if !h.centralGate(w, r, id, false) {
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 				return
 			}
 			// 用户 Token（v0.18：users.token_hash，含管理员）：对自己 Vault 全权限。
 			// 不做 scope 检查（scope 是设备的最小权限机制），但 admin API 必须 is_admin。
-			if u, err := svc.AuthUserByToken(bearer); err == nil && u != nil {
+			u, err := svc.AuthUserByToken(bearer)
+			if errors.Is(err, syncsvc.ErrTokenRevoked) {
+				writeAPITokenRevoked(w)
+				return
+			}
+			if err == nil && u != nil {
 				if strings.HasPrefix(r.URL.Path, "/api/v1/admin/") && !u.IsAdmin {
 					writeErr(w, http.StatusForbidden, "admin privileges required")
 					return
@@ -370,18 +418,21 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 				if ok := enforceVault(w, svc, vaultID); !ok {
 					return
 				}
-				ctx := context.WithValue(r.Context(), identityKey, &authIdentity{
+				id := &authIdentity{
 					UserToken: true, UserID: u.UserID, IsAdmin: u.IsAdmin,
-					Name: u.Name, VaultID: vaultID,
-				})
-				next.ServeHTTP(w, r.WithContext(ctx))
+					Name: u.Name, VaultID: vaultID, AuthEpoch: u.TokenAuthEpoch, OwnerUserID: u.UserID,
+				}
+				if !h.centralGate(w, r, id, false) {
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
 				return
 			}
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/") {
 			// ADMIN capability：普通会话不够，必须持管理员 Token 或短期 admin 会话
 			if c, err := r.Cookie(adminCookieName); err == nil {
-				if info, ok := web.lookup(c.Value, true); ok && sessionGenerationValid(svc, info) {
+				if info, ok := web.lookup(c.Value, true); ok && sessionValid(svc, info) {
 					id, okv := h.sessionIdentity(w, r, c.Value, info, true)
 					if !okv {
 						return
@@ -400,7 +451,7 @@ func authGate(h *handlers, next http.Handler) http.Handler {
 			return
 		}
 		if c, err := r.Cookie(sessionCookieName); err == nil {
-			if info, ok := web.lookup(c.Value, false); ok && sessionGenerationValid(svc, info) {
+			if info, ok := web.lookup(c.Value, false); ok && sessionValid(svc, info) {
 				if webSessionAllowed(r) || (h.opts.WebEditing && webContentWrite(r)) {
 					id, okv := h.sessionIdentity(w, r, c.Value, info, false)
 					if !okv {
@@ -439,14 +490,19 @@ func resolveVaultChoice(w http.ResponseWriter, r *http.Request, svc *syncsvc.Ser
 	return hdr, true
 }
 
-// sessionGenerationValid 比对会话创建时的 Token 世代与用户当前世代。
+// sessionValid 比对会话创建时记下的账号状态与账号当前状态（每次请求都做）。
 //
-// Token 轮换（网页或 CLI）把世代 +1，所有旧会话在这里被拒——这是「重置后
-// 旧会话必须全部下线」的实现，不依赖遍历内存，跨进程（CLI 兜底）同样生效。
-// 用户被禁用时 UserTokenGeneration 返回 0，同样在这里拦截。
-func sessionGenerationValid(svc *syncsvc.Service, info sessionInfo) bool {
-	gen, err := svc.UserTokenGeneration(info.userID)
-	return err == nil && gen != 0 && gen == info.tokenGeneration
+//   - Token 世代：Token 轮换（网页或 CLI）、back-channel 只带 sub 的退出把它 +1，
+//     这个用户的全部网页会话在这里被拒（动作 A 的 sub 分支）；
+//   - 授权代次（ADR-019）：动作 B / C / D、停用、Token 重置把它 +1——会话、设备、
+//     待领取授权一起失效；
+//   - 停用位。
+//
+// 都不依赖遍历内存：CLI（另一个进程）改库同样立即生效。
+func sessionValid(svc *syncsvc.Service, info sessionInfo) bool {
+	st, err := svc.UserSessionState(info.userID)
+	return err == nil && st.Exists && !st.Disabled &&
+		st.TokenGeneration == info.tokenGeneration && st.AuthEpoch == info.authEpoch
 }
 
 // securityHeaders 为所有响应加安全头（CSP 是 Web 端持有明文与密钥时的第二道防线；

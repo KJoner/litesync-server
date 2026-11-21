@@ -154,7 +154,10 @@ LSE4 解密、设备平台/IP 记录、运维页都在服务端资产里）。�
 | `OBSYNC_PG_RESTORE_DSN` | （空） | 仅 PG 部署的 `backup restore` 使用：恢复写入的**新的空库**（旧库原样保留作为退路） |
 | `OBSYNC_PUBLIC_URL` | （空） | 本服务对外的规范地址（如 `https://sync.example.com`，不带路径）；启用统一登录时必填，回调固定为 `<PUBLIC_URL>/auth/callback` |
 | `OBSYNC_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` | （空） | 统一登录（OIDC，如 Keycloak）。三个都设置才启用；**半套配置拒绝启动**；非本机必须 https |
-| `OBSYNC_REGISTRATION_MODE` | `invite` | `closed` / `invite` / `open`：首次出现的统一账号是否自动建本地账号 |
+| `OBSYNC_REGISTRATION_MODE` | `invite` | `closed` / `invite` / `open`：首次出现的统一账号是否自动建本地账号。**`open` 要求同时配置中心状态检查（下面两行），否则拒绝启动** |
+| `OBSYNC_OIDC_STATUS_CLIENT_ID` / `_SECRET` | （空） | 0.20.1：中心状态检查用的**只读**服务账号（client credentials，只授 realm-management 的 `view-users`，client 的作用域映射里也要加它）。配置后，身份中心停用 / 删除的账号最迟 60 秒内被撤销全部设备；未配置时只结束网页会话。两者都设置才启用，半套拒绝启动 |
+| `OBSYNC_OIDC_ADMIN_API_URL` | （从 issuer 推导） | 0.20.1：Keycloak 管理接口基址 `https://host/admin/realms/<realm>`；默认把 issuer 里的 `/realms/` 换成 `/admin/realms/` |
+| `OBSYNC_PEER_REVOCATION_URL` / `_SECRET` | （空） | 0.20.1：跨产品撤销。URL 是另一个产品（Nexus Portal）的内部地址（如 compose 网络里的 `http://nexus:8787`，路径 `/api/internal/v1/account-revocations` 自动补上）；SECRET 是两个产品**相同**的共享密钥（≥ 32 字节，按字符串原始字节作 HMAC 密钥）。两者都设置才启用「退出所有产品与设备」的跨产品一步与本服务的接收端；半套拒绝启动 |
 | `OBSYNC_LEGACY_TOKEN_LOGIN` | `true` | 启用统一登录后是否保留「API Token 网页登录」（管理员认领统一账号前的兜底） |
 | `OBSYNC_REQUIRE_E2EE_NEW_VAULTS` | `true` | 新建仓库必须先完成浏览器端（或插件端）加密初始化才接受内容写入 |
 | `OBSYNC_WEB_EDITING` | `false` | 允许网页会话写入笔记（网页编辑器、回收站恢复）；默认只读 |
@@ -348,6 +351,52 @@ API Token 与完全独立的仓库（见下方「多用户」一节）。隔离�
   全局日预算。注册验证与找回密码邮件由身份服务发送，不经过这里。
 - **命令行**：`obsync identity link|list`（SSH 兜底认领，冲突不覆盖）、`obsync vaults pending`（列出未完成初始化的仓库）。
 
+## 账号撤销的三种范围（0.20.1 / ADR-019）
+
+账户中心的「退出与撤销」有三个按钮，每个旁边都写着影响范围；它们**互不混用**：
+
+| 动作 | 入口 | 生效范围 | 不影响 |
+|---|---|---|---|
+| **A 只退出这个浏览器** | 「退出此浏览器」；身份中心的 back-channel logout（带 `sid` = 那一个会话，只带 `sub` = 本产品该账号的全部网页会话） | 本产品的网页会话 | 设备、未使用的连接链接、身份中心、另一个产品 |
+| **B 退出 LiteSync 的全部设备** | 「退出 LiteSync 的全部设备」`POST /api/v2/account/logout-devices` | 本产品：全部网页会话 + 全部设备凭据（含在途的短期票）+ 全部未使用的连接链接 + API Token | 身份中心、另一个产品 |
+| **C 退出所有产品与设备** | 「退出所有产品与设备」`POST /api/v2/account/logout-all` | B 的全部 + 身份中心里该账号**所有浏览器**的登录 + 另一个产品的 B | — |
+| **D 中心停用 / 删除** | 管理员在身份中心停用或删除用户 | 本产品发现后执行 B（需要配置中心状态检查） | — |
+
+实现要点（如实写下代价与做不到的事）：
+
+- **账号授权代次**：`users.auth_epoch` 只增不减。网页会话、设备凭据、短期票、未使用的连接链接（enrollment / 配对 v2 授予）
+  与 API Token 在**签发时**记下签发者凭据的代次，**每次校验**都比较；B / C / D / 管理员停用 / Token 重置在一个事务里把它 +1。
+  判定发生在校验时，所以「撤销与兑换并发」也不会留下有效凭据；已消费授权的「响应丢失重放」同样先核对代次。
+- **普通退出永远只是 A**：身份中心的会话结束不代表要断开全部 Obsidian。设备只被 B、C、D 撤销。
+- **C 逐项报告真实状态**：本产品（事务内立即生效）→ 身份中心（用该用户本人的令牌调用 Keycloak Account REST API
+  `DELETE {issuer}/account/sessions?current=true`，只用他自己的 `manage-account`；浏览器拿不到任何身份中心令牌）→ 另一个产品
+  （与本产品的撤销同一事务写入 outbox，请求返回前同步投递一次，失败后台按 5 s、15 s、30 s… 重试，7 天后记为失败）。
+  三步都完成 `ok` 才是 `true`；否则逐项显示 `pending` / `failed` / `not-configured`。身份中心一步失败时给出账号中心地址，
+  提示到「设备活动」手动退出。C 之后本产品的会话都已失效，结果页凭响应里的一次性 `statusToken`（30 分钟）继续查看与
+  「重新发送」；之后重新登录可在「账号与设备 → 最近的撤销」看到。
+- **跨产品事件**（ADR-019 §2.4）：`POST {对方}/api/internal/v1/account-revocations`，`X-Revocation-Timestamp` +
+  `X-Revocation-Signature: v1=<hex(HMAC-SHA256(共享密钥, 时间戳 + "." + 原始请求体))>`，以 `(issuer, subject)` 定位账号
+  （任何一方都不使用另一方的本地 user_id）。接收端常数时间验签、时间戳偏差超过 5 分钟拒绝、`eventId` 去重（重复投递返回同样的
+  结果）、找不到身份返回 `200 {"applied":false,"reason":"unknown-identity"}`、不转发、单独限流；事件只能撤销，不能授予任何权限。
+  400 / 401 记为失败不重试（需运维修正密钥后手动重发），5xx 与网络错误重试。
+- **中心状态检查（D）**：任一已认证请求到达时，该账号上一次成功检查超过 60 秒就先同步查一次身份中心（同一账号并发只查一次，
+  超时 3 秒；统一登录成功、会话刷新成功也算一次确认）。停用 / 删除 → 立即执行 B，本次请求按撤销返回。身份中心不可达（包括
+  401 / 403 这类**配置错误**，它们不会被当成「用户被停用」）时，上一次成功检查在 15 分钟宽限内放行；超过宽限后**设备请求**返回
+  `503 IDENTITY_UNAVAILABLE`（可重试，客户端保留本地待发内容），网页会话按会话复核宽限处理。**未配置服务账号时不做这项检查**：
+  中心停用只会在刷新复核时结束网页会话，已连接的设备不会自动失效，需要在产品里撤销——启动日志与账户中心都会写明；
+  开放公众注册（`OBSYNC_REGISTRATION_MODE=open`）时不配置直接拒绝启动。
+- **管理员停用 = B**；**重新启用只恢复登录资格，不复活任何旧凭据**：用户重新登录、重新连接设备即可；只用 API Token 的旧账号
+  （v0.18 邀请注册的）需要管理员在服务器上 `obsync token reset --user <名>` 换发新 Token。
+- **API Token 也在「全部凭据」之内**：B / C 会让它作废。旧管理员如果只用 `OBSYNC_TOKEN` 登录网页，执行 B 之后需要在服务器上
+  运行 `obsync token reset --from-env`（或 `obsync token reset` 换一个新的）——重启服务**不会**让旧 Token 复活（启动日志会提示）。
+  Token 重置本身也是一次 B（未使用的连接链接、其他网页会话一起失效，发起重置的会话保留）。
+- **做不到的事**：已经下载到设备上的笔记无法远程删除；离线设备在下一次联网时才收到撤销（`401 TOKEN_REVOKED`，客户端保留本地
+  待发内容并提示重新连接，不换用其他凭据提交）。
+
+身份中心（Keycloak）需要的配置（realm 模板 / `configure.sh` 增量应用）：两个产品的 client 都 `fullScopeAllowed=false`，作用域映射加
+`account` 客户端角色 `manage-account`（用户 access token 因此带 `aud: account`）；中心状态检查用的服务账号只授 realm-management 的
+`view-users`，并且**也要加进该 client 的作用域映射**，否则令牌不带这个角色、查询返回 403。
+
 ## 设备可信度：签名 checkpoint（0.15.0）
 
 服务器转发的 checkpoint 由**设备**签名，服务器自己不参与签名，因此无法长期
@@ -518,6 +567,8 @@ X-Canonical-Hash: canonical path HMAC，64 位小写 hex（0.12.0）
 | `CANONICAL_COLLISION` | 422 | canonical 归一化后与现有文件同名 |
 | `NOT_FOUND` / `TOO_LARGE` / `INTERNAL` | 404 / 413 / 5xx | — |
 | `AUTH_REQUIRED` | 401 | 0.20：网页会话失效（统一账号被撤销 / 退出），需重新登录，不得跨账号重发 |
+| `TOKEN_REVOKED` | 401 | 设备凭据 / 短期票 / API Token 曾有效、已被撤销（单独撤销、退出全部设备、停用、中心停用、Token 重置）；客户端保留本地待发内容，提示重新连接，不换用其他凭据提交 |
+| `IDENTITY_UNAVAILABLE` | 503 | 0.20.1：暂时无法向身份中心确认账号状态且已超过 15 分钟宽限（只对设备请求），带 `Retry-After`，`retryable:true`；保留本地待发内容稍后重试，不需要重新连接 |
 | `VAULT_REQUIRED` | 409 | 0.20：零仓库账号调用了需要仓库的接口 |
 | `VAULT_NOT_READY` | 409 | 0.20：仓库尚未完成加密初始化，拒绝内容写入 |
 | `EMAIL_NOT_VERIFIED` | 403 | 0.20：未验证邮箱的统一账号不能建仓库或连接设备 |
@@ -534,7 +585,12 @@ X-Canonical-Hash: canonical path HMAC，64 位小写 hex（0.12.0）
 | GET | `/auth/login` · `/auth/callback` · `/auth/link/start` | OIDC 授权码 + PKCE；认领旧账号（强制重新认证） |
 | POST | `/auth/logout` · `/auth/backchannel-logout` | 退出本产品；身份服务的 back-channel logout（验签、拒 nonce、jti 防重放） |
 | GET | `/api/v2/me` | 账号、角色、引导状态、功能开关、用量与上限 |
-| POST | `/api/v2/account/logout-all` | 退出所有产品与设备（撤销全部设备凭据并给出全局退出地址） |
+| POST | `/api/v2/account/logout-devices` | 0.20.1：动作 B，退出 LiteSync 的全部设备（返回撤销的设备与授权数） |
+| POST | `/api/v2/account/logout-all` | 0.20.1：动作 C，退出所有产品与设备；逐项返回 `local` / `identityCenter` / `peers[]` 的真实状态与一次性 `statusToken` |
+| GET | `/api/v2/account/revocations` | 0.20.1：最近的撤销事件与跨产品投递状态（只含时间、对象产品、状态与错误类别） |
+| POST | `/api/v2/account/revocations/{eventId}/retry` | 0.20.1：重新发送尚未送达的跨产品事件（只能是本人的事件） |
+| GET / POST | `/api/v2/revocation-status/{eventId}` · `…/resend` | 0.20.1：**公开**，凭 `X-Revocation-Status-Token`（C 的一次性凭证，30 分钟）查看 / 重发这一个事件；按 IP 限流 |
+| POST | `/api/internal/v1/account-revocations` | 0.20.1：**公开**，跨产品撤销事件接收端（HMAC 签名 + 时间窗 + eventId 去重 + 单独限流）；未配置共享密钥时 404 |
 | GET / DELETE | `/api/v2/devices` · `/api/v2/devices/{id}` | 本人设备列表与撤销 |
 | POST | `/api/v2/vaults` · `/api/v2/vaults/{id}/initialization` | 建 `pending_encryption` 仓库（clientRequestId 幂等）；一次提交加密初始化（opId 幂等） |
 | POST | `/api/v2/vaults/{id}/pairing-grants` · `/api/v2/pairings` · DELETE `/api/v2/pairings/{id}` | 发行连接链接、上传加密配对包、撤销 |

@@ -7,6 +7,7 @@ package sync
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -74,14 +75,36 @@ func HasScope(scopes, want string) bool {
 // CreateDevice 直接创建设备凭据（用户 Token 专用：首台设备自注册）。
 // vaultID / userID 是新设备的归属，来自认证上下文；空值落到 default 管理员
 //（单用户旧路径的正确语义，db.InsertDevice 兜底）。
+//
+// 新设备属于账号**此刻**的授权代次——只给运维 CLI 与测试用；请求路径上必须用
+// CreateDeviceAt 传入签发者凭据自己的代次（ADR-019 §2.2）。
 func (s *Service) CreateDevice(name, vaultID, userID string) (*DeviceCredential, error) {
 	s.mu.Lock()
+	epoch, err := db.UserAuthEpoch(s.db, defaultIfEmptyStr(userID, db.AdminUserID))
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return s.CreateDeviceAt(name, vaultID, userID, epoch)
+}
+
+// CreateDeviceAt 以签发者凭据的授权代次创建设备凭据（ADR-019 §2.2）。
+// 签发者在撤销之前通过了校验、撤销又抢先提交时，新设备带的是旧代次，下一次校验即失败。
+func (s *Service) CreateDeviceAt(name, vaultID, userID string, authEpoch int64) (*DeviceCredential, error) {
+	s.mu.Lock()
 	defer s.mu.Unlock()
-	cred, err := s.createDeviceLocked(name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID)
+	cred, err := s.createDeviceLocked(s.db, name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID, authEpoch, "")
 	if err == nil {
 		s.notifyDeviceLocked(userID, vaultID, cred.DeviceID, name, "")
 	}
 	return cred, err
+}
+
+func defaultIfEmptyStr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 // notifyDeviceLocked 发出「新设备已连接」通知（调用方持有 s.mu，且写入已提交）。
@@ -97,7 +120,8 @@ func (s *Service) notifyDeviceLocked(userID, vaultID, deviceID, name, platform s
 	})
 }
 
-func (s *Service) createDeviceLocked(name, scopes, vaultID, userID string) (*DeviceCredential, error) {
+// createDeviceLocked 写入一台新设备（q 可以是事务；调用方持有 s.mu）。
+func (s *Service) createDeviceLocked(q db.Queryer, name, scopes, vaultID, userID string, authEpoch int64, platform string) (*DeviceCredential, error) {
 	id, err := randomHex(8)
 	if err != nil {
 		return nil, err
@@ -107,7 +131,7 @@ func (s *Service) createDeviceLocked(name, scopes, vaultID, userID string) (*Dev
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if err := db.InsertDevice(s.db, &db.Device{
+	if err := db.InsertDevice(q, &db.Device{
 		DeviceID:   id,
 		Name:       name,
 		TokenHash:  sha256Hex([]byte(token)),
@@ -116,6 +140,8 @@ func (s *Service) createDeviceLocked(name, scopes, vaultID, userID string) (*Dev
 		LastSeenAt: now,
 		VaultID:    vaultID,
 		UserID:     userID,
+		Platform:   platform,
+		AuthEpoch:  authEpoch,
 	}); err != nil {
 		return nil, err
 	}
@@ -128,7 +154,18 @@ func (s *Service) createDeviceLocked(name, scopes, vaultID, userID string) (*Dev
 // 归属在创建时定死：新设备将落到 (vaultID, userID)。userID 为空而
 // actorDeviceID 非空时，继承该设备的归属——配对包由某台设备生成，
 // 新设备自然属于同一个人。
+//
+// 授权代次取账号此刻的值——只给测试与 CLI 用；请求路径用 CreateEnrollmentAt。
 func (s *Service) CreateEnrollment(ttl time.Duration, vaultID, userID, actorDeviceID string) (id, secret string, expiresAt int64, err error) {
+	return s.createEnrollment(ttl, vaultID, userID, actorDeviceID, nil)
+}
+
+// CreateEnrollmentAt 以签发者凭据的授权代次生成一次性注册凭据（ADR-019 §2.2）。
+func (s *Service) CreateEnrollmentAt(ttl time.Duration, vaultID, userID, actorDeviceID string, authEpoch int64) (id, secret string, expiresAt int64, err error) {
+	return s.createEnrollment(ttl, vaultID, userID, actorDeviceID, &authEpoch)
+}
+
+func (s *Service) createEnrollment(ttl time.Duration, vaultID, userID, actorDeviceID string, authEpoch *int64) (id, secret string, expiresAt int64, err error) {
 	if ttl <= 0 || ttl > 2*enrollmentDefaultTTL {
 		ttl = enrollmentDefaultTTL
 	}
@@ -150,8 +187,14 @@ func (s *Service) CreateEnrollment(ttl time.Duration, vaultID, userID, actorDevi
 			userID = ownerID
 		}
 	}
+	var epoch int64
+	if authEpoch != nil {
+		epoch = *authEpoch
+	} else if epoch, err = db.UserAuthEpoch(s.db, defaultIfEmptyStr(userID, db.AdminUserID)); err != nil {
+		return "", "", 0, err
+	}
 	err = db.InsertEnrollment(s.db, id, sha256Hex([]byte(secret)),
-		strings.Join(DefaultDeviceScopes, ","), now.Unix(), expiresAt, vaultID, userID)
+		strings.Join(DefaultDeviceScopes, ","), now.Unix(), expiresAt, vaultID, userID, epoch)
 	if err != nil {
 		return "", "", 0, err
 	}
@@ -160,21 +203,53 @@ func (s *Service) CreateEnrollment(ttl time.Duration, vaultID, userID, actorDevi
 
 // EnrollDevice 用一次性注册凭据换取设备凭据（公开接口，secret 即认证）。
 // 新设备的归属来自 enrollment 自身（创建时定死），不来自请求。
+//
+// ADR-019：授权签发时的代次必须仍等于账号当前代次、账号未停用；消费授权与建设备在
+// 同一事务里，新设备继承授权的代次（撤销与兑换并发时，晚到的这台下一次校验即失败）。
+// 失败一律 ErrEnrollmentInvalid（v1 端点「不暴露凭据是否曾经有效」的既有约定）。
 func (s *Service) EnrollDevice(secret, name string) (*DeviceCredential, error) {
+	hash := sha256Hex([]byte(secret))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	grant, err := db.ConsumeEnrollment(s.db, sha256Hex([]byte(secret)), time.Now().Unix())
+	row, err := db.GetEnrollmentBySecretHash(s.db, hash)
 	if err != nil {
 		return nil, err
 	}
-	if grant == nil {
+	if row == nil {
 		return nil, ErrEnrollmentInvalid
 	}
-	cred, err := s.createDeviceLocked(name, grant.Scopes, grant.VaultID, grant.UserID)
-	if err == nil {
-		s.notifyDeviceLocked(grant.UserID, grant.VaultID, cred.DeviceID, name, "")
+	st, err := db.UserSessionState(s.db, row.UserID)
+	if err != nil {
+		return nil, err
 	}
-	return cred, err
+	if st.Disabled || row.AuthEpoch != st.AuthEpoch {
+		return nil, ErrEnrollmentInvalid
+	}
+	var cred *DeviceCredential
+	var grant *db.EnrollmentGrant
+	err = s.inTx(func(tx *sql.Tx) error {
+		g, err := db.ConsumeEnrollment(tx, hash, time.Now().Unix(), row.AuthEpoch)
+		if err != nil {
+			return err
+		}
+		if g == nil {
+			return ErrEnrollmentInvalid
+		}
+		// 事务内复核（多连接的 PG 部署里撤销可能刚好提交）
+		if cur, err := db.UserAuthEpoch(tx, g.UserID); err != nil {
+			return err
+		} else if cur != g.AuthEpoch {
+			return ErrEnrollmentInvalid
+		}
+		grant = g
+		cred, err = s.createDeviceLocked(tx, name, g.Scopes, g.VaultID, g.UserID, g.AuthEpoch, "")
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.notifyDeviceLocked(grant.UserID, grant.VaultID, cred.DeviceID, name, "")
+	return cred, nil
 }
 
 // AuthDevice 校验设备 token；有效则返回设备并更新 last_seen（节流到 5 分钟一次）。
@@ -190,13 +265,16 @@ func (s *Service) AuthDevice(token string) (*db.Device, error) {
 func (s *Service) AuthDeviceWithClient(token, clientVersion string, protocol int64, platform, ip string) (*db.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	d, err := db.GetDeviceByTokenHash(s.db, sha256Hex([]byte(token)))
-	if err != nil || d == nil {
+	a, err := db.GetDeviceAuthByTokenHash(s.db, sha256Hex([]byte(token)))
+	if err != nil || a == nil {
 		return nil, err
 	}
-	if d.Revoked {
+	// ADR-019 R-1：单独撤销、账号授权代次已前进（退出全部设备 / 停用 / 中心停用……）、
+	// 账号已停用——都是「曾有效、已被撤销」
+	if !a.Valid() {
 		return nil, ErrDeviceRevoked
 	}
+	d := &a.Device
 	now := time.Now().Unix()
 	// 版本/平台/IP 任一变化就立刻记，否则沿用 5 分钟节流：升级完（或换了网络）
 	// 立刻去看设备列表是个很自然的动作，让人等五分钟才看到新值会被当成「没生效」

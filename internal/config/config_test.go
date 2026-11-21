@@ -107,6 +107,14 @@ func TestLoadPublicLaunchOptions(t *testing.T) {
 		t.Fatal("open registration without an explicit per-account storage quota must refuse to start")
 	}
 	t.Setenv("OBSYNC_QUOTA_BYTES_PER_USER", "2GB")
+	// ADR-019 §2.5：开放公众注册必须配置中心状态检查（否则中心停用 / 删除的账号保留设备凭据）
+	t.Setenv("OBSYNC_OIDC_STATUS_CLIENT_ID", "")
+	t.Setenv("OBSYNC_OIDC_STATUS_CLIENT_SECRET", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("open registration without the central status check must refuse to start")
+	}
+	t.Setenv("OBSYNC_OIDC_STATUS_CLIENT_ID", "litesync-status")
+	t.Setenv("OBSYNC_OIDC_STATUS_CLIENT_SECRET", "status-secret-not-real")
 	if cfg, err = Load(); err != nil || cfg.RegistrationMode != "open" || cfg.LegacyTokenLogin || cfg.QuotaBytesPerUser != 2<<30 {
 		t.Fatalf("explicit settings not honored: %v %+v", err, cfg)
 	}

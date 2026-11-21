@@ -277,7 +277,9 @@ type Service struct {
 	opts    Options
 	// notifier：账号安全通知（v0.20，可为 nil）；见 notify.go
 	notifier Notifier
-	log      *slog.Logger
+	// peer：跨产品撤销（v0.20.1 / ADR-019 §2.4；未配置为 nil）；见 revocation_peer.go
+	peer *peerState
+	log  *slog.Logger
 	// blobID 域分隔密钥（§10.3）。按 Vault 缓存（vaultID → []byte）：
 	// 密钥落库后不变，缓存永不失效；换掉它会让该 Vault 的去重失效。
 	secrets gosync.Map

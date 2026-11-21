@@ -19,3 +19,17 @@ func ForceSessionRevalidation(_ http.Handler) {
 
 // ResetOIDCClock 恢复真实时钟。
 func ResetOIDCClock() { oidcNow = time.Now }
+
+// ShiftCentralClock 把中心状态检查（ADR-019 §2.5）的时钟拨快 d；返回恢复函数。
+func ShiftCentralClock(d time.Duration) (restore func()) {
+	old := centralNow
+	centralNow = func() time.Time { return old().Add(d) }
+	return func() { centralNow = old }
+}
+
+// SetCentralCheckTimeout 临时改变中心状态检查的超时；返回恢复函数。
+func SetCentralCheckTimeout(d time.Duration) (restore func()) {
+	old := centralCheckTimeout
+	centralCheckTimeout = d
+	return func() { centralCheckTimeout = old }
+}

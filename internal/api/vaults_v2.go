@@ -265,7 +265,7 @@ func (h *handlers) createPairingGrant(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusForbidden, CodeReauthRequired, "sign in again before connecting a new device", false)
 		return
 	}
-	g, err := h.svc.CreatePairingGrant(scope, owner, me.DeviceID)
+	g, err := h.svc.CreatePairingGrant(scope, owner, me.DeviceID, me.AuthEpoch)
 	if errors.Is(err, syncsvc.ErrVaultNotReady) {
 		writeVaultNotReady(w)
 		return
@@ -451,7 +451,8 @@ func (h *handlers) redeemEnrollment(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, syncsvc.ErrPairingExpired):
 		writeCoded(w, http.StatusGone, CodePairingExpired, "this link has expired", false)
 	case errors.Is(err, syncsvc.ErrPairingRevoked):
-		writeCoded(w, http.StatusGone, CodePairingRevoked, "this link has been revoked", false)
+		writeCoded(w, http.StatusGone, CodePairingRevoked,
+			"这个连接链接已失效：它被撤销了，或者账号已执行「退出全部设备」、被停用。请在账户中心重新生成链接。", false)
 	case errors.Is(err, syncsvc.ErrVaultMismatch):
 		writeCoded(w, http.StatusConflict, CodeVaultMismatch, "this link belongs to a different vault", false)
 	case errors.Is(err, syncsvc.ErrVaultNotReady):
@@ -503,7 +504,11 @@ func readyGate(h *handlers, next http.Handler) http.Handler {
 func publicAPIRoute(r *http.Request) bool {
 	p := r.URL.Path
 	return (r.Method == http.MethodGet && strings.HasPrefix(p, "/api/v2/pairings/") && strings.HasSuffix(p, "/envelope")) ||
-		(r.Method == http.MethodPost && p == "/api/v2/device-enrollments/redeem")
+		(r.Method == http.MethodPost && p == "/api/v2/device-enrollments/redeem") ||
+		// ADR-019：动作 C 结果页的一次性进度凭证、跨产品撤销接收端（HMAC）
+		(r.Method == http.MethodGet && strings.HasPrefix(p, "/api/v2/revocation-status/") && strings.Count(p, "/") == 4) ||
+		(r.Method == http.MethodPost && strings.HasPrefix(p, "/api/v2/revocation-status/") && strings.HasSuffix(p, "/resend")) ||
+		(r.Method == http.MethodPost && p == syncsvc.PeerRevocationPath)
 }
 
 // mailWebhook POST /hooks/mail/resend：服务商回执（Svix 签名校验在 handler 内）。

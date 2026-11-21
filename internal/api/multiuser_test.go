@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/KJoner/litesync-server/internal/db"
 )
 
 func adminCreateInvite(t *testing.T, e *testEnv) (secret string) {
@@ -200,12 +202,21 @@ func TestUserDisableAndDelete(t *testing.T) {
 	if resp, _ := bearerGet(t, e, "/api/v1/info", tok); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("disabled user info = %d, want 401", resp.StatusCode)
 	}
-	// 解禁 → Token 恢复
+	// 解禁（v0.20.1 / ADR-019 §2.1）：只恢复登录资格，**不复活任何旧凭据**（R-2）。
+	// 停用 = 动作 B，旧 Token 的授权代次已落后：解禁后仍是 401 TOKEN_REVOKED，
+	// 换发新 Token（`obsync token reset --user` 的等价操作）之后才能继续使用
 	req, _ = http.NewRequest(http.MethodPost, e.ts.URL+"/api/v1/admin/users/"+userID+"/enable", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	e.do(t, req)
+	if resp, body := bearerGet(t, e, "/api/v1/info", tok); resp.StatusCode != http.StatusUnauthorized || body["code"] != "TOKEN_REVOKED" {
+		t.Fatalf("re-enabled user's OLD token = %d %v, want 401 TOKEN_REVOKED (re-enabling must not revive old credentials)", resp.StatusCode, body)
+	}
+	tok = "lsk_reissued_after_enable_0123456789abcdef"
+	if _, err := db.SetUserToken(e.db, userID, db.HashToken(tok)); err != nil {
+		t.Fatal(err)
+	}
 	if resp, _ := bearerGet(t, e, "/api/v1/info", tok); resp.StatusCode != http.StatusOK {
-		t.Fatalf("re-enabled user info = %d, want 200", resp.StatusCode)
+		t.Fatalf("re-enabled user with a re-issued token: info = %d, want 200", resp.StatusCode)
 	}
 
 	// 删除：confirmName 不符 → 400 且没删；相符 → 数据消失、Token 失效

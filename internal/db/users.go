@@ -39,13 +39,15 @@ func HashToken(token string) string {
 }
 
 const userColumns = `user_id, name, created_at,
-	COALESCE(token_hash, ''), token_generation, is_admin, disabled, COALESCE(last_seen_at, 0)`
+	COALESCE(token_hash, ''), token_generation, is_admin, disabled, COALESCE(last_seen_at, 0),
+	auth_epoch, token_auth_epoch, central_checked_at`
 
 func scanUser(row *sql.Row) (*User, error) {
 	u := &User{}
 	var isAdmin, disabled int
 	err := row.Scan(&u.UserID, &u.Name, &u.CreatedAt,
-		&u.TokenHash, &u.TokenGeneration, &isAdmin, &disabled, &u.LastSeenAt)
+		&u.TokenHash, &u.TokenGeneration, &isAdmin, &disabled, &u.LastSeenAt,
+		&u.AuthEpoch, &u.TokenAuthEpoch, &u.CentralCheckedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -78,13 +80,16 @@ func GetUserByName(q dbtx, name string) (*User, error) {
 	return scanUser(q.QueryRow(`SELECT `+userColumns+` FROM users WHERE name = ?`, name))
 }
 
-// SetUserToken 写入新的 Token 哈希并把会话世代 +1。
+// SetUserToken 写入新的 Token 哈希并把会话世代 +1；新 Token 属于账号**当前**授权代次。
 //
 // 世代 +1 的效果：所有按旧世代建立的网页会话在下一次校验时被拒。
 // 轮换与会话作废因此是同一个原子写，不存在「Token 换了、旧会话还活着」的窗口。
+//
+// 只给「真的签发了一个新 Token」的路径用（网页 / CLI 重置）。只想作废会话的地方用
+// BumpSessionGeneration——用这里原样写回旧哈希会把旧 Token 重新挂到新代次上，等于复活它。
 func SetUserToken(q dbtx, userID, tokenHash string) (generation int64, err error) {
-	res, err := q.Exec(`UPDATE users SET token_hash = ?, token_generation = token_generation + 1
-		WHERE user_id = ?`, tokenHash, userID)
+	res, err := q.Exec(`UPDATE users SET token_hash = ?, token_generation = token_generation + 1,
+		token_auth_epoch = auth_epoch WHERE user_id = ?`, tokenHash, userID)
 	if err != nil {
 		return 0, err
 	}
@@ -109,6 +114,47 @@ func UserTokenGeneration(q dbtx, userID string) (int64, error) {
 		return 0, nil
 	}
 	return gen, err
+}
+
+// SessionState 是网页会话每次校验要比较的账号状态（一次查询取齐）。
+type SessionState struct {
+	Exists          bool
+	Disabled        bool
+	TokenGeneration int64
+	AuthEpoch       int64
+}
+
+// UserSessionState 返回会话校验所需的账号状态；用户不存在时 Exists=false。
+func UserSessionState(q dbtx, userID string) (SessionState, error) {
+	var st SessionState
+	var disabled int
+	err := q.QueryRow(`SELECT token_generation, auth_epoch, disabled FROM users WHERE user_id = ?`, userID).
+		Scan(&st.TokenGeneration, &st.AuthEpoch, &disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return st, nil
+	}
+	if err != nil {
+		return st, err
+	}
+	st.Exists, st.Disabled = true, disabled != 0
+	return st, nil
+}
+
+// UserAuthEpoch 返回账号当前授权代次；账号行不存在按 0 处理（与 DeviceAuth.Valid 同一口径：
+// 被撤销过的账号代次 ≥ 1，不会因为「查不到账号」而让旧凭据对上）。
+func UserAuthEpoch(q dbtx, userID string) (int64, error) {
+	var e int64
+	err := q.QueryRow(`SELECT auth_epoch FROM users WHERE user_id = ?`, userID).Scan(&e)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return e, err
+}
+
+// SetCentralCheckedAt 记录「身份中心确认这个账号仍然启用」的时刻（只前进）。
+func SetCentralCheckedAt(q dbtx, userID string, at int64) error {
+	_, err := q.Exec(`UPDATE users SET central_checked_at = ? WHERE user_id = ? AND central_checked_at < ?`, at, userID, at)
+	return err
 }
 
 // SetUserDisabled 设置禁用位。禁用即时生效：Token 认证与会话世代校验都会拒绝。
@@ -146,6 +192,10 @@ const (
 	// AdminTokenSuperseded：库里的哈希与环境变量**不同**——网页端轮换过，
 	// 以库为准，环境变量当前无效。调用方必须把这件事清楚地写进启动日志。
 	AdminTokenSuperseded
+	// AdminTokenRevoked：哈希与环境变量一致，但这个 Token 已随「退出本产品的全部设备」等
+	// 动作作废（ADR-019：代次只增不减，重启不复活旧凭据）。重新启用必须显式运行
+	// `obsync token reset --from-env`。
+	AdminTokenRevoked
 )
 
 // EnsureAdminUser 启动对账（幂等）：保证内置管理员账号存在并持有可用的 Token 哈希。
@@ -176,9 +226,12 @@ func EnsureAdminUser(q dbtx, envTokenHash string) (AdminTokenReconcile, error) {
 		if envTokenHash == "" {
 			return AdminTokenUnchanged, errors.New("admin account has no token and OBSYNC_TOKEN is empty")
 		}
-		_, err := q.Exec(`UPDATE users SET token_hash = ? WHERE user_id = ?`, envTokenHash, AdminUserID)
+		_, err := q.Exec(`UPDATE users SET token_hash = ?, token_auth_epoch = auth_epoch WHERE user_id = ?`, envTokenHash, AdminUserID)
 		return AdminTokenAdopted, err
 	case subtle.ConstantTimeCompare([]byte(u.TokenHash), []byte(envTokenHash)) == 1:
+		if !u.TokenValid() {
+			return AdminTokenRevoked, nil
+		}
 		return AdminTokenUnchanged, nil
 	default:
 		return AdminTokenSuperseded, nil

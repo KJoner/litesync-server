@@ -57,6 +57,12 @@ type OIDCOptions struct {
 	RegistrationMode string
 	// HTTPClient：访问身份服务用的客户端（测试注入；生产默认 10 秒超时）。
 	HTTPClient *http.Client
+	// StatusClientID / StatusClientSecret：中心状态检查用的只读服务账号（client credentials，
+	// realm-management 的 view-users；ADR-019 §2.5）。两者都非空才启用动作 D 的检查。
+	StatusClientID     string
+	StatusClientSecret string
+	// AdminAPIURL：Keycloak 管理接口基址（…/admin/realms/{realm}）；空 = 从 Issuer 推导。
+	AdminAPIURL string
 }
 
 func (o OIDCOptions) enabled() bool {
@@ -282,7 +288,7 @@ func (h *handlers) oidcLinkStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info, ok := h.web.lookup(c.Value, false)
-	if !ok || !sessionGenerationValid(h.svc, info) {
+	if !ok || !sessionValid(h.svc, info) {
 		authErrorPage(w, http.StatusUnauthorized, "会话已失效，请先用原来的方式登录，再绑定统一账号。")
 		return
 	}
@@ -488,7 +494,7 @@ func (h *handlers) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	base := sessionInfo{
 		userID: user.UserID, name: display, isAdmin: user.IsAdmin, vaultID: vaultID,
-		tokenGeneration: user.TokenGeneration, oidc: st, authTime: now,
+		tokenGeneration: user.TokenGeneration, authEpoch: user.AuthEpoch, oidc: st, authTime: now,
 	}
 	h.setSessionCookie(w, r, sessionCookieName, h.web.create(base), int(sessionTTL.Seconds()))
 	if in.admin {
@@ -496,28 +502,32 @@ func (h *handlers) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		elevated.admin = true
 		h.setSessionCookie(w, r, adminCookieName, h.web.create(elevated), int(adminTTL.Seconds()))
 	}
+	// 身份中心刚刚认证过这个人：算一次「确认启用」（ADR-019 §2.5 的宽限起点）
+	h.central.markOK(user.UserID, now)
 	bouncePage(w, in.returnTo)
 }
 
 // revalidate 每 ≤5 分钟用 refresh token 向身份服务复核一次会话（ADR-011 I-6）：
-// 账号被冻结、在别处「退出全部」后 refresh 会失败，本会话随之失效。
-// 身份服务暂时不可达时给有限宽限，超过宽限同样失效。返回 false = 会话应作废。
-func (rp *oidcRP) revalidate(ctx context.Context, st *oidcSessionState) bool {
+// 账号被冻结、在别处「退出全部」后 refresh 会失败，本会话随之失效（这是动作 A：只结束
+// 网页会话；设备凭据只由 B / C / D 撤销，ADR-019 R-3）。
+// 身份服务暂时不可达时给有限宽限，超过宽限同样失效。返回 valid=false = 会话应作废；
+// refreshed=true = 这一次真的向身份服务确认过（中心状态检查把它算作一次「确认启用」）。
+func (rp *oidcRP) revalidate(ctx context.Context, st *oidcSessionState) (valid, refreshed bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	now := oidcNow()
 	if now.Before(st.revalidateAt) {
-		return true
+		return true, false
 	}
 	if st.refreshToken == "" {
 		// 身份服务没给 refresh token：没法复核，只能按会话自身期限
 		st.revalidateAt = now.Add(sessionRevalidate)
-		return true
+		return true, false
 	}
 	cctx, cancel := context.WithTimeout(rp.ctx(ctx), 5*time.Second)
 	defer cancel()
 	if err := rp.ensure(cctx); err != nil {
-		return rp.graceLocked(st, now)
+		return rp.graceLocked(st, now), false
 	}
 	ts := rp.oauth.TokenSource(cctx, &oauth2.Token{RefreshToken: st.refreshToken, Expiry: now.Add(-time.Second)})
 	tok, err := ts.Token()
@@ -525,14 +535,14 @@ func (rp *oidcRP) revalidate(ctx context.Context, st *oidcSessionState) bool {
 		var re *oauth2.RetrieveError
 		if errors.As(err, &re) && (re.ErrorCode == "invalid_grant" || re.ErrorCode == "unauthorized_client" ||
 			re.Response != nil && re.Response.StatusCode >= 400 && re.Response.StatusCode < 500) {
-			return false // 身份服务明确拒绝：账号冻结 / 全局退出 / 会话被撤销
+			return false, false // 身份服务明确拒绝：账号冻结 / 全局退出 / 会话被撤销
 		}
-		return rp.graceLocked(st, now)
+		return rp.graceLocked(st, now), false
 	}
 	if rawID, _ := tok.Extra("id_token").(string); rawID != "" {
 		// 轮换回来的 ID Token 必须仍是同一个主体
 		if idt, verr := rp.verifier.Verify(cctx, rawID); verr != nil || idt.Subject != st.subject {
-			return false
+			return false, false
 		} else {
 			st.idToken = rawID
 		}
@@ -542,7 +552,7 @@ func (rp *oidcRP) revalidate(ctx context.Context, st *oidcSessionState) bool {
 	}
 	st.lastValidated = now
 	st.revalidateAt = now.Add(sessionRevalidate)
-	return true
+	return true, true
 }
 
 func (rp *oidcRP) graceLocked(st *oidcSessionState, now time.Time) bool {
@@ -565,6 +575,11 @@ func (h *handlers) oidcLogout(w http.ResponseWriter, r *http.Request) {
 
 // backchannelLogout POST /auth/backchannel-logout（身份服务直连调用，公开）：
 // 校验 logout token 后作废对应会话（OIDC Back-Channel Logout 1.0）。
+//
+// ADR-019：不论带 sid 还是只带 sub，这**永远只是动作 A**——身份中心的会话结束不代表用户
+// 要断开全部 Obsidian。sid → 作废这一个网页会话；只有 sub → 作废本产品该用户的全部网页会话
+//（会话世代 +1）。设备凭据、待领取授权一律不动（R-3）；它们只由 B / C / D 撤销。
+// 动作 C 之后 Keycloak 会为每个会话发来这里，按 A 处理即可（本产品的会话已因 B 失效）。
 func (h *handlers) backchannelLogout(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if h.rp == nil {
@@ -737,6 +752,8 @@ func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 			"oidc":             h.rp != nil,
 			"registrationMode": h.opts.OIDC.RegistrationMode,
 			"webEditing":       h.opts.WebEditing,
+			// ADR-019：账户中心据此如实提示「跨产品撤销 / 中心状态检查未配置」
+			"revocation": h.revocationConfigJSON(),
 		},
 	}
 	if h.rp != nil && h.rp.ensure(r.Context()) == nil {
@@ -745,37 +762,6 @@ func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 	// 用量与上限（需求 §12：达到额度之前就让用户看得到；limit 0 = 不限）
 	if usage, err := h.svc.UserUsage(owner); err == nil {
 		out["usage"] = usageJSON(usage)
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
-// logoutAll POST /api/v2/account/logout-all：退出所有产品与设备（需求 §3.2）。
-// 全部网页会话失效 + 撤销全部设备凭据；返回身份服务的全局退出地址，
-// 浏览器随后跳转过去结束 SSO 会话（另一个产品经 back-channel logout 同步退出）。
-func (h *handlers) logoutAll(w http.ResponseWriter, r *http.Request) {
-	me := identityFrom(r)
-	if me == nil || me.UserID == "" {
-		writeCoded(w, http.StatusForbidden, CodeForbidden, "user session required", false)
-		return
-	}
-	n, err := h.svc.LogoutEverywhere(me.UserID)
-	if err != nil {
-		h.internalError(w, "logout all", err)
-		return
-	}
-	out := map[string]any{"ok": true, "revokedDevices": n}
-	if h.rp != nil && h.rp.endSess != "" {
-		v := url.Values{}
-		v.Set("client_id", h.rp.opts.ClientID)
-		v.Set("post_logout_redirect_uri", h.rp.opts.PublicURL+"/")
-		if me.idTokenHint != "" {
-			v.Set("id_token_hint", me.idTokenHint)
-		}
-		out["endSessionUrl"] = h.rp.endSess + "?" + v.Encode()
-	}
-	// 当前浏览器的会话 Cookie 一并清掉
-	for _, name := range []string{sessionCookieName, adminCookieName} {
-		http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
