@@ -350,11 +350,13 @@ func (h *handlers) restoreFileWithContent(w http.ResponseWriter, r *http.Request
 // trash 回收站（v0.20 网页编辑 / 需求 §7.2「删除回收」）：本仓库仍保留的删除记录。
 //
 // 只读。restorable=false 表示删除前的内容已被历史清理（或 blob 已不在）——界面据此不提供恢复。
-// v0.20.1 只加字段（插件不读这个接口，网页之外的调用方照旧可用）：
+// v0.20.1 只加字段，原有字段的名字与含义不变（插件 0.20.1 起读其中的 contentGeneration / metaGeneration
+// 作为显式恢复时信封世代的下限，见插件 push.ts 的 tombstoneFacts；它不看 restorable）：
 //   - priorRevision / priorGeneration：删除前内容所在的历史版本（W4：先取回再以新世代重新加密，
 //     PUT /api/v1/files/{fileId}/restore 一次提交）；
 //   - metaEnc：路径加密仓库删除前最后一份 LSM1 密文（W5：已解锁的客户端解密出原路径；
 //     服务器看不到里面的明文）。空 = 明文仓库或较早删除的记录，客户端给出手动选择路径的降级。
+//
 // GET /api/v1/trash
 func (h *handlers) trash(w http.ResponseWriter, r *http.Request) {
 	list, err := h.svc.ListTrash(scopeOf(r))

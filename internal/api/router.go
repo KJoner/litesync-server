@@ -81,7 +81,7 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("GET /api/v1/file", h.getFile)
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
-	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)             // v6：改名 = 元数据更新，不产生 tombstone
+	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)                       // v6：改名 = 元数据更新，不产生 tombstone
 	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile)           // v6：显式恢复已删除对象（插件；语义不变）
 	mux.HandleFunc("PUT /api/v1/files/{fileId}/restore", h.restoreFileWithContent) // v0.20.1：带新内容的原子恢复（W4）
 	mux.HandleFunc("GET /api/v1/trash", h.trash)                                   // v0.20：回收站（只读列表）
