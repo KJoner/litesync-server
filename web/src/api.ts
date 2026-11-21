@@ -637,9 +637,49 @@ export interface Me {
 	onboarding: { state: "needs_first_vault" | "ready" };
 	identity: { linked: boolean };
 	session: { kind: "oidc" | "token" | "device"; legacyLogin: boolean };
-	features: { oidc: boolean; registrationMode: string; webEditing?: boolean };
+	features: {
+		oidc: boolean;
+		registrationMode: string;
+		webEditing?: boolean;
+		/** ADR-019：部署是否配置了身份中心 / 跨产品撤销 / 中心状态检查（未配置要如实提示） */
+		revocation?: RevocationConfig;
+	};
 	accountConsoleUrl?: string;
 	usage?: Usage;
+}
+
+export interface RevocationConfig {
+	identityCenter: boolean;
+	peerRevocation: boolean;
+	centralStatusCheck: boolean;
+}
+
+/** 跨产品撤销事件的投递状态（ADR-019 §2.3 / §5）。 */
+export interface PeerDelivery {
+	product: string;
+	state: "pending" | "delivered" | "failed" | "not-configured";
+	attempts?: number;
+	nextAttemptAt?: string;
+	expiresAt?: string;
+	deliveredAt?: string;
+	result?: string;
+	error?: string;
+}
+
+/** 一次账号撤销（B / C / D / 停用 / Token 重置 / 另一个产品发起）的真实结果。 */
+export interface RevocationView {
+	ok: boolean;
+	eventId: string;
+	createdAt: string;
+	scope: "product-devices" | "all-products-all-devices";
+	reason: string;
+	origin: string;
+	local: { state: "done"; revokedDevices: number; revokedGrants: number };
+	identityCenter?: { state: "done" | "failed" | "not-applicable" | "pending"; error?: string; reason?: string; accountConsoleUrl?: string };
+	peers?: PeerDelivery[];
+	/** 只有动作 C 的响应带：凭它在结果页查看 / 重发（30 分钟；本产品的会话此时已全部失效） */
+	statusToken?: string;
+	endSessionUrl?: string;
 }
 
 export interface VaultCard {
@@ -738,5 +778,26 @@ export const accountApi = {
 	devices: async (): Promise<AccountDevice[]> => (await v2<{ devices: AccountDevice[] }>("GET", "/api/v2/devices")).devices ?? [],
 	revokeDevice: (id: string) => v2<unknown>("DELETE", `/api/v2/devices/${encodeURIComponent(id)}`),
 	logout: () => v2<unknown>("POST", "/auth/logout"),
-	logoutAll: () => v2<{ revokedDevices: number; endSessionUrl?: string }>("POST", "/api/v2/account/logout-all"),
+	/** 动作 B：退出 LiteSync 的全部设备（ADR-019） */
+	logoutDevices: () => v2<RevocationView>("POST", "/api/v2/account/logout-devices"),
+	/** 动作 C：退出所有产品与设备（逐项返回本产品 / 身份中心 / 另一个产品的真实状态） */
+	logoutAll: () => v2<RevocationView>("POST", "/api/v2/account/logout-all"),
+	revocations: () => v2<{ revocations: RevocationView[]; config: RevocationConfig }>("GET", "/api/v2/account/revocations"),
+	retryRevocation: (eventId: string) =>
+		v2<RevocationView>("POST", `/api/v2/account/revocations/${encodeURIComponent(eventId)}/retry`),
+	/** C 之后（会话已失效）凭一次性 statusToken 查看 / 重发这一个事件 */
+	revocationStatus: (eventId: string, token: string) => statusCall("GET", eventId, "", token),
+	resendRevocation: (eventId: string, token: string) => statusCall("POST", eventId, "/resend", token),
 };
+
+async function statusCall(method: string, eventId: string, suffix: string, token: string): Promise<RevocationView> {
+	const res = await fetch(`/api/v2/revocation-status/${encodeURIComponent(eventId)}${suffix}`, {
+		method, headers: { "X-Revocation-Status-Token": token },
+	});
+	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+	if (!res.ok) {
+		throw new ApiCodeError(res.status, String(data.code ?? "HTTP_" + res.status),
+			String(data.message ?? data.error ?? `HTTP ${res.status}`), Boolean(data.retryable));
+	}
+	return data as unknown as RevocationView;
+}

@@ -19,6 +19,8 @@ import {
 	login,
 	Me,
 	PairingGrantResp,
+	PeerDelivery,
+	RevocationView,
 	VaultCard,
 } from "./api";
 import {
@@ -742,31 +744,14 @@ export async function renderAccountCenter(host: PortalHost, me: Me, cfg: AuthCon
 	devs.append(list);
 	main.append(devs);
 
-	const out = h("section", "panel");
-	out.append(h("h2", "", "退出"));
-	const logoutHere = button("退出 LiteSync（仅此浏览器）", "", () => {
-		void (me.session.kind === "oidc" ? accountApi.logout() : fetch("/web/session", { method: "DELETE" }))
-			.catch(() => undefined).then(() => {
-				announceAccount(""); // 同一浏览器的其他标签页随之清掉可见内容
-				location.hash = "";
-				location.reload();
-			});
-	});
-	const logoutAll = button("退出所有产品与设备…", "danger", () => {
-		if (!confirm("这会退出所有浏览器中的 LiteSync，并撤销你名下的全部设备授权：每台 Obsidian 都需要重新连接。确定继续？")) return;
-		void accountApi.logoutAll().then((r) => {
-			announceAccount("");
-			if (r.endSessionUrl) location.href = r.endSessionUrl;
-			else location.reload();
-		}, (e) => alert(errText(e)));
-	});
-	out.append(logoutHere, logoutAll);
-	if (me.session.kind === "token") {
-		const adv = h("a", "button ghost", "API Token（高级）");
-		adv.href = "#/account";
-		out.append(adv);
-	}
-	main.append(out);
+	main.append(revocationSection(me));
+	const history = h("section", "panel");
+	history.append(h("h2", "", "最近的撤销"));
+	const historyList = h("div", "revocation-list");
+	historyList.append(h("p", "muted small", "正在加载…"));
+	history.append(historyList);
+	main.append(history);
+	void renderRevocationHistory(historyList);
 
 	try {
 		const devices = await accountApi.devices();
@@ -788,5 +773,305 @@ export async function renderAccountCenter(host: PortalHost, me: Me, cfg: AuthCon
 	} catch (e) {
 		list.innerHTML = "";
 		list.append(h("div", "banner danger", "加载设备失败：" + errText(e)));
+	}
+}
+
+// ---------------------------------------------------------------- 退出与撤销（ADR-019）
+//
+// 三种动作各是一个按钮，旁边写清影响范围（ADR-019 §2.1）：
+//   A 只退出这个浏览器      POST /auth/logout（统一登录）/ DELETE /web/session（Token 登录）
+//   B 退出 LiteSync 的全部设备  POST /api/v2/account/logout-devices
+//   C 退出所有产品与设备      POST /api/v2/account/logout-all：逐项展示本产品 / 身份中心 / 另一个产品的
+//                             真实状态，pending / failed 看得到、能「重新发送」（R-5）
+// B / C 之后本产品的会话都已失效；C 的结果页凭响应里的一次性 statusToken（30 分钟）继续查看与重发。
+
+const IDENTITY_ERRORS: Record<string, string> = {
+	"no-user-token": "当前登录方式没有可用的身份中心令牌（例如用 API Token 登录）",
+	"session-expired": "身份中心那边的登录已经过期，或已在别处退出",
+	"identity-unreachable": "暂时连不上身份中心",
+	forbidden: "身份中心拒绝了请求（服务器的身份中心配置缺少 manage-account 授权）",
+	unauthorized: "身份中心不接受这个令牌",
+	"not-supported": "身份中心不支持「结束全部会话」",
+	"identity-error": "身份中心返回了意外的结果",
+};
+
+function peerErrorText(err?: string): string {
+	if (!err) return "";
+	if (err.startsWith("expired:")) return "7 天内一直没能送达（最后一次：" + peerErrorText(err.slice(8)) + "）";
+	if (err.startsWith("http-")) return `对方暂时不可用（HTTP ${err.slice(5)}）`;
+	switch (err) {
+		case "network":
+			return "网络不通";
+		case "timeout":
+			return "请求超时";
+		case "signature-rejected":
+			return "对方拒绝了签名：两边的共享密钥不一致，需要管理员修正后重新发送";
+		case "bad-request":
+			return "对方认为事件格式不对，需要管理员检查两边的版本";
+		default:
+			return err;
+	}
+}
+
+function productName(p: string): string {
+	return p === "nexus" ? "Nexus Portal" : p;
+}
+
+function fmtIso(iso?: string): string {
+	if (!iso) return "";
+	const d = new Date(iso);
+	return isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+function revocationTitle(r: RevocationView): string {
+	if (r.reason.startsWith("peer:")) return `${productName(r.origin)} 发起的「退出所有产品与设备」`;
+	switch (r.reason) {
+		case "admin-disable":
+			return "管理员停用了账号";
+		case "central-disabled":
+			return "身份中心停用了账号";
+		case "account-deleted":
+			return "身份中心删除了账号";
+		case "token-reset":
+			return "重置 API Token";
+		default:
+			return r.scope === "all-products-all-devices" ? "退出所有产品与设备" : "退出 LiteSync 的全部设备";
+	}
+}
+
+/** 一个跨产品投递的展示：[状态文字, chip 样式, 说明]。 */
+function peerView(p: PeerDelivery): [string, string, string] {
+	switch (p.state) {
+		case "delivered":
+			return ["已送达", "ok", p.result === "unknown-identity" ? "对方没有这个账号，无需撤销" : "对方已撤销这个账号的全部网页登录、设备与扩展授权"];
+		case "pending":
+			return ["等待送达", "warn", `已尝试 ${p.attempts ?? 0} 次${p.error ? "（" + peerErrorText(p.error) + "）" : ""}；` +
+				`下次重试约在 ${fmtIso(p.nextAttemptAt)}，后台会持续重试，最长 7 天`];
+		case "failed":
+			return ["发送失败", "danger", peerErrorText(p.error) || "没有送达"];
+		default:
+			return ["未配置", "warn", "服务器没有配置跨产品撤销，这个产品没有被通知。请到它的账户中心执行「退出全部设备」。"];
+	}
+}
+
+function scopeBlock(title: string, scope: string, action: HTMLElement): { row: HTMLElement; text: HTMLElement } {
+	const row = h("div", "revocation-action");
+	const text = h("div", "revocation-scope");
+	text.append(h("strong", "", title), h("p", "muted small", scope));
+	row.append(text, action);
+	return { row, text };
+}
+
+function revocationSection(me: Me): HTMLElement {
+	const rc = me.features.revocation;
+	const out = h("section", "panel");
+	out.append(h("h2", "", "退出与撤销"));
+	out.append(h("p", "muted small", "三种退出的影响范围不同，请按需要选择。任何一种都不会远程删除已经下载到设备上的笔记；设备上还没同步的修改会留在设备上。"));
+
+	// A：只退出这个浏览器
+	const a = button("退出此浏览器", "", () => {
+		a.disabled = true;
+		void (me.session.kind === "oidc" ? accountApi.logout() : fetch("/web/session", { method: "DELETE" }))
+			.catch(() => undefined).then(() => {
+				announceAccount(""); // 同一浏览器的其他标签页随之清掉可见内容
+				location.hash = "";
+				location.reload();
+			});
+	});
+	out.append(scopeBlock("只退出这个浏览器",
+		"结束这个浏览器里的 LiteSync 登录。其他浏览器、已连接的 Obsidian 设备、身份中心的登录和 Nexus Portal 都不受影响。", a).row);
+
+	// B：退出 LiteSync 的全部设备
+	const bScope = "结束 LiteSync 在所有浏览器里的登录，撤销你名下全部 Obsidian 设备授权、尚未使用的连接链接和 API Token。" +
+		"身份中心的登录和 Nexus Portal 不受影响。之后每台 Obsidian 都需要重新连接。";
+	const tokenNote = me.session.kind === "token"
+		? "你现在用 API Token 登录：这个 API Token 也会一起作废。之后需要用统一账号登录后重置，或由管理员在服务器上运行 obsync token reset。"
+		: "";
+	const b = button("退出 LiteSync 的全部设备…", "danger", () => {
+		if (!confirm(bScope + (tokenNote ? "\n\n" + tokenNote : "") + "\n\n确定继续？")) return;
+		b.disabled = true;
+		void accountApi.logoutDevices().then((r) => {
+			alert(`已完成：撤销 ${r.local.revokedDevices} 台设备、${r.local.revokedGrants} 个尚未使用的连接链接；所有浏览器里的 LiteSync 登录已结束。`);
+			announceAccount("");
+			location.hash = "";
+			location.reload();
+		}, (e) => {
+			b.disabled = false;
+			alert(errText(e));
+		});
+	});
+	const bBlock = scopeBlock("退出 LiteSync 的全部设备", bScope, b);
+	if (tokenNote) bBlock.text.append(h("p", "banner warn", tokenNote));
+	out.append(bBlock.row);
+
+	// C：退出所有产品与设备
+	const linked = me.identity.linked && me.features.oidc;
+	const cScope = "包括上一项的全部，并且：结束你在身份中心所有浏览器里的登录；通知 Nexus Portal 撤销它那边的全部网页登录、设备与扩展授权。" +
+		"每一步的结果都会如实显示，没送达的可以重新发送。";
+	const c = button("退出所有产品与设备…", "danger", () => {
+		if (!confirm(cScope + "\n\n确定继续？")) return;
+		c.disabled = true;
+		void accountApi.logoutAll().then((r) => openRevocationResult(r), (e) => {
+			c.disabled = false;
+			alert(errText(e));
+		});
+	});
+	const cBlock = scopeBlock("退出所有产品与设备", cScope, c);
+	if (!linked) {
+		c.disabled = true;
+		cBlock.text.append(h("p", "muted small", "当前账号没有绑定统一账号：「退出所有产品」不适用，请使用上一项。"));
+	} else if (rc && !rc.peerRevocation) {
+		cBlock.text.append(h("p", "banner warn", "服务器没有配置跨产品撤销：执行后 Nexus Portal 不会收到通知，结果里会显示「未配置」。请另外到 Nexus Portal 的账户中心退出。"));
+	}
+	out.append(cBlock.row);
+
+	if (me.session.kind === "token") {
+		const adv = h("a", "button ghost", "API Token（高级）");
+		adv.href = "#/account";
+		out.append(adv);
+	}
+	// 管理员：如实提示部署缺口（ADR-019 §2.4 / §2.5「启动日志与管理员页面写明」）
+	if (me.role === "admin" && rc && rc.identityCenter) {
+		if (!rc.peerRevocation) {
+			out.append(h("p", "banner warn", "管理员：跨产品撤销未配置（OBSYNC_PEER_REVOCATION_URL / OBSYNC_PEER_REVOCATION_SECRET）。用户执行「退出所有产品与设备」时，另一个产品不会被通知。"));
+		}
+		if (!rc.centralStatusCheck) {
+			out.append(h("p", "banner warn", "管理员：中心状态检查未配置（OBSYNC_OIDC_STATUS_CLIENT_ID / OBSYNC_OIDC_STATUS_CLIENT_SECRET）。在身份中心停用或删除用户后，只有网页登录会在复核时结束，已连接的设备不会自动失效；开放公众注册前必须配置。"));
+		}
+	}
+	return out;
+}
+
+function stepRow(list: HTMLElement, label: string, chipText: string, chipCls: string, detail: string, extra?: HTMLElement[]): void {
+	const dd = h("dd");
+	dd.append(h("span", "chip " + chipCls, chipText), document.createTextNode(" " + detail));
+	for (const x of extra ?? []) dd.append(x);
+	list.append(h("dt", "", label), dd);
+}
+
+/** 动作 C 的结果页：逐项展示真实状态；有 pending 时定时刷新；pending / failed 可以重新发送。 */
+function openRevocationResult(first: RevocationView): void {
+	let current = first;
+	const token = first.statusToken ?? "";
+	let timer = 0;
+	const dlg = openDialog("退出所有产品与设备：结果", () => {
+		window.clearInterval(timer);
+		announceAccount("");
+		location.hash = "";
+		location.reload();
+	});
+	const render = () => {
+		dlg.body.innerHTML = "";
+		dlg.body.append(h("p", current.ok ? "banner" : "banner warn",
+			current.ok ? "三步都已完成。" : "还有没完成的步骤：请看下面每一项的状态。"));
+		const list = h("dl", "facts revocation-result");
+		stepRow(list, "LiteSync（本产品）", "已完成", "ok",
+			`撤销 ${current.local.revokedDevices} 台设备、${current.local.revokedGrants} 个尚未使用的连接链接；所有浏览器里的 LiteSync 登录已结束。`);
+		const ic = current.identityCenter;
+		if (ic) {
+			if (ic.state === "done") {
+				stepRow(list, "身份中心", "已完成", "ok", "已结束你在所有浏览器里的登录。");
+			} else if (ic.state === "not-applicable") {
+				stepRow(list, "身份中心", "不适用", "", "这个账号没有绑定统一账号。");
+			} else {
+				const extra: HTMLElement[] = [];
+				if (ic.accountConsoleUrl) {
+					const link = h("a", "button small-btn", "打开账号中心");
+					link.href = ic.accountConsoleUrl;
+					link.rel = "noopener";
+					extra.push(link);
+				}
+				if (current.endSessionUrl) {
+					const here = h("a", "button ghost small-btn", "至少退出此浏览器的身份中心登录");
+					here.href = current.endSessionUrl;
+					extra.push(here);
+				}
+				stepRow(list, "身份中心", ic.state === "pending" ? "进行中" : "没有完成", ic.state === "pending" ? "warn" : "danger",
+					`${IDENTITY_ERRORS[ic.error ?? ""] ?? "没有完成"}。请打开账号中心，在「设备活动」里手动退出其他浏览器的登录。`, extra);
+			}
+		}
+		const peers = current.peers ?? [];
+		let pending = false;
+		for (const p of peers) {
+			const [text, cls, detail] = peerView(p);
+			const extra: HTMLElement[] = [];
+			if ((p.state === "pending" || p.state === "failed") && token) {
+				pending = pending || p.state === "pending";
+				const resend = button("重新发送", "small-btn", () => {
+					resend.disabled = true;
+					void accountApi.resendRevocation(current.eventId, token).then((r) => {
+						current = r;
+						render();
+					}, (e) => {
+						resend.disabled = false;
+						alert(errText(e));
+					});
+				});
+				extra.push(resend);
+			}
+			stepRow(list, productName(p.product), text, cls, detail, extra);
+		}
+		dlg.body.append(list);
+		dlg.body.append(h("p", "muted small", "这个结果页 30 分钟内有效；之后重新登录，可以在「账号与设备 → 最近的撤销」查看最新状态或重新发送。"));
+		const actions = h("div", "dialog-actions");
+		actions.append(button("完成", "primary", () => dlg.close()));
+		dlg.body.append(actions);
+		window.clearInterval(timer);
+		if (pending && token) {
+			timer = window.setInterval(() => {
+				void accountApi.revocationStatus(current.eventId, token).then((r) => {
+					const was = JSON.stringify(current.peers);
+					current = r;
+					if (JSON.stringify(r.peers) !== was) render();
+				}, () => window.clearInterval(timer));
+			}, 5000);
+		}
+	};
+	render();
+}
+
+/** 「最近的撤销」：时间、动作、每一步的真实状态；没送达的可以重新发送。 */
+async function renderRevocationHistory(list: HTMLElement): Promise<void> {
+	let data: { revocations: RevocationView[] };
+	try {
+		data = await accountApi.revocations();
+	} catch (e) {
+		list.innerHTML = "";
+		list.append(h("div", "banner danger", "加载撤销记录失败：" + errText(e)));
+		return;
+	}
+	list.innerHTML = "";
+	if (data.revocations.length === 0) {
+		list.append(h("p", "muted small", "还没有撤销记录。"));
+		return;
+	}
+	for (const r of data.revocations) {
+		const row = h("div", "revocation-row");
+		row.append(h("strong", "", revocationTitle(r)), h("span", "muted small", " · " + fmtIso(r.createdAt)));
+		const facts = h("dl", "facts");
+		stepRow(facts, "LiteSync", "已完成", "ok", `撤销 ${r.local.revokedDevices} 台设备、${r.local.revokedGrants} 个尚未使用的连接链接`);
+		if (r.identityCenter && r.origin === "litesync") {
+			const ic = r.identityCenter;
+			stepRow(facts, "身份中心", ic.state === "done" ? "已完成" : ic.state === "not-applicable" ? "不适用" : "没有完成",
+				ic.state === "done" ? "ok" : ic.state === "not-applicable" ? "" : "danger",
+				ic.state === "failed" ? (IDENTITY_ERRORS[ic.error ?? ""] ?? "") : "");
+		}
+		for (const p of r.peers ?? []) {
+			const [text, cls, detail] = peerView(p);
+			const extra: HTMLElement[] = [];
+			if (p.state === "pending" || p.state === "failed") {
+				const retry = button("重新发送", "small-btn", () => {
+					retry.disabled = true;
+					void accountApi.retryRevocation(r.eventId).then(() => renderRevocationHistory(list), (e) => {
+						retry.disabled = false;
+						alert(errText(e));
+					});
+				});
+				extra.push(retry);
+			}
+			stepRow(facts, productName(p.product), text, cls, detail, extra);
+		}
+		row.append(facts);
+		list.append(row);
 	}
 }

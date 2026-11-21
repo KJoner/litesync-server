@@ -1552,3 +1552,44 @@ button.recent-card {
 .unlock-help summary {
 	cursor: pointer;
 }
+
+/* 退出与撤销（v0.20.1 / ADR-019）：每个动作旁写清影响范围；C 的结果逐项展示 */
+.revocation-action {
+	width: 100%;
+	display: flex;
+	gap: 16px;
+	align-items: flex-start;
+	justify-content: space-between;
+	padding: 10px 0;
+	border-top: 1px solid var(--border);
+}
+.revocation-scope {
+	flex: 1;
+	min-width: 0;
+}
+.revocation-scope p {
+	margin: 4px 0 0;
+}
+.revocation-list {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+.revocation-row {
+	border-top: 1px solid var(--border);
+	padding-top: 8px;
+}
+.revocation-result dd .button,
+.revocation-row dd button {
+	margin-left: 8px;
+}
+.chip.danger {
+	color: var(--danger);
+	border-color: var(--danger);
+}
+@media (max-width: 640px) {
+	.revocation-action {
+		flex-direction: column;
+	}
+}
