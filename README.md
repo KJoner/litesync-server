@@ -827,17 +827,31 @@ curl http://127.0.0.1:8080/health
 obsync backup create
 # 1. 只读演练：结构兼容性 + 逐表行数 + 每仓库摘要（不连接目标库）
 obsync migrate-to-pg --dry-run
-# 2. 正式导入（服务必须已停止）。目标库必须为空；单事务，任一步失败整体回滚
+# 2. 正式导入。服务必须已停止——这一条是机器检查：运行中的服务持有数据目录锁
+#    （$OBSYNC_DATA_DIR/.obsync-server.lock），拿不到锁直接拒绝；迁移期间本命令持有它，服务也无法中途启动。
+#    目标库必须为空；导入与校验在目标库的同一个事务里，校验不通过整体回滚
 OBSYNC_PG_DSN='postgres://…' obsync migrate-to-pg
-# 3. 切换：OBSYNC_DB=postgres（保留 OBSYNC_PG_DSN）后启动服务
+# 3. 只有 ok=true 且 targetState=committed-verified 才算成功；切换：OBSYNC_DB=postgres（保留 OBSYNC_PG_DSN）后启动服务
 ```
 
-导入后在**同一个源快照**上逐表校验（每个值按目标列类型规范化后做与行顺序无关的摘要），
-再用一个新快照复核一次（证明导入期间源库没有被写入）；另外核对每个仓库的对象/版本/
-墓碑/变更计数、content_hash 集合、repoEpoch / headSequence / formatEpoch / keyEpoch /
-信封下限、keyDoc 指纹，以及自增序列的高水位（id 永不复用）。任一不符即失败，源库不动。
-报告是机器可读的 JSON（标准输出 + `$OBSYNC_DATA_DIR/migrate-to-pg-report.json`）。
+导入后在**同一个源快照**上、**提交之前**、在同一个目标事务里逐表校验（每个值按目标列类型规范化后做与行顺序
+无关的摘要）；另外核对每个仓库的对象/版本/墓碑/变更计数、content_hash 集合、repoEpoch / headSequence /
+formatEpoch / keyEpoch / 信封下限、keyDoc 指纹，以及自增序列的高水位（id 永不复用）。任一不符即整体回滚，
+源库不动。提交之后再用一个新快照复核一次（证明导入期间源库没有被写入）。
+报告是机器可读的 JSON（标准输出 + `$OBSYNC_DATA_DIR/migrate-to-pg-report.json`），其中 `targetState`
+如实写出目标库最后的状态：
+
+| targetState | 含义 | 下一步 |
+|---|---|---|
+| `untouched` | 目标没有任何提交（失败发生在写入前，或导入与校验的事务已回滚） | 修正问题后直接重跑 |
+| `committed-verified` | 已提交且校验通过 | 切换（第 3 步） |
+| `commit-unknown` | 提交调用本身报错（例如连接在提交时断开），结果不确定 | **不要**在这个库上启动服务；先检查它是否为空，非空就换一个新的空库重跑 |
+| `copied-not-enabled` | 已复制并校验，但源库在迁移期间被写入（新快照对不上）；没有写迁移标记 | **不要**在这个库上启动服务；停掉所有写入者，换一个新的空库重跑 |
+| `already-migrated` | 目标已有与源库逐表一致的数据（重复运行） | 只做了校验，可以切换 |
+
 重复运行是幂等的：目标已有与源库逐表一致的数据时只做校验；不一致则拒绝，不碰任何一边。
+`sourceLock` 字段说明锁检查的结果；文件系统不支持独占锁时（`unsupported:…`）命令会如实警告，只能人工确认服务已停止，
+提交后的新快照复核仍会发现迁移期间的写入。同一数据目录也只能运行一个服务：第二个进程启动时会因锁被占用而拒绝。
 
 迁移保留全部身份与世代（vaultId、fileId、revision、各 generation、墓碑、checkpoint、
 repoEpoch），**不旋转 epoch**——客户端游标照常续用，不会进入灾备合并。

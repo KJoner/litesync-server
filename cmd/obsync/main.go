@@ -10,12 +10,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/KJoner/litesync-server/internal/api"
 	"github.com/KJoner/litesync-server/internal/backup"
 	"github.com/KJoner/litesync-server/internal/config"
+	"github.com/KJoner/litesync-server/internal/datalock"
 	"github.com/KJoner/litesync-server/internal/db"
 	"github.com/KJoner/litesync-server/internal/mail"
 	"github.com/KJoner/litesync-server/internal/storage"
@@ -116,6 +118,19 @@ func run() error {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 	os.Chmod(cfg.DataDir, 0o700) //nolint:errcheck // 已存在目录也收紧；Windows 上是 no-op
+	// 同一数据目录只能运行一个服务（每 Vault 写锁、迁移租约都在进程内存里）；
+	// `obsync migrate-to-pg` 也靠这把锁机器确认「源库已停写」（复审 SV-03）。进程退出时由系统释放
+	dirLock, lerr := datalock.Acquire(cfg.DataDir, "obsync-server")
+	switch {
+	case errors.Is(lerr, datalock.ErrHeld):
+		return fmt.Errorf("data directory %s is in use by another obsync process (%s); only one server may run per data directory",
+			cfg.DataDir, strings.TrimSpace(datalock.Holder(cfg.DataDir)))
+	case lerr != nil:
+		logger.Warn("cannot take the data-directory lock; `obsync migrate-to-pg` will not be able to confirm that the server is stopped",
+			"error", lerr)
+	default:
+		defer dirLock.Release() //nolint:errcheck
+	}
 	dbPath := filepath.Join(cfg.DataDir, "sync.db")
 	// 批次 G：OBSYNC_DB=sqlite（默认，数据目录里的 sync.db）| postgres（OBSYNC_PG_DSN）
 	database, dbc, err := openDatabase(cfg.DataDir, cfg.DurabilityStrict)

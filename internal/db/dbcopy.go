@@ -12,7 +12,9 @@ package db
 // 每个值按目标列类型规范化后逐行哈希、排序再哈希（与行顺序、NULL 排序规则无关），
 // 两边摘要必须逐表相等；另外核对每仓库的业务计数、世代字段、content_hash 集合与
 // keyDoc 指纹，以及自增序列的高水位（「id 永不复用」在两种库之间保持）。
-// 任一不符即失败：源库只读，目标写入在单个事务里，失败整体回滚。
+// 任一不符即失败：源库只读；目标的写入**与校验在同一个事务里**（v0.20.1 / 复审 SV-03），
+// 校验不通过整体回滚、什么都不提交——与 RestoreSnapshotInto 同一种做法。报告的 targetState
+// 如实写出目标库最后的状态（untouched / committed-verified / commit-unknown）。
 
 import (
 	"context"
@@ -29,6 +31,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/KJoner/litesync-server/internal/failpoint"
 )
 
 type colKind int
@@ -307,10 +311,23 @@ type VaultSummary struct {
 	KeyDocFingerprint string `json:"keyDocFingerprint"`
 }
 
+// 目标库最后的状态（复审 SV-03：失败时必须如实告诉运维目标里有没有东西）。
+const (
+	// TargetUntouched：目标没有任何提交（失败发生在写入之前，或写入与校验的事务已整体回滚）。
+	TargetUntouched = "untouched"
+	// TargetCommittedVerified：数据已提交，且提交前在同一事务内逐表校验通过。
+	TargetCommittedVerified = "committed-verified"
+	// TargetCommitUnknown：提交调用本身返回了错误（例如连接在提交时断开）——结果不确定，
+	// 必须检查目标是否为空；非空就当作「已复制、未启用」，换一个新的空库重跑。
+	TargetCommitUnknown = "commit-unknown"
+)
+
 // CopyReport 是一次复制（或纯校验 / 演练）的完整结果，可直接序列化为机器可读 JSON。
 type CopyReport struct {
 	Direction     string           `json:"direction"`
 	Mode          string           `json:"mode"` // dry-run | copy | verify-only | export
+	// TargetState：只在 copy / export 模式填写，取值见 TargetUntouched 等常量
+	TargetState string `json:"targetState,omitempty"`
 	StartedAt     string           `json:"startedAt"`
 	DurationMs    int64            `json:"durationMs"`
 	Tables        []TableReport    `json:"tables"`
@@ -849,19 +866,20 @@ func TargetIsEmpty(dst *sql.DB) (bool, []string, error) {
 	return len(n) == 0, n, err
 }
 
-// CopyDatabase 把 src 的全部业务数据复制到 dst（dst 必须已建好 schema 且为空），然后在
-// 同一个源快照上逐表校验。src 只读；dst 的写入在单个事务里，任一错误整体回滚。
+// CopyDatabase 把 src 的全部业务数据复制到 dst（dst 必须已建好 schema 且为空），并在
+// **提交之前**、在同一个目标事务里、用同一个源快照逐表校验（复审 SV-03）。
+// src 只读；校验不通过或任何错误都整体回滚——此时 rep.TargetState = untouched，目标里什么都没有。
 func CopyDatabase(src, dst *sql.DB) (*CopyReport, error) {
 	start := time.Now()
 	rep := newReport(dialectOf(src)+"->"+dialectOf(dst), "copy")
+	rep.TargetState = TargetUntouched
 	stx, err := beginSnapshot(src)
 	if err != nil {
 		return rep, err
 	}
 	defer stx.Rollback() //nolint:errcheck
 	s := copySide{q: stx, pg: IsPostgres(src)}
-	d := copySide{q: dst, pg: IsPostgres(dst)}
-	plan, err := planCopy(s, d, rep)
+	plan, err := planCopy(s, copySide{q: dst, pg: IsPostgres(dst)}, rep)
 	if err != nil {
 		return rep, err
 	}
@@ -871,15 +889,15 @@ func CopyDatabase(src, dst *sql.DB) (*CopyReport, error) {
 		rep.Problems = append(rep.Problems, "target is not empty: "+strings.Join(n, ", "))
 		return rep, ErrTargetNotEmpty
 	}
-	if err := copyInto(s, dst, plan); err != nil {
-		return rep, err
-	}
-	err = verifyPlan(s, d, plan, rep)
+	err = copyVerifyCommit(s, dst, plan, rep)
 	rep.DurationMs = time.Since(start).Milliseconds()
 	return rep, err
 }
 
-func copyInto(s copySide, dst *sql.DB, plan []tablePlan) error {
+// copyVerifyCommit：复制 → 自增高水位 → 校验，全部在同一个目标事务里；校验通过才提交。
+// 返回时 rep.TargetState 如实反映目标库的状态。
+func copyVerifyCommit(s copySide, dst *sql.DB, plan []tablePlan, rep *CopyReport) error {
+	rep.TargetState = TargetUntouched
 	tx, err := dst.Begin()
 	if err != nil {
 		return err
@@ -894,10 +912,28 @@ func copyInto(s copySide, dst *sql.DB, plan []tablePlan) error {
 	if err != nil {
 		return err
 	}
-	if err := applySeqHighWater(copySide{q: tx, pg: IsPostgres(dst)}, hw); err != nil {
+	d := copySide{q: tx, pg: IsPostgres(dst)}
+	if err := applySeqHighWater(d, hw); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := failpoint.Eval(failpoint.DBCopyVerify); err != nil {
+		rep.OK = false
+		rep.Problems = append(rep.Problems, "verification failed (injected): "+err.Error())
+		return fmt.Errorf("verification failed: %w", err)
+	}
+	if err := verifyPlan(s, d, plan, rep); err != nil {
+		return err
+	}
+	if err := failpoint.Eval(failpoint.DBCopyCommit); err != nil {
+		rep.TargetState = TargetCommitUnknown
+		return fmt.Errorf("commit target: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		rep.TargetState = TargetCommitUnknown
+		return fmt.Errorf("commit target: %w", err)
+	}
+	rep.TargetState = TargetCommittedVerified
+	return nil
 }
 
 // VerifyDatabases 只做校验（迁移已完成后的重复运行 = 幂等：只校验，不写）。
@@ -958,15 +994,11 @@ func ExportToSQLiteFile(src *sql.DB, path string) (*CopyReport, error) {
 	}
 	defer stx.Rollback() //nolint:errcheck
 	s := copySide{q: stx, pg: IsPostgres(src)}
-	d := copySide{q: dst}
-	plan, err := planCopy(s, d, rep)
+	plan, err := planCopy(s, copySide{q: dst}, rep)
 	if err != nil {
 		return rep, err
 	}
-	if err := copyInto(s, dst, plan); err != nil {
-		return rep, err
-	}
-	if err := verifyPlan(s, d, plan, rep); err != nil {
+	if err := copyVerifyCommit(s, dst, plan, rep); err != nil {
 		return rep, err
 	}
 	ok = true

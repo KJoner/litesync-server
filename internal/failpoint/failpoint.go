@@ -141,4 +141,8 @@ const (
 	GCBeforeDelete      = "gc.before-delete"
 	BackupStaging       = "backup.staging"
 	RestoreBeforeEpoch  = "restore.before-epoch-rotate"
+	// 跨方言复制（复审 SV-03）：校验阶段失败、提交调用失败、迁移的二次快照比对之前
+	DBCopyVerify           = "dbcopy.verify"
+	DBCopyCommit           = "dbcopy.commit"
+	MigrateBeforePostCheck = "migrate.before-postcheck"
 )
