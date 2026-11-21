@@ -111,9 +111,9 @@ func (s *Service) RevokeAccount(req RevokeRequest) (*RevokeResult, error) {
 		}
 		if payload != "" {
 			// 跨产品事件与本产品的撤销同一事务落盘（outbox）：进程在这之后任何时刻退出，
-			// 后台都会把它送出去。首次到期留 5 秒——请求内的同步投递先发，不与后台撞车
+			// 后台都会把它送出去。立即到期：请求内的同步投递先领租约（60 秒），后台不会同时再发
 			if err := db.InsertRevocationDelivery(tx, eventID, s.peer.cfg.Product, payload,
-				now.Add(peerBackoff[0]).Unix(), now.Add(peerDeliveryLifetime).Unix()); err != nil {
+				now.Unix(), now.Add(peerDeliveryLifetime).Unix()); err != nil {
 				return err
 			}
 		}

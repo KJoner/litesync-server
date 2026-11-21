@@ -40,16 +40,26 @@ const testPeerSecret = "peer-revocation-shared-secret-for-tests-0123456789"
 type fakePeer struct {
 	srv      *httptest.Server
 	mu       gosync.Mutex
-	statuses []int // 依次返回；用完后 200
+	statuses []int // 依次返回；用完后 200。3xx 会带 Location 指向 /redirect-target
 	events   []syncsvc.PeerEvent
 	sigOK    []bool
 	headers  []http.Header
+	// redirectHits：重定向目标被请求的次数（发送方不得跟随重定向，应恒为 0）
+	redirectHits int
 }
 
 func newFakePeer(t *testing.T, statuses ...int) *fakePeer {
 	t.Helper()
 	p := &fakePeer{statuses: statuses}
 	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect-target" {
+			p.mu.Lock()
+			p.redirectHits++
+			p.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"applied":true}`)) //nolint:errcheck
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		ts := r.Header.Get("X-Revocation-Timestamp")
 		ok := r.Method == http.MethodPost && r.URL.Path == syncsvc.PeerRevocationPath &&
@@ -69,6 +79,9 @@ func newFakePeer(t *testing.T, statuses ...int) *fakePeer {
 		if !ok {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
+		}
+		if status >= 300 && status < 400 {
+			w.Header().Set("Location", p.srv.URL+"/redirect-target")
 		}
 		w.WriteHeader(status)
 		if status == http.StatusOK {
@@ -708,6 +721,19 @@ func TestPeerRevocationReceiver(t *testing.T) {
 		out["applied"] != false || out["reason"] != "unknown-identity" {
 		t.Fatalf("unknown identity = %d %v", code, out)
 	}
+	// issuer 末尾斜杠差异要容忍（ADR-019 §2.4）；事件迟到也一样执行 B：在 occurredAt（一小时前）之后
+	// 才连接的设备同样失效——不按 occurredAt 截断
+	bLate, late := e.loginAs(t, "late-sub")
+	lateVault := mustVault(t, e, late, "迟到")
+	lateCred := redeemDevice(t, e.testEnv, bLate.grant(lateVault), "exch_late_device_001", lateVault)
+	lateBody := peerEventBody(t, e.idp.issuer+"/", "late-sub", func(v map[string]any) {
+		v["occurredAt"] = time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05Z")
+	})
+	if code, out := send(lateBody, now); code != http.StatusOK || out["applied"] != true {
+		t.Fatalf("event with a trailing-slash issuer = %d %v", code, out)
+	}
+	mustRevoked(t, e.testEnv, lateCred, "a device connected after occurredAt (late event)")
+
 	// 同一个 subject、不同 issuer：不是同一个人
 	if code, out := send(peerEventBody(t, "https://other-issuer.example/realms/x", "bob-sub", nil), now); code != http.StatusOK || out["applied"] != false {
 		t.Fatalf("foreign issuer = %d %v", code, out)
@@ -771,12 +797,103 @@ func TestPeerRevocationReceiver(t *testing.T) {
 }
 
 // 没有配置共享密钥：接收端关闭（404），不泄露任何信息。
+// 没有配置共享密钥：401 PEER_REVOCATION_NOT_CONFIGURED（与 Nexus 一致；发送方记为失败、不重试）。
 func TestPeerRevocationReceiverClosedWithoutSecret(t *testing.T) {
 	e := newRevocationEnv(t, nil, false)
 	body := peerEventBody(t, e.idp.issuer, "x", nil)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	if code, _ := signedPost(t, e.testEnv, body, ts, syncsvc.SignPeerRevocation(testPeerSecret, ts, body)); code != http.StatusNotFound {
-		t.Fatalf("receiver without a secret = %d, want 404", code)
+	if code, out := signedPost(t, e.testEnv, body, ts, syncsvc.SignPeerRevocation(testPeerSecret, ts, body)); code != http.StatusUnauthorized ||
+		out["code"] != "PEER_REVOCATION_NOT_CONFIGURED" {
+		t.Fatalf("receiver without a secret = %d %v, want 401 PEER_REVOCATION_NOT_CONFIGURED", code, out)
+	}
+}
+
+// 发送方对返回码的处理（ADR-019 §2.4）：2xx delivered；401 / 400 / 其他 4xx（408、429 除外）failed 不重试；
+// 408、429、5xx 与重定向（不跟随）退避重试。
+func TestPeerRevocationSenderStatusHandling(t *testing.T) {
+	cases := []struct {
+		status    int
+		state     string
+		errPrefix string
+	}{
+		{http.StatusNoContent, "delivered", ""},
+		{http.StatusAccepted, "delivered", ""},
+		{http.StatusBadRequest, "failed", "rejected:http-400"},
+		{http.StatusForbidden, "failed", "rejected:http-403"},
+		{http.StatusNotFound, "failed", "rejected:http-404"},
+		{http.StatusConflict, "failed", "rejected:http-409"},
+		{http.StatusRequestTimeout, "pending", "http-408"},
+		{http.StatusTooManyRequests, "pending", "http-429"},
+		{http.StatusInternalServerError, "pending", "http-500"},
+		{http.StatusBadGateway, "pending", "http-502"},
+		{http.StatusFound, "pending", "redirect-refused"},
+		{http.StatusPermanentRedirect, "pending", "redirect-refused"},
+	}
+	statuses := make([]int, len(cases))
+	for i, c := range cases {
+		statuses[i] = c.status
+	}
+	peer := newFakePeer(t, statuses...)
+	e := newRevocationEnv(t, peer, false)
+	for i, c := range cases {
+		b, _ := e.loginAs(t, fmt.Sprintf("status-%d-sub", i))
+		_, out := b.do(http.MethodPost, "/api/v2/account/logout-all", nil, nil)
+		p0 := out["peers"].([]any)[0].(map[string]any)
+		gotErr, _ := p0["error"].(string)
+		if p0["state"] != c.state || !strings.HasPrefix(gotErr, c.errPrefix) {
+			t.Fatalf("peer answered %d: state %v error %q, want %s %q", c.status, p0["state"], gotErr, c.state, c.errPrefix)
+		}
+		if c.state == "failed" {
+			// failed 是终态：即使到期也不会被后台重试
+			if _, err := e.db.Exec(`UPDATE revocation_deliveries SET next_attempt_at = 0 WHERE event_id = ?`, out["eventId"]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	before := peer.count()
+	e.svc.RunRevocationDeliveries(t.Context())
+	if peer.count() != before {
+		t.Fatalf("pending deliveries are inside their backoff and failed ones are final: %d new attempts", peer.count()-before)
+	}
+	peer.mu.Lock()
+	hits := peer.redirectHits
+	peer.mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("the sender followed a redirect %d times; it must not", hits)
+	}
+}
+
+// 租约（ADR-019 §2.4）：一个 worker 领取后中途中断，别的 worker 在租约内不会重发；租约到期后接续发送。
+func TestPeerRevocationLeaseSurvivesAnInterruptedWorker(t *testing.T) {
+	peer := newFakePeer(t, http.StatusServiceUnavailable) // C 内的同步投递：503 → pending
+	e := newRevocationEnv(t, peer, false)
+	b, _ := e.loginAs(t, "lease-sub")
+	_, out := b.do(http.MethodPost, "/api/v2/account/logout-all", nil, nil)
+	eventID := out["eventId"].(string)
+	// 退避到期；某个 worker 领了租约（attempts+1、到期推后 60 秒）然后进程中断
+	if _, err := e.db.Exec(`UPDATE revocation_deliveries SET next_attempt_at = 0 WHERE event_id = ?`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if ok, err := db.ClaimRevocationDelivery(e.db, eventID, "nexus", now, now+60); err != nil || !ok {
+		t.Fatalf("claim = %v %v", ok, err)
+	}
+	before := peer.count()
+	if n := e.svc.RunRevocationDeliveries(t.Context()); n != 0 || peer.count() != before {
+		t.Fatalf("a leased delivery was sent again by another worker (%d attempts)", n)
+	}
+	// 60 秒后租约到期，由下一个 worker 接续（这里把到期时间拨回来模拟）
+	if _, err := e.db.Exec(`UPDATE revocation_deliveries SET next_attempt_at = ? WHERE event_id = ?`, now-1, eventID); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.svc.RunRevocationDeliveries(t.Context()); n != 1 {
+		t.Fatalf("expired lease: attempted %d, want 1", n)
+	}
+	var state string
+	var attempts int
+	e.db.QueryRow(`SELECT delivery_state, attempts FROM revocation_deliveries WHERE event_id = ?`, eventID).Scan(&state, &attempts) //nolint:errcheck
+	if state != "delivered" || attempts != 3 {
+		t.Fatalf("after resuming: %s attempts=%d (sync attempt + interrupted claim + resumed send)", state, attempts)
 	}
 }
 

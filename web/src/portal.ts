@@ -798,16 +798,17 @@ const IDENTITY_ERRORS: Record<string, string> = {
 function peerErrorText(err?: string): string {
 	if (!err) return "";
 	if (err.startsWith("expired:")) return "7 天内一直没能送达（最后一次：" + peerErrorText(err.slice(8)) + "）";
+	if (err.startsWith("rejected:http-")) return `对方拒绝了这个事件（HTTP ${err.slice(14)}），需要管理员检查两边的地址与版本后重新发送`;
 	if (err.startsWith("http-")) return `对方暂时不可用（HTTP ${err.slice(5)}）`;
 	switch (err) {
 		case "network":
 			return "网络不通";
 		case "timeout":
 			return "请求超时";
+		case "redirect-refused":
+			return "对方返回了重定向（地址可能配置错了），不会跟随，稍后重试";
 		case "signature-rejected":
-			return "对方拒绝了签名：两边的共享密钥不一致，需要管理员修正后重新发送";
-		case "bad-request":
-			return "对方认为事件格式不对，需要管理员检查两边的版本";
+			return "对方拒绝了签名：两边的共享密钥不一致，或对方没有配置跨产品撤销；需要管理员修正后重新发送";
 		default:
 			return err;
 	}

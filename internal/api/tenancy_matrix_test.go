@@ -62,7 +62,7 @@ var publicRoutes = map[string]string{
 	// 它不授予任何读写，按 IP 限流，无效一律 404
 	"GET /api/v2/revocation-status/{eventId}":         "一次性 statusToken 即认证；只返回该撤销事件的状态（时间、产品、状态、错误类别），不含令牌",
 	"POST /api/v2/revocation-status/{eventId}/resend": "一次性 statusToken 即认证；只能重新投递该撤销事件（只会造成更多撤销，不授予任何权限）",
-	"POST /api/internal/v1/account-revocations":       "跨产品撤销事件：HMAC-SHA256 签名 + 5 分钟时间窗 + eventId 去重 + 单独限流；只能撤销不能授予；未配置共享密钥时 404",
+	"POST /api/internal/v1/account-revocations":       "跨产品撤销事件：HMAC-SHA256 签名 + 5 分钟时间窗 + eventId 去重 + 单独限流；只能撤销不能授予；未配置共享密钥时 401",
 }
 
 // parseRoutes 从 router.go 抽出全部注册的路由。

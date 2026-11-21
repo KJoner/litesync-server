@@ -33,6 +33,12 @@ import (
 // peerProductName：跨产品撤销的对方产品（ADR-019 §2.4 只定义了 LiteSync ↔ Nexus 一对）。
 const peerProductName = "nexus"
 
+// 接收端的 401 错误码（与 Nexus 相同的两种）。
+const (
+	CodePeerNotConfigured = "PEER_REVOCATION_NOT_CONFIGURED"
+	CodeSignatureInvalid  = "SIGNATURE_INVALID"
+)
+
 // 身份中心一步的状态（ADR-019 §2.3）。
 const (
 	identityDone          = "done"
@@ -385,18 +391,19 @@ func (h *handlers) resendAndReport(w http.ResponseWriter, r *http.Request, rec *
 
 // peerRevocationInbound POST /api/internal/v1/account-revocations（公开路径；HMAC 签名即认证，单独限流）。
 //
-// 200 已处理（重复投递返回同样的结果）；400 格式错误；401 签名或时间戳不符；5xx 发送方重试。
-// 只能撤销、不能授予；不转发。
+// 200 已处理（重复投递返回同样的结果）；400 格式错误；401 签名或时间戳不符、或本端没有配置共享密钥
+//（与 Nexus 一致；发送方记为失败、不重试）；5xx 发送方重试。只能撤销、不能授予；不转发。
+// 校验顺序（ADR-019 §2.4）：先常数时间验签，再查 ±300 秒时间窗，再校验格式。
 func (h *handlers) peerRevocationInbound(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if !h.svc.PeerRevocationConfigured() {
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	}
 	ip := clientIP(r, h.trusted)
 	if !h.internalLimiter.allow(ip) {
 		w.Header().Set("Retry-After", "60")
 		writeCoded(w, http.StatusTooManyRequests, CodeRateLimited, "too many requests; retry later", true)
+		return
+	}
+	if !h.svc.PeerRevocationConfigured() {
+		writeCoded(w, http.StatusUnauthorized, CodePeerNotConfigured, "peer revocation is not configured on this server", false)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<10+1))
@@ -407,7 +414,7 @@ func (h *handlers) peerRevocationInbound(w http.ResponseWriter, r *http.Request)
 	if err := h.svc.VerifyPeerRevocation(r.Header.Get("X-Revocation-Timestamp"), r.Header.Get("X-Revocation-Signature"),
 		body, time.Now()); err != nil {
 		h.opts.Logger.Warn("peer revocation rejected", "reason", "signature-or-timestamp")
-		writeCoded(w, http.StatusUnauthorized, CodeUnauthorized, "signature or timestamp rejected", false)
+		writeCoded(w, http.StatusUnauthorized, CodeSignatureInvalid, "signature or timestamp rejected", false)
 		return
 	}
 	ev, err := syncsvc.ParsePeerEvent(body)

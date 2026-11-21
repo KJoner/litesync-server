@@ -378,11 +378,16 @@ API Token 与完全独立的仓库（见下方「多用户」一节）。隔离�
   三步都完成 `ok` 才是 `true`；否则逐项显示 `pending` / `failed` / `not-configured`。身份中心一步失败时给出账号中心地址，
   提示到「设备活动」手动退出。C 之后本产品的会话都已失效，结果页凭响应里的一次性 `statusToken`（30 分钟）继续查看与
   「重新发送」；之后重新登录可在「账号与设备 → 最近的撤销」看到。
-- **跨产品事件**（ADR-019 §2.4）：`POST {对方}/api/internal/v1/account-revocations`，`X-Revocation-Timestamp` +
-  `X-Revocation-Signature: v1=<hex(HMAC-SHA256(共享密钥, 时间戳 + "." + 原始请求体))>`，以 `(issuer, subject)` 定位账号
-  （任何一方都不使用另一方的本地 user_id）。接收端常数时间验签、时间戳偏差超过 5 分钟拒绝、`eventId` 去重（重复投递返回同样的
-  结果）、找不到身份返回 `200 {"applied":false,"reason":"unknown-identity"}`、不转发、单独限流；事件只能撤销，不能授予任何权限。
-  400 / 401 记为失败不重试（需运维修正密钥后手动重发），5xx 与网络错误重试。
+- **跨产品事件**（ADR-019 §2.4，与 Nexus Portal 逐字一致）：`POST {对方}/api/internal/v1/account-revocations`，
+  `X-Revocation-Timestamp: <Unix 秒>` + `X-Revocation-Signature: v1=<小写 hex(HMAC-SHA256(共享密钥原样的 UTF-8 字节, 时间戳 + "." + 原始请求体))>`；
+  请求体字段顺序固定（`v, eventId, issuer, subject, scope, reason, origin, occurredAt`），`eventId` 32 位小写 hex，`occurredAt` 秒精度、以 `Z` 结尾，
+  `issuer` / `subject` 取 ID Token 的 `iss` / `sub`；重试时请求体字节不变，时间戳与签名重算（两边共用一组固定测试向量，见
+  `internal/sync/revocation_peer_internal_test.go`）。以 `(issuer, subject)` 定位账号（任何一方都不使用另一方的本地 user_id，issuer 末尾
+  斜杠差异容忍）。接收端先常数时间验签、再查 ±300 秒时间窗、再校验格式；`eventId` 去重（与 B 同一事务，重复投递返回同样的结果）；
+  找不到身份返回 `200 {"applied":false,"reason":"unknown-identity"}`；没有配置共享密钥时 401；不转发、单独限流；事件只能撤销，
+  不能授予任何权限，迟到的事件在**应用时**执行 B（不按 `occurredAt` 截断）。发送端：2xx 送达；401（签名被拒或对方未配置）、400 与其他
+  4xx（408、429 除外）记为失败、不自动重试（运维修正后在账户中心「重新发送」）；408、429、5xx、网络错误、5 秒超时按 5 s、15 s、30 s…
+  退避重试，7 天后记为失败；**不跟随重定向**（按网络错误重试）；投递用 60 秒租约领取，进程中断后由下一轮接续。
 - **中心状态检查（D）**：任一已认证请求到达时，该账号上一次成功检查超过 60 秒就先同步查一次身份中心（同一账号并发只查一次，
   超时 3 秒；统一登录成功、会话刷新成功也算一次确认）。停用 / 删除 → 立即执行 B，本次请求按撤销返回。身份中心不可达（包括
   401 / 403 这类**配置错误**，它们不会被当成「用户被停用」）时，上一次成功检查在 15 分钟宽限内放行；超过宽限后**设备请求**返回
@@ -398,8 +403,9 @@ API Token 与完全独立的仓库（见下方「多用户」一节）。隔离�
   待发内容并提示重新连接，不换用其他凭据提交）。
 
 身份中心（Keycloak）需要的配置（realm 模板 / `configure.sh` 增量应用）：两个产品的 client 都 `fullScopeAllowed=false`，作用域映射加
-`account` 客户端角色 `manage-account`（用户 access token 因此带 `aud: account`）；中心状态检查用的服务账号只授 realm-management 的
-`view-users`，并且**也要加进该 client 的作用域映射**，否则令牌不带这个角色、查询返回 403。
+`account` 客户端角色 `manage-account`（用户 access token 因此带 `aud: account`），并且 client 的**默认客户端作用域要包含 `roles`**——
+否则令牌里没有 `aud: account` / `manage-account`，「退出所有产品与设备」的身份中心一步会失败（报告为 `forbidden` / `unauthorized`）；
+中心状态检查用的服务账号只授 realm-management 的 `view-users`，并且**也要加进该 client 的作用域映射**，否则令牌不带这个角色、查询返回 403。
 
 ## 设备可信度：签名 checkpoint（0.15.0）
 
@@ -594,7 +600,7 @@ X-Canonical-Hash: canonical path HMAC，64 位小写 hex（0.12.0）
 | GET | `/api/v2/account/revocations` | 0.20.1：最近的撤销事件与跨产品投递状态（只含时间、对象产品、状态与错误类别） |
 | POST | `/api/v2/account/revocations/{eventId}/retry` | 0.20.1：重新发送尚未送达的跨产品事件（只能是本人的事件） |
 | GET / POST | `/api/v2/revocation-status/{eventId}` · `…/resend` | 0.20.1：**公开**，凭 `X-Revocation-Status-Token`（C 的一次性凭证，30 分钟）查看 / 重发这一个事件；按 IP 限流 |
-| POST | `/api/internal/v1/account-revocations` | 0.20.1：**公开**，跨产品撤销事件接收端（HMAC 签名 + 时间窗 + eventId 去重 + 单独限流）；未配置共享密钥时 404 |
+| POST | `/api/internal/v1/account-revocations` | 0.20.1：**公开**，跨产品撤销事件接收端（HMAC 签名 + 时间窗 + eventId 去重 + 单独限流）；未配置共享密钥时 401 `PEER_REVOCATION_NOT_CONFIGURED` |
 | GET / DELETE | `/api/v2/devices` · `/api/v2/devices/{id}` | 本人设备列表与撤销 |
 | POST | `/api/v2/vaults` · `/api/v2/vaults/{id}/initialization` | 建 `pending_encryption` 仓库（clientRequestId 幂等）；一次提交加密初始化（opId 幂等） |
 | POST | `/api/v2/vaults/{id}/pairing-grants` · `/api/v2/pairings` · DELETE `/api/v2/pairings/{id}` | 发行连接链接、上传加密配对包、撤销 |

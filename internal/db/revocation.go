@@ -235,6 +235,20 @@ func InsertRevocationDelivery(q dbtx, eventID, peer, payload string, now, expire
 	return err
 }
 
+// ClaimRevocationDelivery 领取一条到期的待投递事件（租约，ADR-019 §2.4）：attempts + 1、下次到期推后到
+// leaseUntil。领到返回 true；别的 worker 正在发（租约未到期）或还没到重试时间返回 false。
+// 发送途中进程中断时，租约到期后由下一个 worker 接续。
+func ClaimRevocationDelivery(q dbtx, eventID, peer string, now, leaseUntil int64) (bool, error) {
+	res, err := q.Exec(`UPDATE revocation_deliveries SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
+		WHERE event_id = ? AND peer = ? AND delivery_state = 'pending' AND next_attempt_at <= ?`,
+		leaseUntil, now, eventID, peer, now)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected() //nolint:errcheck
+	return n == 1, nil
+}
+
 // GetRevocationDelivery 取一条投递；不存在返回 (nil, nil)。
 func GetRevocationDelivery(q dbtx, eventID, peer string) (*RevocationDelivery, error) {
 	return scanDelivery(q.QueryRow(`SELECT `+deliveryColumns+` FROM revocation_deliveries WHERE event_id = ? AND peer = ?`,
