@@ -89,6 +89,8 @@ export class Suite {
 	}
 
 	private browsers: Browser[] = [];
+	/** 实际启动的浏览器（名称 + 版本），写进结果：证据要能说清楚是哪个浏览器跑出来的。 */
+	private readonly browserIds = new Set<string>();
 
 	/**
 	 * 启动 Chromium。返回的对象上 close() 推迟到套件结束：套件体里的 finally 先关浏览器的话，
@@ -98,6 +100,7 @@ export class Suite {
 		const { chromium } = playwright();
 		const b = await chromium.launch({ headless: !E2E.headed });
 		this.browsers.push(b);
+		this.browserIds.add(`${b.browserType().name()} ${b.version()}`);
 		return new Proxy(b, {
 			get(target, prop) {
 				if (prop === "close") return async () => undefined;
@@ -167,7 +170,7 @@ export class Suite {
 		for (const b of this.browsers) await b.close().catch(() => undefined);
 		const passed = this.checks.filter((c) => c.ok).length;
 		const failed = this.checks.length - passed;
-		const out = { suite: E2E.suite, passed, failed, aborted: this.aborted, checks: this.checks, artifacts: this.artifacts, durationMs: Date.now() - this.t0 };
+		const out = { suite: E2E.suite, passed, failed, aborted: this.aborted, checks: this.checks, artifacts: this.artifacts, browser: [...this.browserIds], durationMs: Date.now() - this.t0 };
 		if (E2E.result) writeFileSync(E2E.result, JSON.stringify(out, null, 2));
 		console.log(`\n${passed}/${passed + failed} passed${this.aborted ? "（中途中止）" : ""}`);
 		if (failed) console.log("FAILED:", this.checks.filter((c) => !c.ok).map((c) => c.name).join(" / "));

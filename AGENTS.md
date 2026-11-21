@@ -241,7 +241,7 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/api/vault_init_test.go` | 建库状态机全周期、v1 兼容、配对 v2 发行/envelope/兑换/重放/撤销、8 路并发兑换只成功 1 个 |
 | `internal/api/web_edit_test.go` / `quota_test.go` | 网页写入闸门（默认只读、同源、只读成员、审计身份）、回收站；配额（原子、历史计入、幂等放行、覆盖值）与限流 |
 | `web/test/*.test.ts`（`cd web && npm test`） | crypto-core 冻结向量对比、网页写端协议层（信封不降级、世代、重试同密文、三方合并、加密草稿隔离、附件命名）；v0.20.1 起还有：编辑控制器在 PUT / GET / 草稿加密边界注入延迟与逆序（`note-editor.test.ts`，Node 下的控制器状态）、草稿条件写 / compare-and-delete、IndexedDB 事务完成语义（`draft-idb.test.ts`）、文档 position 与原文保真（`editor-core.test.ts`）、病态 Markdown 时间预算（`markdown.test.ts`）、原子恢复请求（`restore-client.test.ts`） |
-| `web/e2e/`（`cd web && npm run test:e2e`） | 真实 Chromium 的验收套件（原 58+5+5+7+6 项入库 + W1/W2/W4/W5/W6）；需要 Go（或 `E2E_SERVER_BIN`）、`npx playwright-core install chromium`、插件 checkout（`LITESYNC_PLUGIN_DIR`）。`E2E_SERVER_BIN` 指向旧版本二进制即可复现旧缺陷 |
+| `web/e2e/`（`cd web && npm run test:e2e`） | 真实 Chromium 的验收套件（原 58+5+5+7+6 项入库 + W1/W2/W4/W5/W6）；需要 Go（或 `E2E_SERVER_BIN` / CI 的 `OBSYNC_BIN`）、`npx playwright install chromium`（playwright 与 playwright-core 在 devDependency 里钉成同一版本，装到的 Chromium 修订号与 runner 一致）、插件 checkout（`LITESYNC_PLUGIN_DIR`，默认本仓库旁边的 `litesync`；缺了就记「未执行」并以 1 退出，不冒充通过）。结果在 `web/test-results/<时间>/`（`results.json` + 失败截图 / trace）。`E2E_SERVER_BIN` 指向旧版本二进制即可复现旧缺陷 |
 | `internal/api/restore_content_test.go` | 原子恢复：全流程、拒绝无副作用（墓碑原样）、崩溃注入点、配额、换位置恢复、历史清理、路径加密墓碑 LSM1、网页会话闸门与 `info.access` |
 
 **两种库各跑一遍**：设置 `LITESYNC_TEST_PG_DSN` 后，测试二进制里的 `db.Open(path)` 改走 PG

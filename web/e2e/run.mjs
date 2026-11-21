@@ -5,20 +5,22 @@
  * 用法（在 web/ 下）：
  *   npm run test:e2e                              构建服务端，每个套件起一个独立的本机实例，跑全部套件
  *   npm run test:e2e -- --suite edit,w1-merge     只跑指定套件（--list 列出全部）
- *   E2E_SERVER_BIN=/path/obsync npm run test:e2e  用现成的服务端二进制（例如复现旧版本的缺陷）
+ *   E2E_SERVER_BIN=/path/obsync npm run test:e2e  用现成的服务端二进制（例如复现旧版本的缺陷）；
+ *                                                 没有 E2E_SERVER_BIN 时也认 OBSYNC_BIN（CI 构建服务端后写进的变量）
  *   E2E_BASE=http://127.0.0.1:39210 E2E_ADMIN_TOKEN=… npm run test:e2e -- --suite ed06
  *                                                 用已经在跑的服务端（需要只读实例的套件另给 E2E_BASE_READONLY）
  *
  * 前置条件：
- *   - Node ≥ 22（WebCrypto、fetch）；未给 E2E_SERVER_BIN / E2E_BASE 时需要 Go（go build ./cmd/obsync）；
- *   - playwright-core（web/ 的 devDependency）与 Chromium：`npx playwright-core install chromium`；
+ *   - Node ≥ 22（WebCrypto、fetch）；未给 E2E_SERVER_BIN / OBSYNC_BIN / E2E_BASE 时需要 Go（go build ./cmd/obsync）；
+ *   - playwright / playwright-core（web/ 的 devDependency，版本钉死、两者一致）与对应的 Chromium：
+ *     `npx playwright install chromium`（Linux CI 加 --with-deps）；
  *     也可以用 E2E_PLAYWRIGHT 指向另一个装了 playwright-core / @playwright/test 的目录；
- *   - 插件 checkout：LITESYNC_PLUGIN_DIR（默认同级 ../../litesync）。需要「另一台设备」的套件
+ *   - 插件 checkout：LITESYNC_PLUGIN_DIR（默认同级 ../../litesync，即本仓库旁边的 litesync）。需要「另一台设备」的套件
  *     直接 bundle 插件的 src/api/client.ts、src/sync/transfer.ts、src/crypto/crypto.ts；没有插件时这些
- *     套件记为「未执行」，不会算作通过。
+ *     套件记为「未执行」，不会算作通过（CI 需要先 checkout 插件仓库并设置 LITESYNC_PLUGIN_DIR）。
  *
  * 全部数据都是合成的：每个实例一个临时数据目录、随机管理员 Token（不写进结果文件），
- * 端口只用 E2E_PORTS（默认 39200-39299）。结果写到 E2E_OUT（默认 web/.e2e-results/<时间>/）：
+ * 端口只用 E2E_PORTS（默认 39200-39299）。结果写到 E2E_OUT（默认 web/test-results/<时间>/，CI 失败时整目录上传）：
  *   results.json  机器可读：服务端/网页/插件/浏览器版本与 SHA、每个套件每一项检查的结果；
  *   <套件>/       失败截图、失败 trace（Playwright trace.zip）、套件日志。
  * 退出码：0 全部通过；1 有失败或未执行；2 环境/参数问题。
@@ -70,7 +72,7 @@ const selected = only.length ? SUITES.filter((s) => only.includes(s.name)) : SUI
 const keep = args.includes("--keep") || process.env.E2E_KEEP === "1";
 
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-const outRoot = resolve(process.env.E2E_OUT ?? join(webRoot, ".e2e-results", stamp));
+const outRoot = resolve(process.env.E2E_OUT ?? join(webRoot, "test-results", stamp));
 mkdirSync(outRoot, { recursive: true });
 const work = mkdtempSync(join(process.env.E2E_TMP ?? tmpdir(), "w-e2e-"));
 
@@ -115,7 +117,9 @@ if (!pw) fail(`找不到 Playwright：在 web/ 下 npm ci（devDependency playwr
 // ---------- 服务端 ----------
 const externalBase = process.env.E2E_BASE ?? "";
 const externalReadonly = process.env.E2E_BASE_READONLY ?? "";
-let serverBin = process.env.E2E_SERVER_BIN ? resolve(process.env.E2E_SERVER_BIN) : "";
+// E2E_SERVER_BIN 优先；CI 的上一步把构建好的服务端写进 OBSYNC_BIN，同样直接用，不再重复构建
+const binSource = process.env.E2E_SERVER_BIN ? "E2E_SERVER_BIN" : process.env.OBSYNC_BIN ? "OBSYNC_BIN" : "";
+let serverBin = binSource ? resolve(process.env[binSource]) : "";
 if (!externalBase && !serverBin) {
 	serverBin = join(work, process.platform === "win32" ? "obsync-e2e.exe" : "obsync-e2e");
 	console.log("构建服务端（go build ./cmd/obsync）…");
@@ -284,7 +288,7 @@ const report = {
 		node: process.version,
 		os: `${process.platform}-${process.arch}`,
 		playwright: pw,
-		server: { ...gitInfo(repoRoot), bin: serverBin ? (process.env.E2E_SERVER_BIN ? "E2E_SERVER_BIN" : "go build") : "external", base: externalBase || null },
+		server: { ...gitInfo(repoRoot), bin: serverBin ? binSource || "go build" : "external", base: externalBase || null },
 		web: { version: JSON.parse(readFileSync(join(webRoot, "package.json"), "utf8")).version },
 		plugin: pluginDir ? { ...gitInfo(pluginDir), version: pluginVersion } : null,
 	},
@@ -296,7 +300,7 @@ for (const suite of selected) {
 	const entry = { name: suite.name, description: suite.desc, status: "not-run", passed: 0, failed: 0, checks: [], expectedChecks: suite.expect || null };
 	report.suites.push(entry);
 	if (suite.plugin && !pluginDir) {
-		entry.reason = "未执行：缺少插件 checkout（设置 LITESYNC_PLUGIN_DIR）";
+		entry.reason = `未执行：缺少插件 checkout（设置 LITESYNC_PLUGIN_DIR；当前找的是 ${pluginDirRaw}）`;
 		console.log(entry.reason);
 		continue;
 	}
@@ -334,7 +338,7 @@ for (const suite of selected) {
 	if (server) await server.stop();
 	entry.durationMs = Date.now() - t0;
 	if (result) {
-		Object.assign(entry, { checks: result.checks, passed: result.passed, failed: result.failed, aborted: result.aborted ?? null, artifacts: result.artifacts ?? [] });
+		Object.assign(entry, { checks: result.checks, passed: result.passed, failed: result.failed, aborted: result.aborted ?? null, artifacts: result.artifacts ?? [], browser: result.browser ?? [] });
 		const total = result.passed + result.failed;
 		if (suite.expect && total !== suite.expect && !result.aborted) {
 			entry.failed++;
@@ -348,6 +352,8 @@ for (const suite of selected) {
 	console.log(`==== ${suite.name}：${entry.status}（${entry.passed} 通过 / ${entry.failed} 失败）`);
 }
 
+// 套件实际启动的浏览器（例如「chromium 156.0.8078.4」）；没有套件启动浏览器时为空数组
+report.environment.browser = [...new Set(report.suites.flatMap((s) => s.browser ?? []))];
 report.finishedAt = new Date().toISOString();
 report.durationMs = Date.now() - started;
 report.totals = {
