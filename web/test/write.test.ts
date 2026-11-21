@@ -118,24 +118,64 @@ test("加密草稿：只存密文；换账号/换密钥/篡改都读不出；命
 	const key = await deriveDraftKey(raw);
 	const alice = new DraftStore(backend, "https://sync.example|u-alice|v-1", key, "identity|1");
 	const f = file();
-	await alice.save(f.fileId, { text: "秘密草稿", baseText: "旧", baseRevision: 3, path: f.path, file: f });
+	await alice.save(f.fileId, "ed1", 1, { text: "秘密草稿", baseText: "旧", baseRevision: 3, path: f.path, file: f });
 	for (const rec of backend.dump().values()) {
 		assert.ok(!JSON.stringify(rec).includes("秘密草稿") && !JSON.stringify(rec).includes("今天"), "草稿记录里不能出现明文正文或路径");
 	}
-	assert.equal((await alice.load(f.fileId))?.text, "秘密草稿");
+	assert.equal((await alice.loadAll(f.fileId))[0]?.text, "秘密草稿");
 	const bob = new DraftStore(backend, "https://sync.example|u-bob|v-1", key, "identity|1");
-	assert.equal(await bob.load(f.fileId), null, "另一个账号的命名空间里没有这份草稿");
-	assert.deepEqual(await bob.listKeys(), []);
+	assert.deepEqual(await bob.loadAll(f.fileId), [], "另一个账号的命名空间里没有这份草稿");
+	assert.deepEqual(await bob.listFiles(), []);
 	const other = new DraftStore(backend, "https://sync.example|u-alice|v-1", await deriveDraftKey(core.randomBytes(32)), "identity|1");
-	assert.equal(await other.load(f.fileId), null, "别的仓库密钥解不开");
+	assert.deepEqual(await other.loadAll(f.fileId), [], "别的仓库密钥解不开");
 	const rotated = new DraftStore(backend, "https://sync.example|u-alice|v-1", key, "identity|2");
-	assert.equal(await rotated.load(f.fileId), null, "密钥世代变化后旧草稿不再自动重放");
+	assert.deepEqual(await rotated.loadAll(f.fileId), [], "密钥世代变化后旧草稿不再自动重放");
 	const k = [...backend.dump().keys()][0];
 	const rec = backend.dump().get(k)!;
 	const ct = core.b64decode(rec.ct);
 	ct[3] ^= 1;
 	backend.dump().set(k, { ...rec, ct: core.b64encode(ct) });
-	assert.equal(await alice.load(f.fileId), null, "被篡改的草稿解不开");
+	assert.deepEqual(await alice.loadAll(f.fileId), [], "被篡改的草稿解不开");
+	backend.dump().set(k, { ...rec, v: 99 });
+	assert.deepEqual(await alice.loadAll(f.fileId), [], "版本号绑进 AAD：改记录里的 v 同样解不开");
+});
+
+// W2（RC-1）：草稿条件写 / compare-and-delete / 按编辑器实例分开
+test("加密草稿：逆序完成的旧写入不覆盖新草稿；旧上传成功只删它确认的版本；两个编辑器实例互不删除", async () => {
+	const backend = memoryBackend();
+	const ds = new DraftStore(backend, "o|u|v", await deriveDraftKey(raw), "id|1");
+	const f = file();
+	const c = (text: string) => ({ text, baseText: "base", baseRevision: 3, path: f.path, file: f });
+	assert.equal((await ds.save(f.fileId, "tabA", 5, c("第五版"))).stored, true);
+	assert.equal((await ds.save(f.fileId, "tabA", 4, c("第四版（较早开始、较晚完成）"))).stored, false, "较早的版本晚到：不得覆盖");
+	assert.equal((await ds.loadAll(f.fileId))[0].text, "第五版");
+	assert.equal(await ds.removeIfAtMost(f.fileId, "tabA", 4), false, "旧上传只确认到第 4 版：第 5 版的草稿必须留着");
+	assert.equal((await ds.loadAll(f.fileId)).length, 1);
+	await ds.save(f.fileId, "tabB", 1, c("另一个标签页的输入"));
+	assert.equal((await ds.loadAll(f.fileId)).length, 2, "同一篇笔记两个编辑器实例各有一份草稿");
+	assert.equal(await ds.removeIfAtMost(f.fileId, "tabA", 5), true);
+	const left = await ds.loadAll(f.fileId);
+	assert.deepEqual(left.map((d) => [d.draftId, d.text]), [["tabB", "另一个标签页的输入"]], "标签一保存成功不删标签二的草稿");
+	assert.equal((await ds.listFiles())[0].count, 1);
+});
+
+test("加密草稿：0.20.0 的单草稿格式（wd1）仍可读、可删", async () => {
+	const backend = memoryBackend();
+	const key = await deriveDraftKey(raw);
+	const ns = "o|u|v";
+	const f = file();
+	const iv = core.randomBytes(12);
+	const aad = new TextEncoder().encode(`litesync/web-draft/wd1|${ns}|${f.fileId}|id|1`);
+	const body = new TextEncoder().encode(JSON.stringify({ text: "旧格式草稿", baseText: "b", baseRevision: 1, path: f.path, file: f }));
+	const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource }, key, body as BufferSource));
+	await backend.putIfNotOlder(`${ns}|${f.fileId}`, { format: "wd1", iv: core.b64encode(iv), ct: core.b64encode(ct), savedAt: 1 });
+	const ds = new DraftStore(backend, ns, key, "id|1");
+	const all = await ds.loadAll(f.fileId);
+	assert.equal(all.length, 1);
+	assert.equal(all[0].draftId, "legacy");
+	assert.equal(all[0].text, "旧格式草稿");
+	await ds.remove(f.fileId, "legacy");
+	assert.equal((await ds.loadAll(f.fileId)).length, 0);
 });
 
 test("deleteFile：与插件 ApiClient.remove 同形——JSON {path, baseRevision}，CAS 冲突被识别", async () => {
@@ -183,4 +223,17 @@ test("restoreTombstone：与插件 ApiClient.restore 同形，带幂等键；服
 	respondId = "e".repeat(32);
 	const bad = await restoreTombstone(binding, "f".repeat(32), { expectedTombstoneRevision: 4, contentGeneration: 3, pseudonym: "a.md" }, "web_op2", fakeFetch);
 	assert.equal(bad.ok, false);
+});
+
+// W5 前置（路径加密仓库）：新建后服务器记账的元数据世代是 1——客户端必须采纳，
+// 否则第一次改名拿 0 做 CAS 被服务器 412 拒绝（v0.20.0 网页在路径加密仓库里的实际行为）
+test("uploadPrepared：采纳服务器回报的 metaGeneration（之后改名的 CAS 以它为准）", async () => {
+	const vmk = await vmkP;
+	const meta = await core.deriveMetaKeys(raw);
+	const b = { ...binding, metaMode: true, formatEpoch: 2 };
+	const f = newTrackedFile("私密/新建.md", b);
+	const p = await prepareUpload(b, { vmk, meta }, f, enc.encode("x"));
+	const fakeFetch = async () => new Response(JSON.stringify({ revision: 1, hash: p.cipherHash, fileId: f.fileId, contentGeneration: 1, metaGeneration: 1 }), { status: 200 });
+	const out = await uploadPrepared(b, f, p, fakeFetch);
+	assert.equal(out.kind === "saved" && out.metaGeneration, 1);
 });

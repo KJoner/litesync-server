@@ -43,6 +43,9 @@ const SUITES = [
 	{ name: "ed06", file: "suites/ed06.ts", server: "editing", plugin: false, expect: 5, desc: "ED-06：恶意 Markdown 不执行脚本、不外发请求" },
 	{ name: "quota", file: "suites/quota.ts", server: "editing", plugin: false, expect: 7, desc: "配额超限如实说明且不丢内容" },
 	{ name: "edit-off", file: "suites/edit-off.ts", server: "readonly", plugin: true, expect: 6, desc: "网页编辑默认关闭：只读界面 + 服务端拒绝会话写入" },
+	{ name: "w1-merge", file: "suites/w1-merge.ts", server: "editing", plugin: true, expect: 12, desc: "W1：上传/取远端期间继续输入，合并与冲突副本不丢输入（含输入法组合）" },
+	{ name: "w2-drafts", file: "suites/w2-drafts.ts", server: "editing", plugin: true, expect: 18, desc: "W2：旧上传成功不删更新的草稿；草稿逆序写入；多标签；强制结束后恢复" },
+	{ name: "w6-bytes", file: "suites/w6-bytes.ts", server: "editing", plugin: true, expect: 18, desc: "W6：CRLF/混合换行/BOM/emoji 的工具栏操作与无编辑不改字节" },
 ];
 
 function fail(msg, code = 2) {

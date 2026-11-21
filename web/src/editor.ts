@@ -4,16 +4,20 @@
  * 单独打包成 /editor.js，只在用户进入编辑时加载——阅读路径不背这几百 KB。
  * 原则：Markdown 原文是唯一事实来源。
  *   - 不做任何「整篇格式化」：打开、预览、保存都不会重排原文；
- *   - 换行风格按原文保持（CRLF 文件用 CRLF 作为行分隔符，否则 CodeMirror 会统一成 LF）；
- *   - 工具栏动作只改动选区或光标所在行；输入法组合输入期间不执行任何替换。
+ *   - 位置一律用文档 position（W6）：文档内部按任意换行切行、一个换行恒为 1 个 position；
+ *     换行风格只在序列化时体现——纯 CRLF 原文按 CRLF 写回，其余按 LF；
+ *   - 没有真实编辑（含编辑后撤销回原样）时 getText() 原样返回原文字节（混用换行、BOM 不动）；
+ *   - 工具栏动作只改动选区或光标所在行；输入法组合输入期间不执行任何程序化替换
+ *     （合并结果等组合结束再套用，见 whenNotComposing）。
  */
-import { EditorState, Transaction } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, keymap, placeholder } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { StyleModule } from "style-mod";
+import { Baseline, diffSpec, insertSpec, prefixSpec, wrapSpec } from "./editor-core";
 
 /**
  * CSP 兼容：本站 CSP 是 `style-src 'self'`（不允许内联 <style>）。CodeMirror 的主题由
@@ -49,12 +53,21 @@ export interface EditorOptions {
 }
 
 export interface EditorHandle {
+	/** 要保存的文本：没有真实编辑时原样返回基准原文。 */
 	getText(): string;
-	/** 整体替换内容（合并远端后）；作为一次可撤销的修改。 */
-	replaceAll(text: string): void;
+	/** 文档修改计数（每次 docChanged +1，含程序化修改）：异步结果据此判断「期间有没有新输入」。 */
+	version(): number;
+	/** 载入新的基准原文（远端新版本 / 刚保存的内容），整体替换。 */
+	load(text: string): void;
+	/** 把文档改成 text（合并结果、恢复的草稿）：只替换差异部分，作为一次可撤销的修改；基准不变。 */
+	applyText(text: string): void;
 	focus(): void;
 	destroy(): void;
 	isComposing(): boolean;
+	/** 输入法组合结束后 resolve（没有组合时立即 resolve）。 */
+	whenNotComposing(): Promise<void>;
+	/** 只读（保留双方上传冲突副本期间）：用户输入被拒绝而不是被吞掉。 */
+	setReadOnly(readOnly: boolean): void;
 	wrap(before: string, after: string, placeholderText: string): void;
 	prefixLines(prefix: string): void;
 	insert(text: string): void;
@@ -74,13 +87,15 @@ const theme = EditorView.theme({
 });
 
 export function createEditor(parent: HTMLElement, text: string, opts: EditorOptions): EditorHandle {
-	const crlf = /\r\n/.test(text) && !/(^|[^\r])\n/.test(text); // 全文一致为 CRLF 时才按 CRLF 保持
+	let baseline: Baseline;
+	let version = 0;
+	const readOnly = new Compartment();
 	const view = new EditorView({
 		parent,
 		state: EditorState.create({
 			doc: text,
 			extensions: [
-				crlf ? EditorState.lineSeparator.of("\r\n") : [],
+				readOnly.of([]),
 				history(),
 				drawSelection(),
 				highlightActiveLine(),
@@ -98,8 +113,9 @@ export function createEditor(parent: HTMLElement, text: string, opts: EditorOpti
 					...searchKeymap,
 				]),
 				EditorView.updateListener.of((u) => {
-					// sliceDoc 按配置的行分隔符拼接（CRLF 文件保持 CRLF）；doc.toString() 永远用 LF（ED-02 实测抓到）
-					if (u.docChanged) opts.onChange(u.state.sliceDoc());
+					if (!u.docChanged) return;
+					version++;
+					opts.onChange(baseline.serialize(u.state.doc));
 				}),
 				EditorView.domEventHandlers({
 					paste: (e) => {
@@ -109,13 +125,13 @@ export function createEditor(parent: HTMLElement, text: string, opts: EditorOpti
 						opts.onFiles(files);
 						return true;
 					},
-					drop: (e, view) => {
+					drop: (e, v) => {
 						const files = Array.from(e.dataTransfer?.files ?? []);
 						if (files.length === 0 || !opts.onFiles) return false;
 						e.preventDefault();
 						// 光标放到落点，引用插在用户松手的位置
-						const pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
-						if (pos !== null) view.dispatch({ selection: { anchor: pos } });
+						const pos = v.posAtCoords({ x: e.clientX, y: e.clientY });
+						if (pos !== null) v.dispatch({ selection: { anchor: pos } });
 						opts.onFiles(files);
 						return true;
 					},
@@ -125,48 +141,47 @@ export function createEditor(parent: HTMLElement, text: string, opts: EditorOpti
 			],
 		}),
 	});
+	baseline = Baseline.of(view.state, text);
 
 	const guard = () => !view.composing; // 输入法组合期间不做任何程序化替换
 
 	return {
-		getText: () => view.state.sliceDoc(),
-		replaceAll: (t) => {
-			view.dispatch({
-				changes: { from: 0, to: view.state.doc.length, insert: t },
-				annotations: Transaction.userEvent.of("input.merge"),
-			});
+		getText: () => baseline.serialize(view.state.doc),
+		version: () => version,
+		load: (t) => {
+			// 先换基准再派发：updateListener 里序列化出来的就是 t 本身（内容相同的文档 eq 成立）
+			baseline = new Baseline(t, view.state.toText(t));
+			const spec = diffSpec(view.state, t, "input.load");
+			if (spec) view.dispatch(spec);
+		},
+		applyText: (t) => {
+			const spec = diffSpec(view.state, t);
+			if (spec) view.dispatch(spec);
 		},
 		focus: () => view.focus(),
 		destroy: () => view.destroy(),
 		isComposing: () => view.composing,
+		whenNotComposing: () =>
+			new Promise<void>((resolve) => {
+				const tick = () => (view.composing ? setTimeout(tick, 50) : resolve());
+				tick();
+			}),
+		setReadOnly: (ro) => {
+			view.dispatch({ effects: readOnly.reconfigure(ro ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []) });
+		},
 		wrap: (before, after, ph) => {
 			if (!guard()) return;
-			const r = view.state.selection.main;
-			const sel = view.state.sliceDoc(r.from, r.to) || ph;
-			view.dispatch({
-				changes: { from: r.from, to: r.to, insert: before + sel + after },
-				selection: { anchor: r.from + before.length, head: r.from + before.length + sel.length },
-				userEvent: "input.format",
-			});
+			view.dispatch(wrapSpec(view.state, before, after, ph));
 			view.focus();
 		},
 		prefixLines: (prefix) => {
 			if (!guard()) return;
-			const r = view.state.selection.main;
-			const first = view.state.doc.lineAt(r.from).number;
-			const last = view.state.doc.lineAt(r.to).number;
-			const changes = [];
-			for (let n = first; n <= last; n++) {
-				const line = view.state.doc.line(n);
-				if (!line.text.startsWith(prefix)) changes.push({ from: line.from, insert: prefix });
-			}
-			view.dispatch({ changes, userEvent: "input.format" });
+			view.dispatch(prefixSpec(view.state, prefix));
 			view.focus();
 		},
 		insert: (t) => {
 			if (!guard()) return;
-			const r = view.state.selection.main;
-			view.dispatch({ changes: { from: r.from, to: r.to, insert: t }, selection: { anchor: r.from + t.length }, userEvent: "input" });
+			view.dispatch(insertSpec(view.state, t));
 			view.focus();
 		},
 	};

@@ -17,7 +17,9 @@ import * as core from "./vendor/litesync-core/crypto/crypto";
 import { smartThreeWayMerge } from "./vendor/litesync-core/merge/smart-merge";
 
 export const WEB_DRAFT_INFO = "litesync/v1/web-draft";
-const DRAFT_FORMAT = "wd1";
+/** wd2（v0.20.1）：按编辑器实例分草稿、带版本号；wd1 = 0.20.0 的单草稿格式（只读兼容） */
+const DRAFT_FORMAT = "wd2";
+const LEGACY_DRAFT_FORMAT = "wd1";
 
 /** 写入时需要的仓库绑定（来自 /api/v1/info 与仓库列表）。 */
 export interface RepoBinding {
@@ -57,7 +59,8 @@ export interface PreparedUpload {
 }
 
 export type SaveOutcome =
-	| { kind: "saved"; revision: number; generation: number; fileId: string; hash: string }
+	/** metaGeneration：服务器记账的元数据世代（路径加密仓库新建 = 1）；之后改名的 CAS 以它为准 */
+	| { kind: "saved"; revision: number; generation: number; fileId: string; hash: string; metaGeneration?: number }
 	| { kind: "conflict"; revision: number; hash: string; deleted: boolean; fileId?: string }
 	| { kind: "offline"; message: string }
 	| { kind: "auth" }
@@ -164,14 +167,16 @@ export async function uploadPrepared(b: RepoBinding, f: TrackedFile, p: Prepared
 		const { code, message, body } = await readCode(res);
 		return { kind: "rejected", status: res.status, code, message, details: body.details as Record<string, unknown> | undefined };
 	}
-	const out = (await res.json()) as { revision: number; hash: string; fileId?: string; contentGeneration?: number };
+	const out = (await res.json()) as { revision: number; hash: string; fileId?: string; contentGeneration?: number; metaGeneration?: number };
 	// 服务端回报的身份必须与本次加密用的一致，否则这份密文将来解不开
 	if (b.encrypted && out.fileId && out.fileId !== f.fileId) {
 		return { kind: "rejected", status: 200, code: "FILE_ID_MISMATCH", message: "服务器返回的文件身份与加密时不一致，已停止" };
 	}
 	// 服务端确认的世代为准（幂等重放命中首次结果时同样成立）
 	const generation = typeof out.contentGeneration === "number" && out.contentGeneration > 0 ? out.contentGeneration : p.generation;
-	return { kind: "saved", revision: out.revision, generation, fileId: out.fileId ?? f.fileId, hash: out.hash };
+	// 元数据世代同样以服务端记账为准：路径加密仓库新建时服务器记 1，客户端若还当 0，第一次改名就会 412
+	const meta = typeof out.metaGeneration === "number" ? { metaGeneration: out.metaGeneration } : {};
+	return { kind: "saved", revision: out.revision, generation, fileId: out.fileId ?? f.fileId, hash: out.hash, ...meta };
 }
 
 /** 删除（产生 tombstone；带前置版本 CAS）。请求体与插件 ApiClient.remove 相同：JSON {path, baseRevision}。 */
@@ -332,12 +337,34 @@ export interface DraftContent {
 	baseRevision: number;
 	path: string;
 	file: TrackedFile;
+	/**
+	 * 写这份草稿时正在上传、还没有得到确认的那版全文（W2）。上传其实已经到了服务器、只是响应没回来
+	 * （锁定 / 刷新 / 崩溃打断）时，恢复草稿可以拿它当合并的 base——否则「草稿 = 已上传内容 + 后来的输入」
+	 * 与「服务器 = 已上传内容」会被三方合并当成同一处的两份不同插入。
+	 */
+	inflightText?: string | null;
+}
+
+/** 已解密的一份草稿（含它属于哪个编辑器实例、第几版）。 */
+export interface LoadedDraft extends DraftContent {
+	savedAt: number;
+	fileKey: string;
+	/** 写入它的编辑器实例；legacy = 0.20.0 的单草稿格式 */
+	draftId: string;
+	/** 该编辑器实例的本地修改计数：同一 draftId 内只升不降 */
+	version: number;
 }
 
 /** 草稿的持久化后端（浏览器用 IndexedDB；测试用内存）。值是不透明的密文记录。 */
 export interface DraftBackend {
 	get(key: string): Promise<DraftRecord | undefined>;
-	put(key: string, rec: DraftRecord): Promise<void>;
+	/**
+	 * 条件写：已有记录的版本（v）比 rec.v 新时不写，返回 false。读与写在**同一个**事务里，
+	 * 并且只有事务真正提交（oncomplete）之后才 resolve——「已加密保存到本机」必须对应已落盘。
+	 */
+	putIfNotOlder(key: string, rec: DraftRecord): Promise<boolean>;
+	/** 条件删（compare-and-delete）：已有记录的版本 ≤ v 时才删，返回是否删了。 */
+	deleteIfAtMost(key: string, v: number): Promise<boolean>;
 	delete(key: string): Promise<void>;
 	keys(prefix: string): Promise<string[]>;
 }
@@ -347,77 +374,212 @@ export interface DraftRecord {
 	iv: string;
 	ct: string;
 	savedAt: number;
+	/** wd2：编辑器本地版本号（同时绑进 AAD，篡改即解不开） */
+	v?: number;
 }
 
+const LEGACY_DRAFT_ID = "legacy";
+
+/**
+ * 加密草稿（ADR-015 §2；W2）。
+ *
+ * 键 = 服务器源|账号|仓库|fileId|draftId。draftId 是**编辑器实例**：同一篇笔记在两个标签页里
+ * 各有各的草稿，一个保存成功不会删掉另一个的未同步输入。每次写入带该实例的本地版本号 v：
+ *   - 写入是条件写：较早开始、较晚完成的加密（逆序完成）不会覆盖较新的草稿；
+ *   - 删除是 compare-and-delete：一次上传成功只删「≤ 它所确认的版本」的草稿，不删更新的输入。
+ * 0.20.0 的单草稿格式（wd1，键 = …|fileId）照常可读，按 draftId = legacy 处理。
+ */
 export class DraftStore {
 	/** ns = 服务器源|账号|仓库；aadBase = 仓库身份|密钥世代。 */
 	constructor(private backend: DraftBackend, private ns: string, private key: CryptoKey, private aadBase: string) {}
 
-	private aad(fileKey: string): Uint8Array {
-		return new TextEncoder().encode(`litesync/web-draft/${DRAFT_FORMAT}|${this.ns}|${fileKey}|${this.aadBase}`);
+	private aadV2(fileKey: string, draftId: string, v: number): Uint8Array {
+		return new TextEncoder().encode(`litesync/web-draft/${DRAFT_FORMAT}|${this.ns}|${fileKey}|${draftId}|${v}|${this.aadBase}`);
 	}
 
-	async save(fileKey: string, c: DraftContent): Promise<number> {
+	private aadLegacy(fileKey: string): Uint8Array {
+		return new TextEncoder().encode(`litesync/web-draft/${LEGACY_DRAFT_FORMAT}|${this.ns}|${fileKey}|${this.aadBase}`);
+	}
+
+	private keyOf(fileKey: string, draftId: string): string {
+		return draftId === LEGACY_DRAFT_ID ? `${this.ns}|${fileKey}` : `${this.ns}|${fileKey}|${draftId}`;
+	}
+
+	/** 加密并条件写入；stored=false 表示本机已有这个编辑器实例更新的一版（这次写入过期了）。 */
+	async save(fileKey: string, draftId: string, version: number, c: DraftContent): Promise<{ stored: boolean; savedAt: number }> {
 		const iv = core.randomBytes(12);
-		const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as BufferSource, additionalData: this.aad(fileKey) as BufferSource },
+		const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as BufferSource, additionalData: this.aadV2(fileKey, draftId, version) as BufferSource },
 			this.key, new TextEncoder().encode(JSON.stringify(c)) as BufferSource));
 		const savedAt = Date.now();
-		await this.backend.put(this.ns + "|" + fileKey, { format: DRAFT_FORMAT, iv: core.b64encode(iv), ct: core.b64encode(ct), savedAt });
-		return savedAt;
+		const stored = await this.backend.putIfNotOlder(this.keyOf(fileKey, draftId), { format: DRAFT_FORMAT, iv: core.b64encode(iv), ct: core.b64encode(ct), savedAt, v: version });
+		return { stored, savedAt };
 	}
 
-	async load(fileKey: string): Promise<(DraftContent & { savedAt: number }) | null> {
-		const rec = await this.backend.get(this.ns + "|" + fileKey);
-		if (!rec || rec.format !== DRAFT_FORMAT) return null;
+	/** 一次上传成功后：只删除这个实例 ≤ version 的草稿（更新的输入留着）。 */
+	async removeIfAtMost(fileKey: string, draftId: string, version: number): Promise<boolean> {
+		return this.backend.deleteIfAtMost(this.keyOf(fileKey, draftId), version);
+	}
+
+	/** 无条件删除一份草稿（用户丢弃、内容已在服务器上、已被新的编辑器实例接管）。 */
+	async remove(fileKey: string, draftId: string): Promise<void> {
+		await this.backend.delete(this.keyOf(fileKey, draftId));
+	}
+
+	private async decrypt(fileKey: string, draftId: string, rec: DraftRecord): Promise<LoadedDraft | null> {
 		try {
-			const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: core.b64decode(rec.iv) as BufferSource, additionalData: this.aad(fileKey) as BufferSource },
+			const legacy = rec.format === LEGACY_DRAFT_FORMAT;
+			if (!legacy && (rec.format !== DRAFT_FORMAT || typeof rec.v !== "number")) return null;
+			const aad = legacy ? this.aadLegacy(fileKey) : this.aadV2(fileKey, draftId, rec.v!);
+			const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: core.b64decode(rec.iv) as BufferSource, additionalData: aad as BufferSource },
 				this.key, core.b64decode(rec.ct) as BufferSource);
-			return { ...(JSON.parse(new TextDecoder().decode(plain)) as DraftContent), savedAt: rec.savedAt };
+			return { ...(JSON.parse(new TextDecoder().decode(plain)) as DraftContent), savedAt: rec.savedAt, fileKey, draftId, version: legacy ? 0 : rec.v! };
 		} catch {
-			return null; // 别的账号/仓库/密钥世代的草稿：解不开就是不存在
+			return null; // 别的账号/仓库/密钥世代的草稿，或被篡改：解不开就是不存在
 		}
 	}
 
-	async remove(fileKey: string): Promise<void> {
-		await this.backend.delete(this.ns + "|" + fileKey);
+	/** 这篇笔记在本机的全部草稿（各编辑器实例 + 旧格式），最新的在前。 */
+	async loadAll(fileKey: string): Promise<LoadedDraft[]> {
+		const prefix = `${this.ns}|${fileKey}`;
+		const out: LoadedDraft[] = [];
+		for (const k of await this.backend.keys(prefix)) {
+			const rest = k.slice(prefix.length);
+			if (rest !== "" && !rest.startsWith("|")) continue; // 前缀碰巧相同的另一个 fileKey
+			const draftId = rest === "" ? LEGACY_DRAFT_ID : rest.slice(1);
+			const rec = await this.backend.get(k);
+			if (!rec) continue;
+			const d = await this.decrypt(fileKey, draftId, rec);
+			if (d) out.push(d);
+		}
+		return out.sort((a, b) => b.savedAt - a.savedAt);
 	}
 
-	async listKeys(): Promise<string[]> {
-		return (await this.backend.keys(this.ns + "|")).map((k) => k.slice(this.ns.length + 1));
+	/** 本机有草稿的笔记（首页「本机未同步的草稿」）：每篇取最新的一份，并给出份数。 */
+	async listFiles(): Promise<(LoadedDraft & { count: number })[]> {
+		const prefix = this.ns + "|";
+		const fileKeys = new Set<string>();
+		for (const k of await this.backend.keys(prefix)) fileKeys.add(k.slice(prefix.length).split("|")[0]);
+		const out: (LoadedDraft & { count: number })[] = [];
+		for (const fk of fileKeys) {
+			const all = await this.loadAll(fk);
+			if (all.length) out.push({ ...all[0], count: all.length });
+		}
+		return out.sort((a, b) => b.savedAt - a.savedAt);
 	}
 }
 
-/** IndexedDB 后端（浏览器）。打开失败（隐私模式、配额）时抛出，调用方显示「本机草稿不可用」。 */
+type AbortableTx = IDBTransaction & { __abort?: (e: unknown) => void };
+
+/** 一次 IndexedDB 事务：body 发请求、用 done 记下结果；只有事务**提交完成**才 resolve，abort / 错误一律 reject。 */
+function idbTx<T>(db: IDBDatabase, mode: IDBTransactionMode, body: (s: IDBObjectStore, done: (v: T) => void) => void): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		let t: AbortableTx;
+		try {
+			t = db.transaction("drafts", mode);
+		} catch (e) {
+			reject(e);
+			return;
+		}
+		let result: T | undefined;
+		let failure: unknown = null;
+		t.oncomplete = () => resolve(result as T);
+		// 配额已满（QuotaExceededError）、请求出错、被主动中止：都会走到 onabort；failure / error 里是真正原因
+		t.onabort = () => reject(failure ?? t.error ?? new DOMException("IndexedDB 事务已中止", "AbortError"));
+		t.__abort = (e: unknown) => {
+			failure = e;
+			try {
+				t.abort();
+			} catch {
+				/* 已经结束 */
+			}
+		};
+		try {
+			body(t.objectStore("drafts"), (v) => (result = v));
+		} catch (e) {
+			t.__abort(e);
+		}
+	});
+}
+
+/** 在请求回调里执行：回调里同步抛出的异常（例如 put 直接抛 QuotaExceededError）必须让事务中止。 */
+function guarded(s: IDBObjectStore, fn: () => void): void {
+	try {
+		fn();
+	} catch (e) {
+		(s.transaction as AbortableTx).__abort?.(e);
+	}
+}
+
+/** IndexedDB 后端（浏览器）。打开失败（隐私模式、配额）时抛出，调用方降级为内存并如实说明。 */
 export function indexedDbBackend(dbName = "litesync-web-drafts"): DraftBackend {
 	let dbp: Promise<IDBDatabase> | null = null;
 	const open = () => (dbp ??= new Promise((resolve, reject) => {
 		const req = indexedDB.open(dbName, 1);
 		req.onupgradeneeded = () => req.result.createObjectStore("drafts");
 		req.onsuccess = () => resolve(req.result);
-		req.onerror = () => reject(req.error);
+		req.onerror = () => {
+			dbp = null;
+			reject(req.error);
+		};
 	}));
-	const tx = async <T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> => {
-		const db = await open();
-		return new Promise<T>((resolve, reject) => {
-			const r = fn(db.transaction("drafts", mode).objectStore("drafts"));
-			r.onsuccess = () => resolve(r.result);
-			r.onerror = () => reject(r.error);
-		});
-	};
 	return {
-		get: (k) => tx<DraftRecord | undefined>("readonly", (s) => s.get(k) as IDBRequest<DraftRecord | undefined>),
-		put: async (k, rec) => void (await tx("readwrite", (s) => s.put(rec, k))),
-		delete: async (k) => void (await tx("readwrite", (s) => s.delete(k))),
-		keys: async (prefix) => ((await tx<IDBValidKey[]>("readonly", (s) => s.getAllKeys())) as string[]).filter((k) => typeof k === "string" && k.startsWith(prefix)),
+		get: async (k) => idbTx<DraftRecord | undefined>(await open(), "readonly", (s, done) => {
+			const r = s.get(k);
+			r.onsuccess = () => done(r.result as DraftRecord | undefined);
+		}),
+		putIfNotOlder: async (k, rec) => idbTx<boolean>(await open(), "readwrite", (s, done) => {
+			const r = s.get(k);
+			r.onsuccess = () => guarded(s, () => {
+				const cur = r.result as DraftRecord | undefined;
+				if (cur && typeof cur.v === "number" && typeof rec.v === "number" && cur.v > rec.v) return done(false);
+				s.put(rec, k);
+				done(true);
+			});
+		}),
+		deleteIfAtMost: async (k, v) => idbTx<boolean>(await open(), "readwrite", (s, done) => {
+			const r = s.get(k);
+			r.onsuccess = () => guarded(s, () => {
+				const cur = r.result as DraftRecord | undefined;
+				if (!cur) return done(false);
+				if (typeof cur.v === "number" && cur.v > v) return done(false);
+				s.delete(k);
+				done(true);
+			});
+		}),
+		delete: async (k) => idbTx<void>(await open(), "readwrite", (s, done) => {
+			s.delete(k);
+			done(undefined);
+		}),
+		keys: async (prefix) => {
+			const all = await idbTx<IDBValidKey[]>(await open(), "readonly", (s, done) => {
+				const r = s.getAllKeys();
+				r.onsuccess = () => done(r.result);
+			});
+			return all.filter((k): k is string => typeof k === "string" && k.startsWith(prefix));
+		},
 	};
 }
 
-/** 内存后端（测试 / 存储不可用时的降级——此时界面明确提示草稿不会跨刷新保留）。 */
+/**
+ * 内存后端（测试 / 浏览器不允许持久存储时的降级）：语义与 IndexedDB 后端相同（条件写、条件删），
+ * 但**不跨刷新**——界面必须如实说明「只在这个页面的内存里，关闭或刷新即丢失」。
+ */
 export function memoryBackend(): DraftBackend & { dump(): Map<string, DraftRecord> } {
 	const m = new Map<string, DraftRecord>();
 	return {
 		get: async (k) => m.get(k),
-		put: async (k, r) => void m.set(k, r),
+		putIfNotOlder: async (k, r) => {
+			const cur = m.get(k);
+			if (cur && typeof cur.v === "number" && typeof r.v === "number" && cur.v > r.v) return false;
+			m.set(k, r);
+			return true;
+		},
+		deleteIfAtMost: async (k, v) => {
+			const cur = m.get(k);
+			if (!cur || (typeof cur.v === "number" && cur.v > v)) return false;
+			m.delete(k);
+			return true;
+		},
 		delete: async (k) => void m.delete(k),
 		keys: async (p) => [...m.keys()].filter((k) => k.startsWith(p)),
 		dump: () => m,

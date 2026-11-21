@@ -139,6 +139,8 @@ export class Api {
 		encryptionState?: string;
 		minimumEnvelopeVersion?: number;
 		capabilities?: string[];
+		/** v0.20.1：本账号在这个仓库里的成员角色与能否写内容（只对账号身份给出） */
+		access?: { role: string; canWrite: boolean };
 	}> {
 		const res = await this.req("/api/v1/info");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);

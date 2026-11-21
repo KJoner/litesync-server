@@ -258,7 +258,16 @@ func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, "info", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	// access（v0.20.1 / RC-1）：调用者在**这个仓库**里的成员角色与能否写内容。网页据此在只读成员
+	// 打开时就隐藏编辑 / 新建，而不是等用户写了半天、保存时才收到 403；最终裁决仍在写路由的服务端检查。
+	// 只对账号身份（网页会话 / 用户 Token）给出；设备凭据的访问范围由 scope 决定，不在这里表达。
+	var access map[string]any
+	if id := identityFrom(r); id != nil && id.UserID != "" && id.VaultID != "" {
+		if role, ok, rerr := h.svc.RoleIn(scopeOf(r), id.UserID); rerr == nil && ok {
+			access = map[string]any{"role": string(role), "canWrite": role.CanWrite()}
+		}
+	}
+	out := map[string]any{
 		"resetAuthConfigured": resetAuth,
 		// v0.20 能力协商（接口约定 §8）：客户端以「数组里有没有这个字符串」判定，未知值忽略
 		"capabilities":       h.capabilities(),
@@ -281,7 +290,11 @@ func (h *handlers) info(w http.ResponseWriter, r *http.Request) {
 		"migrationId":            ri.MigrationID,
 		"migrationOwnerDeviceId": ri.MigrationOwnerDeviceID,
 		"serverTime":             time.Now().Unix(),
-	})
+	}
+	if access != nil {
+		out["access"] = access // 只加字段：设备凭据的响应与 0.20.0 完全相同
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *handlers) internalError(w http.ResponseWriter, op string, err error) {
