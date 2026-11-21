@@ -117,6 +117,18 @@ func (s *Service) RevokeAccount(req RevokeRequest) (*RevokeResult, error) {
 				return err
 			}
 		}
+		if req.Reason == RevokeReasonUserRequest {
+			// 安全事件与撤销同一事务落盘（复审 SV-05）
+			template := "logout-devices"
+			if req.AllProducts {
+				template = "logout-everywhere"
+			}
+			if err := s.recordEvent(tx, req.UserID, template, map[string]string{
+				"revokedDevices": fmt.Sprint(out.RevokedDevices), "eventId": eventID,
+			}); err != nil {
+				return err
+			}
+		}
 		return db.AuditUserEvent(tx, req.UserID, "account-revoked",
 			fmt.Sprintf("event=%s scope=%s reason=%s devices=%d grants=%d authEpoch=%d",
 				eventID, p.Scope, p.Reason, out.RevokedDevices, out.RevokedGrants, out.AuthEpoch))
@@ -127,15 +139,7 @@ func (s *Service) RevokeAccount(req RevokeRequest) (*RevokeResult, error) {
 	res.AuthEpoch, res.RevokedDevices, res.RevokedGrants = out.AuthEpoch, out.RevokedDevices, out.RevokedGrants
 	s.log.Warn("account revoked", "user", req.UserID, "event", eventID, "scope", p.Scope, "reason", p.Reason,
 		"revokedDevices", out.RevokedDevices, "revokedGrants", out.RevokedGrants)
-	if req.Reason == RevokeReasonUserRequest {
-		template := "logout-devices"
-		if req.AllProducts {
-			template = "logout-everywhere"
-		}
-		s.notify(req.UserID, template, map[string]string{
-			"revokedDevices": fmt.Sprint(out.RevokedDevices), "eventId": eventID,
-		})
-	}
+	s.wake()
 	return res, nil
 }
 

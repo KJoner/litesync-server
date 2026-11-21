@@ -197,14 +197,18 @@ func (s *Service) ResetUserToken(scope db.VaultScope, targetUserID, submittedRes
 			targetUserID, out.RevokedDevices, out.RevokedGrants, gen, out.AuthEpoch, enforced)); err != nil {
 		return nil, err
 	}
+	// 安全事件与重置同一事务落盘（复审 SV-05）
+	if err := s.recordEvent(tx, targetUserID, "token-reset", map[string]string{
+		"revokedDevices": fmt.Sprint(out.RevokedDevices), "eventId": fmt.Sprintf("gen-%d", gen),
+	}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	s.log.Warn("api token reset", "user", targetUserID, "revokedDevices", out.RevokedDevices,
 		"revokedGrants", out.RevokedGrants, "resetAuthEnforced", enforced)
-	s.notify(targetUserID, "token-reset", map[string]string{
-		"revokedDevices": fmt.Sprint(out.RevokedDevices), "eventId": fmt.Sprintf("gen-%d", gen),
-	})
+	s.wake()
 	return &TokenResetResult{
 		Token: token, RevokedDevices: out.RevokedDevices, RevokedGrants: out.RevokedGrants,
 		Generation: gen, AuthEpoch: out.AuthEpoch, ResetAuthEnforced: enforced,

@@ -64,6 +64,15 @@ func (s *Service) RunMaintenance() MaintenanceStats {
 	if _, err := db.PruneInvites(s.db, now); err != nil {
 		s.log.Warn("maintenance: invites", "error", err)
 	}
+	// 已处理 30 天以上的安全事件（SV-05；未处理的永远保留）与过期的撤销记录（ADR-019）
+	s.mu.Lock()
+	if err := db.PruneSecurityEvents(s.db, now); err != nil {
+		s.log.Warn("maintenance: security events", "error", err)
+	}
+	if err := db.PruneRevocationRecords(s.db, now); err != nil {
+		s.log.Warn("maintenance: revocation records", "error", err)
+	}
+	s.mu.Unlock()
 	// tombstone 清理走双条件（时间 + 全部未撤销设备已确认越过删除点）；
 	// 默认配置下 TombstoneRetentionDays = 0，这里永远是 no-op（ADR-002 §3.4）
 	if n, err := s.PurgeTombstones(now); err != nil {

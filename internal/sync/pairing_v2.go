@@ -379,12 +379,16 @@ func (s *Service) RedeemEnrollment(scope db.VaultScope, p RedeemParams) (*Redeem
 		if err := db.DeletePairingsOfGrant(tx, row.ID); err != nil {
 			return err
 		}
+		// 「新设备已连接」安全事件与建设备同一事务落盘（复审 SV-05）
+		if err := s.recordDeviceEvent(tx, g.UserID, g.VaultID, deviceID, name, p.Platform); err != nil {
+			return err
+		}
 		return db.AppendAudit(tx, scope, deviceID, "device-enrolled", fmt.Sprintf("via=redeem-v2 grant=%s", row.ID))
 	})
 	if err != nil {
 		return nil, err
 	}
 	s.log.Info("device enrolled", "deviceId", res.DeviceID, "vault", res.VaultID, "via", "redeem-v2")
-	s.notifyDeviceLocked(row.UserID, row.VaultID, res.DeviceID, name, p.Platform)
+	s.wake()
 	return res, nil
 }

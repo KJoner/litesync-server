@@ -1,9 +1,11 @@
 package db
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 )
@@ -15,6 +17,11 @@ import (
 //
 // 隐私：收件地址与正文只在待发期间存在；发送成功或最终失败后立即清空，只留地址
 // 哈希、模板名与状态用于排障与抑制判断。日志一律不记地址、正文与链接。
+//
+// 耐久性（v0.20.1 / 复审 SV-05）：业务操作在**自己的事务里**写一条最小的安全事件
+//（security_events：账号、事件类型、几项展示字段），与业务变更同生共死；后台 worker 负责
+// 查收件地址、渲染、入队（mail_outbox）与网络发送，每条事件的去向都记成结果（outcome）。
+// 以前是先进容量 256 的内存队列、满了丢弃、由另一个协程再落盘——业务成功到落盘之间进程退出就丢通知。
 
 const mailSchema = `
 CREATE TABLE IF NOT EXISTS mail_outbox (
@@ -41,7 +48,143 @@ CREATE TABLE IF NOT EXISTS mail_suppressions (
 	reason     TEXT NOT NULL,
 	created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS security_events (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	event_key    TEXT NOT NULL UNIQUE,
+	user_id      TEXT NOT NULL,
+	event        TEXT NOT NULL,
+	data         TEXT NOT NULL DEFAULT '',
+	event_state  TEXT NOT NULL DEFAULT 'pending' CHECK (event_state IN ('pending','done')),
+	outcome      TEXT NOT NULL DEFAULT '',
+	mail_id      INTEGER NOT NULL DEFAULT 0,
+	created_at   INTEGER NOT NULL,
+	processed_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_security_events_pending ON security_events(event_state, id);
 `
+
+// ---------------------------------------------------------------- 安全事件（SV-05）
+
+// 安全事件的处理结果（每条事件都有一个；管理员统计按它分组）。
+const (
+	EventOutcomeMailQueued      = "mail-queued"           // 已渲染并进入投递队列
+	EventOutcomeDuplicate       = "duplicate"             // 同一事件的邮件早已入队（重放 / 崩溃后重处理）
+	EventOutcomeSuppressed      = "suppressed"            // 收件人在抑制表（硬退信 / 投诉）
+	EventOutcomeNoAddress       = "no-verified-address"   // 账号没有已验证的统一账号邮箱（如只用 API Token 的旧管理员）
+	EventOutcomeRecipientLimit  = "recipient-daily-limit" // 同一收件人 24 小时内超过上限（防邮件炸弹），本条不发
+	EventOutcomeUnknownTemplate = "unknown-template"      // 程序缺陷：事件类型没有模板
+)
+
+// SecurityEvent 是一条待处理（或已处理）的安全事件。
+type SecurityEvent struct {
+	ID        int64
+	Key       string
+	UserID    string
+	Event     string
+	Data      map[string]string
+	CreatedAt int64
+}
+
+// RecordSecurityEvent 在调用方的事务里记下一条安全事件（幂等：同一 event:user:eventId 只记一次）。
+// data 只放模板需要的最少字段（设备名、平台、仓库名、数量、eventId）；不得含任何秘密。
+func RecordSecurityEvent(q dbtx, userID, event string, data map[string]string, now int64) error {
+	if userID == "" || event == "" {
+		return nil
+	}
+	key := event + ":" + userID + ":" + data["eventId"]
+	if data["eventId"] == "" {
+		raw := make([]byte, 8)
+		if _, err := rand.Read(raw); err != nil {
+			return err
+		}
+		key += "nonce-" + hex.EncodeToString(raw)
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	_, err = q.Exec(`INSERT INTO security_events (event_key, user_id, event, data, event_state, created_at)
+		VALUES (?, ?, ?, ?, 'pending', ?) ON CONFLICT(event_key) DO NOTHING`, key, userID, event, string(payload), now)
+	return err
+}
+
+// PendingSecurityEvents 取出最早的一批未处理事件。
+func PendingSecurityEvents(q dbtx, limit int) ([]SecurityEvent, error) {
+	rows, err := q.Query(`SELECT id, event_key, user_id, event, data, created_at FROM security_events
+		WHERE event_state = 'pending' ORDER BY id ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SecurityEvent
+	for rows.Next() {
+		var ev SecurityEvent
+		var data string
+		if err := rows.Scan(&ev.ID, &ev.Key, &ev.UserID, &ev.Event, &data, &ev.CreatedAt); err != nil {
+			return nil, err
+		}
+		ev.Data = map[string]string{}
+		_ = json.Unmarshal([]byte(data), &ev.Data) //nolint:errcheck // 坏数据按空字段渲染，不卡住队列
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// CompleteSecurityEvent 记下事件的去向并清空展示字段（隐私：处理完只留类型、账号与结果）。
+func CompleteSecurityEvent(q dbtx, id int64, outcome string, mailID, now int64) error {
+	_, err := q.Exec(`UPDATE security_events SET event_state = 'done', outcome = ?, mail_id = ?, data = '',
+		processed_at = ? WHERE id = ? AND event_state = 'pending'`, outcome, mailID, now, id)
+	return err
+}
+
+// MailByKey 按幂等键取邮件的 id 与状态；不存在返回 (0, "", nil)。
+func MailByKey(q dbtx, idemKey string) (int64, string, error) {
+	var id int64
+	var status string
+	err := q.QueryRow(`SELECT id, status FROM mail_outbox WHERE idempotency_key = ?`, idemKey).Scan(&id, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
+	}
+	return id, status, err
+}
+
+// SecurityEventStats 是管理员页的事件计数（不含任何身份信息）。
+type SecurityEventStats struct {
+	Pending   int            `json:"pending"`
+	Processed int            `json:"processed"`
+	ByOutcome map[string]int `json:"byOutcome"`
+}
+
+// GetSecurityEventStats 统计安全事件的积压与去向。
+func GetSecurityEventStats(q dbtx) (SecurityEventStats, error) {
+	st := SecurityEventStats{ByOutcome: map[string]int{}}
+	rows, err := q.Query(`SELECT event_state, outcome, COUNT(*) FROM security_events GROUP BY event_state, outcome`)
+	if err != nil {
+		return st, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var state, outcome string
+		var n int
+		if err := rows.Scan(&state, &outcome, &n); err != nil {
+			return st, err
+		}
+		if state == "pending" {
+			st.Pending += n
+			continue
+		}
+		st.Processed += n
+		st.ByOutcome[outcome] += n
+	}
+	return st, rows.Err()
+}
+
+// PruneSecurityEvents 清理 30 天前已处理的事件（未处理的永远保留，直到 worker 处理掉）。
+func PruneSecurityEvents(q dbtx, now int64) error {
+	_, err := q.Exec(`DELETE FROM security_events WHERE event_state = 'done' AND processed_at < ?`, now-30*86400)
+	return err
+}
 
 // MailAddrHash 是收件地址的规范化哈希（小写、去空白）：抑制表与统计只用它。
 func MailAddrHash(addr string) string {
@@ -146,6 +289,15 @@ func MarkMailSent(q dbtx, id int64, providerID string, now int64) error {
 	return err
 }
 
+// MarkMailUncertain 请求已经发出、没有拿到结果（可能已投递）：记一次不确定的尝试，退避后用
+// **同一个幂等键**重试（服务商侧去重）。uncertain_attempts > 0 的已发邮件在统计里单独计数。
+func MarkMailUncertain(q dbtx, id int64, nextAt, now int64) error {
+	_, err := q.Exec(`UPDATE mail_outbox SET status = 'queued', attempts = attempts + 1,
+		uncertain_attempts = uncertain_attempts + 1, last_error_code = 'outcome-unknown',
+		next_attempt_at = ?, updated_at = ? WHERE id = ?`, nextAt, now, id)
+	return err
+}
+
 // MarkMailRetry 临时失败：退避后重试。
 func MarkMailRetry(q dbtx, id int64, errCode string, nextAt, now int64) error {
 	_, err := q.Exec(`UPDATE mail_outbox SET status = 'queued', attempts = attempts + 1, last_error_code = ?,
@@ -179,10 +331,22 @@ func SuppressMailHash(q dbtx, h, reason string, now int64) error {
 // MailStats 是管理员告警用的计数（不含任何地址）。
 type MailStats struct {
 	Queued, Sending, Sent, Failed, Suppressed int
+	// Uncertain：至少有一次「请求已发出、没有拿到结果」的邮件数（可能重复投递，SMTP 没有服务商侧去重）
+	Uncertain int
+	// Events：安全事件的积压与去向（SV-05）
+	Events SecurityEventStats
 }
 
 func GetMailStats(q dbtx) (MailStats, error) {
 	var s MailStats
+	if err := q.QueryRow(`SELECT COUNT(*) FROM mail_outbox WHERE uncertain_attempts > 0`).Scan(&s.Uncertain); err != nil {
+		return s, err
+	}
+	ev, err := GetSecurityEventStats(q)
+	if err != nil {
+		return s, err
+	}
+	s.Events = ev
 	rows, err := q.Query(`SELECT status, COUNT(*) FROM mail_outbox GROUP BY status`)
 	if err != nil {
 		return s, err

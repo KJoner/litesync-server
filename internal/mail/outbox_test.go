@@ -84,7 +84,7 @@ func status(t *testing.T, d *sql.DB) (st, to, body string, attempts int) {
 }
 
 func TestRenderTemplates(t *testing.T) {
-	for _, ev := range []string{"device-enrolled", "token-reset", "vault-deleted", "logout-everywhere"} {
+	for _, ev := range []string{"device-enrolled", "token-reset", "vault-deleted", "logout-everywhere", "logout-devices"} {
 		s, b, ok := Render(ev, map[string]string{"device": "我的手机", "vault": "个人笔记"}, "https://sync.example.org", time.Unix(0, 0))
 		if !ok || s == "" || !strings.Contains(b, "https://sync.example.org/#/me") {
 			t.Fatalf("%s: subject=%q ok=%v body=%q", ev, s, ok, b)

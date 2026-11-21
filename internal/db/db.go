@@ -219,6 +219,9 @@ func migrateColumns(d *sql.DB) error {
 		{"users", "central_checked_at", `ALTER TABLE users ADD COLUMN central_checked_at INTEGER NOT NULL DEFAULT 0`, false},
 		{"devices", "auth_epoch", `ALTER TABLE devices ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`, false},
 		{"enrollments", "auth_epoch", `ALTER TABLE enrollments ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`, false},
+
+		// --- v0.20.1 通知耐久性（复审 SV-05）：「请求已发出、没有拿到结果」的尝试次数 ---
+		{"mail_outbox", "uncertain_attempts", `ALTER TABLE mail_outbox ADD COLUMN uncertain_attempts INTEGER NOT NULL DEFAULT 0`, false},
 	}
 
 	for _, m := range migrations {

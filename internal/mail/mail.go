@@ -44,6 +44,17 @@ var ErrPermanent = errors.New("permanent mail failure")
 // 不是收件人的错，**不**进抑制表；邮件记为失败并告警管理员。
 var ErrConfig = errors.New("mail provider configuration error")
 
+// ErrOutcomeUnknown 包装「请求已经发出、但没有拿到结果」的失败（复审 SV-05：服务商可能已经接受，
+// 响应在路上丢了）。outbox 记一次不确定的尝试（uncertain_attempts）并用**同一个幂等键**重试：
+// Resend 按 Idempotency-Key 去重；SMTP 没有服务商侧去重，可能出现重复邮件——管理员统计里看得到。
+var ErrOutcomeUnknown = errors.New("mail delivery outcome unknown")
+
+// beforeSend 报告错误是否发生在请求发出之前（拨号失败）——这种情况不是「结果未知」。
+func beforeSend(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
 // Provider 是一个发信渠道。
 type Provider interface {
 	Name() string
@@ -250,9 +261,16 @@ func (p *smtpProvider) Send(ctx context.Context, from, replyTo string, m Message
 		return "", err
 	}
 	if err := w.Close(); err != nil {
-		return "", classifySMTP(err, false)
+		// DATA 的最后一步：服务器明确拒绝（5xx）按原分类；网络中断 / 超时 = 服务器可能已经收下
+		if msg := err.Error(); len(msg) >= 3 && (msg[0] == '5' || msg[0] == '4') {
+			return "", classifySMTP(err, false)
+		}
+		return "", fmt.Errorf("%w: smtp data: %v", ErrOutcomeUnknown, err)
 	}
-	return m.IdempotencyKey, c.Quit()
+	// 250 已经拿到：邮件已被接受。QUIT 失败不改变这个事实——以前这里把 QUIT 的错误当成发送失败，
+	// 会导致重试重复投递
+	_ = c.Quit() //nolint:errcheck
+	return m.IdempotencyKey, nil
 }
 
 // envelopeAddr 从 "名字 <addr>" 里取出 addr。
@@ -304,7 +322,11 @@ func (p *resendProvider) Send(ctx context.Context, from, replyTo string, m Messa
 	req.Header.Set("Idempotency-Key", m.IdempotencyKey)
 	res, err := p.client.Do(req)
 	if err != nil {
-		return "", err
+		if beforeSend(err) {
+			return "", err // 连不上：请求没有发出，普通临时失败
+		}
+		// 请求可能已经到达服务商（超时、连接中途断开）：结果未知，用同一个 Idempotency-Key 重试是安全的
+		return "", fmt.Errorf("%w: resend: %v", ErrOutcomeUnknown, err)
 	}
 	defer res.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))

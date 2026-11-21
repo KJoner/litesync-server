@@ -153,12 +153,15 @@ func (s *Service) CreateUserVault(userID, name string) (string, error) {
 func (s *Service) DeleteUserVault(userID, vaultID, confirmName string) error {
 	s.mu.Lock()
 	name := db.VaultDisplayName(s.db, vaultID)
-	blobIDs, shareIDs, err := db.DeleteUserVault(s.db, userID, vaultID, confirmName)
+	// 「仓库已删除」安全事件与删除同一事务落盘（复审 SV-05）
+	blobIDs, shareIDs, err := db.DeleteUserVaultWith(s.db, userID, vaultID, confirmName, func(tx db.Queryer) error {
+		return s.recordEvent(tx, userID, "vault-deleted", map[string]string{"vault": name, "eventId": vaultID})
+	})
 	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	s.notify(userID, "vault-deleted", map[string]string{"vault": name, "eventId": vaultID})
+	s.wake()
 	for _, id := range shareIDs {
 		if rerr := s.shares.Remove(id); rerr != nil {
 			s.log.Warn("delete vault: share content remove failed", "share", truncateID(id), "error", rerr)

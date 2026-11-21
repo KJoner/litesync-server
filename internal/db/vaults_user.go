@@ -261,6 +261,12 @@ func collectVaultArtifacts(d *sql.DB, vaultID string) (blobIDs, shareIDs []strin
 // 归属校验 + confirmName 必须等于仓库名 + 不能删最后一个；
 // 返回磁盘侧待清理引用（调用方清分享密文并把 blob 交给 GC）。
 func DeleteUserVault(d *sql.DB, userID, vaultID, confirmName string) (blobIDs, shareIDs []string, err error) {
+	return DeleteUserVaultWith(d, userID, vaultID, confirmName, nil)
+}
+
+// DeleteUserVaultWith 同 DeleteUserVault；inTx 非空时在删除事务提交前调用（例如安全事件与删除
+// 同一事务落盘，SV-05）。inTx 返回错误则整个删除回滚。
+func DeleteUserVaultWith(d *sql.DB, userID, vaultID, confirmName string, inTx func(Queryer) error) (blobIDs, shareIDs []string, err error) {
 	role, ok, err := RoleOf(d, VaultScope{vaultID: vaultID}, userID)
 	if err != nil {
 		return nil, nil, err
@@ -295,6 +301,11 @@ func DeleteUserVault(d *sql.DB, userID, vaultID, confirmName string) (blobIDs, s
 	defer tx.Rollback() //nolint:errcheck
 	if err := deleteVaultRowsTx(tx, vaultID); err != nil {
 		return nil, nil, err
+	}
+	if inTx != nil {
+		if err := inTx(tx); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err

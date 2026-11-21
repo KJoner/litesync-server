@@ -93,11 +93,19 @@ func (s *Service) CreateDevice(name, vaultID, userID string) (*DeviceCredential,
 func (s *Service) CreateDeviceAt(name, vaultID, userID string, authEpoch int64) (*DeviceCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cred, err := s.createDeviceLocked(s.db, name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID, authEpoch, "")
-	if err == nil {
-		s.notifyDeviceLocked(userID, vaultID, cred.DeviceID, name, "")
+	var cred *DeviceCredential
+	err := s.inTx(func(tx *sql.Tx) error {
+		var err error
+		if cred, err = s.createDeviceLocked(tx, name, strings.Join(DefaultDeviceScopes, ","), vaultID, userID, authEpoch, ""); err != nil {
+			return err
+		}
+		return s.recordDeviceEvent(tx, userID, vaultID, cred.DeviceID, name, "")
+	})
+	if err != nil {
+		return nil, err
 	}
-	return cred, err
+	s.wake()
+	return cred, nil
 }
 
 func defaultIfEmptyStr(v, def string) string {
@@ -107,16 +115,16 @@ func defaultIfEmptyStr(v, def string) string {
 	return v
 }
 
-// notifyDeviceLocked 发出「新设备已连接」通知（调用方持有 s.mu，且写入已提交）。
-func (s *Service) notifyDeviceLocked(userID, vaultID, deviceID, name, platform string) {
+// recordDeviceEvent 在建设备的同一事务里记下「新设备已连接」安全事件（复审 SV-05）。
+func (s *Service) recordDeviceEvent(q db.Queryer, userID, vaultID, deviceID, name, platform string) error {
 	if userID == "" {
 		userID = db.AdminUserID
 	}
 	if vaultID == "" {
 		vaultID = db.DefaultVaultID
 	}
-	s.notify(userID, "device-enrolled", map[string]string{
-		"device": name, "platform": platform, "vault": db.VaultDisplayName(s.db, vaultID), "eventId": deviceID,
+	return s.recordEvent(q, userID, "device-enrolled", map[string]string{
+		"device": name, "platform": platform, "vault": db.VaultDisplayName(q, vaultID), "eventId": deviceID,
 	})
 }
 
@@ -226,7 +234,6 @@ func (s *Service) EnrollDevice(secret, name string) (*DeviceCredential, error) {
 		return nil, ErrEnrollmentInvalid
 	}
 	var cred *DeviceCredential
-	var grant *db.EnrollmentGrant
 	err = s.inTx(func(tx *sql.Tx) error {
 		g, err := db.ConsumeEnrollment(tx, hash, time.Now().Unix(), row.AuthEpoch)
 		if err != nil {
@@ -241,14 +248,15 @@ func (s *Service) EnrollDevice(secret, name string) (*DeviceCredential, error) {
 		} else if cur != g.AuthEpoch {
 			return ErrEnrollmentInvalid
 		}
-		grant = g
-		cred, err = s.createDeviceLocked(tx, name, g.Scopes, g.VaultID, g.UserID, g.AuthEpoch, "")
-		return err
+		if cred, err = s.createDeviceLocked(tx, name, g.Scopes, g.VaultID, g.UserID, g.AuthEpoch, ""); err != nil {
+			return err
+		}
+		return s.recordDeviceEvent(tx, g.UserID, g.VaultID, cred.DeviceID, name, "")
 	})
 	if err != nil {
 		return nil, err
 	}
-	s.notifyDeviceLocked(grant.UserID, grant.VaultID, cred.DeviceID, name, "")
+	s.wake()
 	return cred, nil
 }
 

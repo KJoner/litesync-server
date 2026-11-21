@@ -87,6 +87,9 @@ type fakeSMTP struct {
 	mu       gosync.Mutex
 	mailSeen []bool // 每次 MAIL FROM 时连接是否已加密（false = 明文泄露）
 	dataSeen int
+	// dropAfterData：DATA 回 250 之后直接断开（QUIT 拿不到应答）；silentAfterData：收完 DATA 不应答就断开
+	dropAfterData   bool
+	silentAfterData bool
 }
 
 func selfSignedCert(t *testing.T, hosts ...string) (tls.Certificate, *x509.CertPool) {
@@ -201,7 +204,13 @@ func (f *fakeSMTP) serve(c net.Conn) {
 			f.mu.Lock()
 			f.dataSeen++
 			f.mu.Unlock()
+			if f.silentAfterData {
+				return
+			}
 			write("250 queued")
+			if f.dropAfterData {
+				return
+			}
 		case cmd == "QUIT":
 			write("221 bye")
 			return

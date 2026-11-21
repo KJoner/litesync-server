@@ -527,7 +527,17 @@ func (h *handlers) adminMailStatus(w http.ResponseWriter, _ *http.Request) {
 		h.internalError(w, "mail status", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"queued": st.Queued, "sending": st.Sending, "sent": st.Sent, "failed": st.Failed, "suppressed": st.Suppressed,
-	})
+		// SV-05：至少有一次「已发出、结果未知」的邮件（可能重复投递）与安全事件的积压 / 去向
+		"uncertain": st.Uncertain, "events": st.Events,
+	}
+	// ADR-019：跨产品撤销事件的投递计数（未配置时为空）
+	if h.svc.PeerRevocationConfigured() {
+		if rs, err := h.svc.RevocationStats(); err == nil {
+			out["revocationDeliveries"] = map[string]any{"pending": rs.Pending, "delivered": rs.Delivered, "failed": rs.Failed}
+		}
+	}
+	out["revocation"] = h.revocationConfigJSON()
+	writeJSON(w, http.StatusOK, out)
 }

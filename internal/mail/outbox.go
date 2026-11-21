@@ -30,21 +30,20 @@ const (
 	sendingStaleAfter = 10 * time.Minute
 )
 
-// Outbox 负责入队与后台投递。Notify 不阻塞调用方（业务操作不会因为邮件变慢或失败）。
+// Outbox 负责把已落盘的安全事件变成邮件并在后台投递（v0.20.1 / 复审 SV-05）。
+//
+// 业务操作在**自己的事务里**写一条最小的安全事件（db.RecordSecurityEvent），提交之后调用 Wake；
+// 这里的 worker 查收件地址、渲染、入队、发送。没有内存队列：Wake 只是「尽快来看一眼」的信号，
+// 丢了也没关系（每 15 秒都会扫一次）；进程在任何时刻退出，未处理的事件都还在库里。
 type Outbox struct {
 	db       *sql.DB
 	provider Provider
 	cfg      Config
 	log      *slog.Logger
 	now      func() time.Time
-	queue    chan notifyReq
+	wake     chan struct{}
 	// lastBudgetWarn：日预算用尽的告警节流（每小时一条）
 	lastBudgetWarn time.Time
-}
-
-type notifyReq struct {
-	userID, event string
-	data          map[string]string
 }
 
 // NewOutbox 构造 outbox；provider 为 nil 时用 log 渠道。
@@ -52,33 +51,28 @@ func NewOutbox(d *sql.DB, p Provider, cfg Config, logger *slog.Logger) *Outbox {
 	if p == nil {
 		p = logProvider{logger: logger}
 	}
-	return &Outbox{db: d, provider: p, cfg: cfg, log: logger, now: time.Now, queue: make(chan notifyReq, 256)}
+	return &Outbox{db: d, provider: p, cfg: cfg, log: logger, now: time.Now, wake: make(chan struct{}, 1)}
 }
 
-// Notify 实现 sync.Notifier：异步入队一条账号安全通知（只发给已验证的统一身份邮箱）。
-// 队列满时丢弃并记警告——通知是尽力而为，绝不反过来阻塞或拖垮同步。
-func (o *Outbox) Notify(userID, event string, data map[string]string) {
+// Wake 实现 sync.Notifier：业务事务已经提交（事件已落盘），请 worker 尽快处理。非阻塞。
+func (o *Outbox) Wake() {
 	select {
-	case o.queue <- notifyReq{userID: userID, event: event, data: data}:
-	default:
-		o.log.Warn("mail notify queue full; notification dropped", "event", event)
+	case o.wake <- struct{}{}:
+	default: // 已经有一个待处理的唤醒；事件本身在库里，不会丢
 	}
 }
 
-// Start 启动入队协程与投递循环，直到 ctx 结束。
+// Notify 是事务之外的旧入口：事件以独立事务落盘再唤醒 worker。业务代码应在自己的事务里
+// 调用 db.RecordSecurityEvent（与业务变更同生共死），这里只给拿不到事务的调用方兜底。
+func (o *Outbox) Notify(userID, event string, data map[string]string) {
+	if err := db.RecordSecurityEvent(o.db, userID, event, data, o.now().Unix()); err != nil {
+		o.log.Warn("record security event failed", "event", event, "error", err)
+	}
+	o.Wake()
+}
+
+// Start 启动后台循环（处理事件 + 投递），直到 ctx 结束。
 func (o *Outbox) Start(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case r := <-o.queue:
-				if err := o.enqueue(r); err != nil {
-					o.log.Warn("mail enqueue failed", "event", r.event, "error", err)
-				}
-			}
-		}
-	}()
 	go func() {
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()
@@ -87,39 +81,104 @@ func (o *Outbox) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				o.RunOnce(ctx)
+			case <-o.wake:
 			}
+			if _, err := o.ProcessEvents(); err != nil {
+				o.log.Warn("security event processing failed; will retry", "error", err)
+			}
+			o.RunOnce(ctx)
 		}
 	}()
 }
 
-// EnqueueNow 同步入队（测试与 CLI 用）。
+// EnqueueNow 同步记录并处理一条事件（测试与 CLI 用）。
 func (o *Outbox) EnqueueNow(userID, event string, data map[string]string) error {
-	return o.enqueue(notifyReq{userID: userID, event: event, data: data})
+	if err := db.RecordSecurityEvent(o.db, userID, event, data, o.now().Unix()); err != nil {
+		return err
+	}
+	_, err := o.ProcessEvents()
+	return err
 }
 
-func (o *Outbox) enqueue(r notifyReq) error {
-	addr, err := db.UserNotifyAddress(o.db, r.userID)
-	if err != nil || addr == "" {
-		return err // 没有已验证邮箱的账号（例如只用 API Token 的旧管理员）不发通知
+// ProcessEvents 处理全部未处理的安全事件：每条事件在一个事务里「渲染 + 入队 + 记下去向」。
+// 返回处理的条数。中途出错就停（下一轮重试；已处理的不会重复——邮件幂等键就是事件键）。
+func (o *Outbox) ProcessEvents() (int, error) {
+	total := 0
+	for {
+		batch, err := db.PendingSecurityEvents(o.db, 50)
+		if err != nil || len(batch) == 0 {
+			return total, err
+		}
+		for _, ev := range batch {
+			outcome, err := o.processEvent(ev)
+			if err != nil {
+				return total, err
+			}
+			total++
+			if outcome != db.EventOutcomeMailQueued && outcome != db.EventOutcomeDuplicate {
+				o.log.Info("security event recorded without mail", "event", ev.Event, "outcome", outcome)
+			}
+		}
+	}
+}
+
+func (o *Outbox) processEvent(ev db.SecurityEvent) (string, error) {
+	tx, err := o.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	outcome, mailID, err := o.render(tx, ev)
+	if err != nil {
+		return "", err
+	}
+	if err := db.CompleteSecurityEvent(tx, ev.ID, outcome, mailID, o.now().Unix()); err != nil {
+		return "", err
+	}
+	return outcome, tx.Commit()
+}
+
+// render 决定一条事件的去向（调用方的事务里）：没有已验证邮箱、收件人当日超限、没有模板都是
+// 「记下结果、不发」；否则渲染并入队（幂等键 = 事件键，重处理不会重复入队）。
+func (o *Outbox) render(tx *sql.Tx, ev db.SecurityEvent) (string, int64, error) {
+	addr, err := db.UserNotifyAddress(tx, ev.UserID)
+	if err != nil {
+		return "", 0, err
+	}
+	if addr == "" {
+		return db.EventOutcomeNoAddress, 0, nil // 例如只用 API Token 的旧管理员
+	}
+	if id, status, err := db.MailByKey(tx, ev.Key); err != nil {
+		return "", 0, err
+	} else if id != 0 {
+		if status == "suppressed" {
+			return db.EventOutcomeSuppressed, id, nil
+		}
+		return db.EventOutcomeDuplicate, id, nil
 	}
 	now := o.now()
-	if n, err := db.CountRecentMailTo(o.db, addr, now.Add(-24*time.Hour).Unix()); err != nil {
-		return err
+	if n, err := db.CountRecentMailTo(tx, addr, now.Add(-24*time.Hour).Unix()); err != nil {
+		return "", 0, err
 	} else if n >= PerRecipientDaily {
-		o.log.Warn("mail per-recipient daily limit reached; notification dropped", "event", r.event)
-		return nil
+		o.log.Warn("mail per-recipient daily limit reached; notification not sent", "event", ev.Event)
+		return db.EventOutcomeRecipientLimit, 0, nil
 	}
-	subject, body, ok := Render(r.event, r.data, o.cfg.PublicURL, now)
+	subject, body, ok := Render(ev.Event, ev.Data, o.cfg.PublicURL, time.Unix(ev.CreatedAt, 0))
 	if !ok {
-		return fmt.Errorf("unknown mail template %q", r.event)
+		o.log.Error("security event has no mail template", "event", ev.Event)
+		return db.EventOutcomeUnknownTemplate, 0, nil
 	}
-	key := r.event + ":" + r.userID + ":" + r.data["eventId"]
-	if r.data["eventId"] == "" {
-		key += ":" + strconv.FormatInt(now.UnixNano(), 36)
+	if _, err := db.EnqueueMail(tx, ev.Key, ev.Event, addr, subject, body, now.Unix()); err != nil {
+		return "", 0, err
 	}
-	_, err = db.EnqueueMail(o.db, key, r.event, addr, subject, body, now.Unix())
-	return err
+	id, status, err := db.MailByKey(tx, ev.Key)
+	if err != nil {
+		return "", 0, err
+	}
+	if status == "suppressed" {
+		return db.EventOutcomeSuppressed, id, nil
+	}
+	return db.EventOutcomeMailQueued, id, nil
 }
 
 // RunOnce 投递一批到期邮件；返回 (成功, 重试, 失败) 数。
@@ -166,6 +225,13 @@ func (o *Outbox) RunOnce(ctx context.Context) (sent, retried, failed int) {
 			failed++
 			// 管理员告警：配置问题会让**所有**通知都发不出去
 			o.log.Error("mail provider configuration error; check OBSYNC_MAIL_* settings", "provider", o.provider.Name(), "code", codeOf(err))
+		case errors.Is(err, ErrOutcomeUnknown) && m.Attempts+1 < MaxAttempts:
+			// 请求已发出、没拿到结果（服务商可能已接受）：记一次不确定的尝试，用同一幂等键退避重试（SV-05）
+			wait := backoff[min(m.Attempts, len(backoff)-1)]
+			_ = db.MarkMailUncertain(o.db, m.ID, ts+int64(wait.Seconds()), ts) //nolint:errcheck
+			retried++
+			o.log.Warn("mail delivery outcome unknown; retrying with the same idempotency key",
+				"template", m.Template, "provider", o.provider.Name())
 		case m.Attempts+1 >= MaxAttempts:
 			_ = db.MarkMailFailed(o.db, m.ID, m.ToHash, "max-attempts", false, ts) //nolint:errcheck
 			failed++
@@ -225,10 +291,17 @@ func Render(event string, d map[string]string, publicURL string, now time.Time) 
 			"已删除的仓库无法通过网页恢复；服务器备份按运营方公布的保留期自然过期。",
 		}
 	case "logout-everywhere":
-		subject = "已退出所有设备"
+		subject = "已退出所有产品与设备"
 		lines = []string{
-			fmt.Sprintf("你的账号已于 %s 执行「退出所有产品与设备」，%s 台设备的授权已被撤销。", when, or(d["revokedDevices"], "全部")),
+			fmt.Sprintf("你的账号已于 %s 执行「退出所有产品与设备」：LiteSync 的 %s 台设备授权已被撤销，", when, or(d["revokedDevices"], "全部")) +
+				"身份中心所有浏览器里的登录已结束，另一个产品也已收到撤销通知（结果可在「账号与设备 → 最近的撤销」查看）。",
 			"每台 Obsidian 需要重新连接后才能继续同步。",
+		}
+	case "logout-devices":
+		subject = "已退出 LiteSync 的全部设备"
+		lines = []string{
+			fmt.Sprintf("你的账号已于 %s 执行「退出 LiteSync 的全部设备」，%s 台设备的授权与尚未使用的连接链接已被撤销。", when, or(d["revokedDevices"], "全部")),
+			"每台 Obsidian 需要重新连接后才能继续同步。身份中心的登录与其他产品不受影响。",
 		}
 	default:
 		return "", "", false

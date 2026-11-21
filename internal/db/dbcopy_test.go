@@ -107,6 +107,7 @@ var checkValues = map[string]string{
 	"status": "queued", "kind": "object", "stage": "pending", "encryption_state": "plaintext",
 	"meta_state": "plain", "object_state": "live", "action": "upsert", "role": "owner",
 	"delivery_state": "pending", // revocation_deliveries（ADR-019）
+	"event_state":    "pending", // security_events（SV-05）
 }
 
 // fillGeneric 给每张表写 n 行按列类型合成的数据。
