@@ -97,7 +97,7 @@ type Config struct {
 	SMTPPort            int    // OBSYNC_SMTP_PORT（默认 587）
 	SMTPUser            string // OBSYNC_SMTP_USER
 	SMTPPassword        string // OBSYNC_SMTP_PASSWORD
-	SMTPTLS             string // OBSYNC_SMTP_TLS = starttls | implicit | none
+	SMTPTLS             string // OBSYNC_SMTP_TLS = starttls（默认）| implicit | none；大小写不敏感，其他值拒绝启动（SV-04）
 	ResendAPIKey        string // OBSYNC_RESEND_API_KEY
 	ResendWebhookSecret string // OBSYNC_RESEND_WEBHOOK_SECRET（whsec_…；空 = 回执端点关闭）
 
@@ -284,7 +284,9 @@ func loadPublicLaunch(cfg *Config) error {
 	cfg.SMTPHost = os.Getenv("OBSYNC_SMTP_HOST")
 	cfg.SMTPUser = os.Getenv("OBSYNC_SMTP_USER")
 	cfg.SMTPPassword = os.Getenv("OBSYNC_SMTP_PASSWORD")
-	cfg.SMTPTLS = strings.ToLower(getenv("OBSYNC_SMTP_TLS", "starttls"))
+	if cfg.SMTPTLS, err = parseSMTPTLS(os.Getenv("OBSYNC_SMTP_TLS")); err != nil {
+		return err
+	}
 	cfg.ResendAPIKey = os.Getenv("OBSYNC_RESEND_API_KEY")
 	cfg.ResendWebhookSecret = os.Getenv("OBSYNC_RESEND_WEBHOOK_SECRET")
 	if v := os.Getenv("OBSYNC_SMTP_PORT"); v != "" {
@@ -311,6 +313,21 @@ func loadPublicLaunch(cfg *Config) error {
 		return fmt.Errorf("invalid OBSYNC_MAIL_PROVIDER: %q (use log/smtp/resend)", cfg.MailProvider)
 	}
 	return nil
+}
+
+// parseSMTPTLS 解析 OBSYNC_SMTP_TLS（复审 SV-04）：去掉首尾空白、大小写不敏感；空值 = starttls；
+// 只接受 starttls / implicit / none，其他任何值（包括 "startls" 这类拼写错误）拒绝启动——
+// 以前未知值会被原样接受，发送时走进普通 TCP 分支，把邮件明文发出去。
+// 与 mail.ParseTLSMode 规则相同（config_test 交叉核对两者）。
+func parseSMTPTLS(v string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(v)); m {
+	case "", "starttls":
+		return "starttls", nil
+	case "implicit", "none":
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid OBSYNC_SMTP_TLS: %q (use starttls, implicit or none; case-insensitive)", v)
+	}
 }
 
 func intEnv(key string, def, min int) (int, error) {

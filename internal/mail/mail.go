@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,7 +61,7 @@ type Config struct {
 	SMTPPort     int
 	SMTPUser     string
 	SMTPPassword string
-	SMTPTLS      string // starttls（默认）| implicit | none（仅限本机测试）
+	SMTPTLS      string // starttls（默认）| implicit | none（仅限本机回环中继）；见 ParseTLSMode
 	// Resend（HTTPS API）
 	ResendAPIKey string
 	ResendURL    string // 默认 https://api.resend.com/emails（测试可覆盖）
@@ -69,6 +70,36 @@ type Config struct {
 	// DailyBudget：全局每 24 小时最多发出的邮件数（需求 §12 / 验收 ID-08）；0 = 不限。
 	// 超出的留在队列里延后发送（不丢弃），并记 WARN 提醒管理员。
 	DailyBudget int
+}
+
+// SMTP TLS 模式（复审 SV-04）。只有这三个值；ParseTLSMode 是唯一的解析入口。
+const (
+	TLSStartTLS = "starttls" // 默认：明文连接后必须升级为 TLS；服务器不支持 STARTTLS 直接失败，绝不降级
+	TLSImplicit = "implicit" // 连接即 TLS（常见于 465 端口）
+	TLSNone     = "none"     // 不加密：只允许回环地址上的本机中继
+)
+
+// ParseTLSMode 规范化并校验 TLS 模式：去掉首尾空白、大小写不敏感（"STARTTLS" 与 " starttls " 等价）；
+// 空值 = starttls。其他任何值（包括 "startls" 这类拼写错误）一律报错——以前未知值会悄悄走进
+// 普通 TCP 分支，把邮件明文发出去。
+func ParseTLSMode(v string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(v)); m {
+	case "", TLSStartTLS:
+		return TLSStartTLS, nil
+	case TLSImplicit, TLSNone:
+		return m, nil
+	default:
+		return "", fmt.Errorf("mail: unknown SMTP TLS mode %q (use starttls / implicit / none)", v)
+	}
+}
+
+// IsLoopbackHost 报告 host 是否是本机回环（none 模式只允许它）。
+func IsLoopbackHost(h string) bool {
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // NewProvider 按配置构造渠道；未配置时返回只记日志的 log 渠道（开发/自托管默认）。
@@ -80,6 +111,14 @@ func NewProvider(c Config, logger *slog.Logger) (Provider, error) {
 		if c.SMTPHost == "" || c.From == "" {
 			return nil, errors.New("mail: smtp provider needs SMTP host and From")
 		}
+		mode, err := ParseTLSMode(c.SMTPTLS)
+		if err != nil {
+			return nil, err
+		}
+		if mode == TLSNone && !IsLoopbackHost(c.SMTPHost) {
+			return nil, errors.New("mail: SMTP TLS mode none is only allowed for a loopback relay")
+		}
+		c.SMTPTLS = mode
 		if c.SMTPPort == 0 {
 			c.SMTPPort = 587
 		}
@@ -112,7 +151,28 @@ func (p logProvider) Send(_ context.Context, _, _ string, m Message) (string, er
 
 // ---------------------------------------------------------------- smtp
 
-type smtpProvider struct{ c Config }
+type smtpProvider struct {
+	c Config
+	// roots：测试注入的信任根（nil = 系统信任库）
+	roots *x509.CertPool
+}
+
+func (p *smtpProvider) tlsConfig() *tls.Config {
+	return &tls.Config{ServerName: p.c.SMTPHost, MinVersion: tls.VersionTLS12, RootCAs: p.roots}
+}
+
+// classifyTLS：证书校验失败（不受信任、主机名不符、已过期……）是配置 / 基础设施问题——重试不会自己好，
+// 记为配置错误并告警，不拉黑收件人；其余 TLS 握手错误按临时错误处理。
+func classifyTLS(err error) error {
+	var verr *tls.CertificateVerificationError
+	var unknown x509.UnknownAuthorityError
+	var host x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &verr) || errors.As(err, &unknown) || errors.As(err, &host) || errors.As(err, &invalid) {
+		return fmt.Errorf("%w: smtp tls certificate rejected", ErrConfig)
+	}
+	return err
+}
 
 func (*smtpProvider) Name() string { return "smtp" }
 
@@ -140,13 +200,20 @@ func (p *smtpProvider) Send(ctx context.Context, from, replyTo string, m Message
 	d := net.Dialer{Timeout: 15 * time.Second}
 	var conn net.Conn
 	var err error
-	if p.c.SMTPTLS == "implicit" {
-		conn, err = tls.DialWithDialer(&d, "tcp", addr, &tls.Config{ServerName: p.c.SMTPHost, MinVersion: tls.VersionTLS12})
-	} else {
+	switch p.c.SMTPTLS {
+	case TLSImplicit:
+		conn, err = (&tls.Dialer{NetDialer: &d, Config: p.tlsConfig()}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return "", classifyTLS(err)
+		}
+	case TLSStartTLS, TLSNone:
 		conn, err = d.DialContext(ctx, "tcp", addr)
-	}
-	if err != nil {
-		return "", err
+		if err != nil {
+			return "", err
+		}
+	default:
+		// NewProvider 已经校验过；这里是第二道：未知模式绝不走明文
+		return "", fmt.Errorf("%w: invalid SMTP TLS mode %q", ErrConfig, p.c.SMTPTLS)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
@@ -155,9 +222,13 @@ func (p *smtpProvider) Send(ctx context.Context, from, replyTo string, m Message
 		return "", err
 	}
 	defer c.Close()
-	if p.c.SMTPTLS == "" || p.c.SMTPTLS == "starttls" {
-		if err := c.StartTLS(&tls.Config{ServerName: p.c.SMTPHost, MinVersion: tls.VersionTLS12}); err != nil {
-			return "", err
+	if p.c.SMTPTLS == TLSStartTLS {
+		// 不降级：服务器不提供 STARTTLS 就不发（以前这里依赖 StartTLS 的报错，现在显式检查并给出原因）
+		if ok, _ := c.Extension("STARTTLS"); !ok {
+			return "", fmt.Errorf("%w: smtp server does not offer STARTTLS; refusing to send in plaintext", ErrConfig)
+		}
+		if err := c.StartTLS(p.tlsConfig()); err != nil {
+			return "", classifyTLS(err)
 		}
 	}
 	if p.c.SMTPUser != "" {

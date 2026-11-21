@@ -167,7 +167,7 @@ LSE4 解密、设备平台/IP 记录、运维页都在服务端资产里）。�
 | `OBSYNC_UPLOAD_CONCURRENCY_PER_USER` | `8` | 每个账号同时进行的上传数（`0` = 不限） |
 | `OBSYNC_MAIL_PROVIDER` | `log` | 产品通知邮件渠道：`log`（只记日志）/ `smtp` / `resend` |
 | `OBSYNC_MAIL_FROM` / `OBSYNC_MAIL_REPLY_TO` | （空） | 发件人（如 `LiteSync <no-reply@mail.example.com>`）与回复地址 |
-| `OBSYNC_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_TLS` | 端口 `587`、`starttls` | SMTP 渠道；`none` 只允许本机 |
+| `OBSYNC_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_TLS` | 端口 `587`、`starttls` | SMTP 渠道。`_TLS` 只接受 `starttls`（默认）/ `implicit` / `none`，大小写不敏感、首尾空白忽略，**其他值（包括 `startls` 这类拼写错误）拒绝启动**；`starttls` 时服务器不提供 STARTTLS 或证书校验失败一律不发送（不降级为明文，记为配置错误并告警）；`none` 只允许本机回环中继 |
 | `OBSYNC_RESEND_API_KEY` / `OBSYNC_RESEND_WEBHOOK_SECRET` | （空） | Resend 渠道；回执密钥为空时 `/hooks/mail/resend` 关闭 |
 | `OBSYNC_MAIL_DAILY_BUDGET` | `500` | 全局每 24 小时最多发出的通知邮件；超出的延后发送（不丢弃） |
 
