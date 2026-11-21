@@ -114,6 +114,12 @@ obsync blobid migrate             # dry-run，不动任何文件
 obsync blobid migrate --confirm   # 真正执行
 ```
 
+**升级到 0.20 时**：表结构升级自动完成（统一账号映射、仓库初始化状态、配对 v2、邮件 outbox、
+配额覆盖值等新表新列），既有仓库一律视为「已就绪」。**默认行为不变**：不配置统一登录仍是 API Token
+登录，网页仍是只读，注册仍需邀请。打算开放注册时，先读[公开化（0.20.0）](#公开化0200)：配置统一登录、
+`OBSYNC_QUOTA_BYTES_PER_USER`（开放注册时必填）与邮件渠道，再把 `OBSYNC_REGISTRATION_MODE` 改为 `open`。
+0.19 插件可以继续连接 0.20 服务端；网页发行的「连接链接 v2」需要插件 0.20 才能在兑换前核对仓库。
+
 **升级到 0.17.x 时**：服务端与插件都要升到 0.17（协议 v6 不变，但 Web 端的
 LSE4 解密、设备平台/IP 记录、运维页都在服务端资产里）。如果部署时固定了
 镜像标签，记得一并更新——「网页端显示乱码」这类现象多半是 Web 资产还是旧版。
@@ -143,6 +149,24 @@ LSE4 解密、设备平台/IP 记录、运维页都在服务端资产里）。�
 | `OBSYNC_QUARANTINE_DAYS` | `0`（永久） | 隔离区保留期。隔离区放的是被判定损坏的副本，属于取证材料，默认不自动删 |
 | `OBSYNC_HTTP_READ_TIMEOUT` | `1800`（秒） | 请求读取超时。必须覆盖「慢速链路上传大附件」这种正常场景 |
 | `OBSYNC_HTTP_WRITE_TIMEOUT` | `1800`（秒） | 响应写出超时，同上 |
+| `OBSYNC_DB` | `sqlite` | 元数据库：`sqlite`（数据目录里的 `sync.db`）或 `postgres`（见「PostgreSQL 元数据库」）。Blob 无论哪种都在数据目录 |
+| `OBSYNC_PG_DSN` | （空） | PostgreSQL 连接串，`OBSYNC_DB=postgres` 时必填；**只从环境变量读取，不出现在任何日志与输出里** |
+| `OBSYNC_PG_RESTORE_DSN` | （空） | 仅 PG 部署的 `backup restore` 使用：恢复写入的**新的空库**（旧库原样保留作为退路） |
+| `OBSYNC_PUBLIC_URL` | （空） | 本服务对外的规范地址（如 `https://sync.example.com`，不带路径）；启用统一登录时必填，回调固定为 `<PUBLIC_URL>/auth/callback` |
+| `OBSYNC_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` | （空） | 统一登录（OIDC，如 Keycloak）。三个都设置才启用；**半套配置拒绝启动**；非本机必须 https |
+| `OBSYNC_REGISTRATION_MODE` | `invite` | `closed` / `invite` / `open`：首次出现的统一账号是否自动建本地账号 |
+| `OBSYNC_LEGACY_TOKEN_LOGIN` | `true` | 启用统一登录后是否保留「API Token 网页登录」（管理员认领统一账号前的兜底） |
+| `OBSYNC_REQUIRE_E2EE_NEW_VAULTS` | `true` | 新建仓库必须先完成浏览器端（或插件端）加密初始化才接受内容写入 |
+| `OBSYNC_WEB_EDITING` | `false` | 允许网页会话写入笔记（网页编辑器、回收站恢复）；默认只读 |
+| `OBSYNC_QUOTA_BYTES_PER_USER` | `0`（不限） | 每个账号的存储上限（live + 历史版本，密文字节；支持 `500MB` / `2GB`，`-1` = 明确不限）。只约束非管理员。**`OBSYNC_REGISTRATION_MODE=open` 时必须显式设置，否则拒绝启动** |
+| `OBSYNC_QUOTA_VAULTS_PER_USER` | `20` | 每个账号可拥有的仓库数 |
+| `OBSYNC_RATE_PER_USER` | `3000` | 每个账号（设备按设备）每分钟请求数，突发 1/6；`0` = 关闭。超出返回 429 `RATE_LIMITED` + `Retry-After` |
+| `OBSYNC_UPLOAD_CONCURRENCY_PER_USER` | `8` | 每个账号同时进行的上传数（`0` = 不限） |
+| `OBSYNC_MAIL_PROVIDER` | `log` | 产品通知邮件渠道：`log`（只记日志）/ `smtp` / `resend` |
+| `OBSYNC_MAIL_FROM` / `OBSYNC_MAIL_REPLY_TO` | （空） | 发件人（如 `LiteSync <no-reply@mail.example.com>`）与回复地址 |
+| `OBSYNC_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_TLS` | 端口 `587`、`starttls` | SMTP 渠道；`none` 只允许本机 |
+| `OBSYNC_RESEND_API_KEY` / `OBSYNC_RESEND_WEBHOOK_SECRET` | （空） | Resend 渠道；回执密钥为空时 `/hooks/mail/resend` 关闭 |
+| `OBSYNC_MAIL_DAILY_BUDGET` | `500` | 全局每 24 小时最多发出的通知邮件；超出的延后发送（不丢弃） |
 
 Compose 额外变量：`LITESYNC_ETC_DIR`（宿主机密钥目录，默认 `./etc-litesync`，
 只读挂载为容器内 `/etc/litesync`；一键部署脚本自动生成密钥）。
@@ -287,6 +311,42 @@ API Token 与完全独立的仓库（见下方「多用户」一节）。隔离�
 - Web 端登录后有仓库切换器（多于一个才显示），各仓库独立解锁；
   「账户 → My vaults」可自助新建 / 重命名 / 删除仓库（删除输入仓库名
   确认；未命名的仓库须先重命名才能删）
+
+## 公开化（0.20.0）
+
+面向「可以开放注册」的一组改动。**全部默认值保持自托管现状不变**：不配置统一登录时仍是 API Token 登录，
+网页仍是只读，注册仍需邀请。
+
+- **统一账号（OIDC）**：配置 `OBSYNC_OIDC_*` 后，网页以授权码 + PKCE 登录（state 单次使用并绑定浏览器、
+  nonce、iss/aud/azp 校验、RS256/ES256），会话 Cookie `SameSite=Strict`（回调经同站中转页落地）。本地账号由
+  `(issuer, subject)` 映射，**邮箱只是资料快照、从不参与匹配**。支持身份服务的 back-channel logout（`sid`/`sub`，
+  `jti` 防重放）与「退出所有产品与设备」。旧管理员通过「绑定统一账号」认领（强制重新认证），也可用
+  `obsync identity link` 在服务器上认领。零仓库账号是正常状态：需要仓库的接口返回 409 `VAULT_REQUIRED`。
+- **浏览器端加密建库**：`POST /api/v2/vaults` 先建 `pending_encryption` 仓库，浏览器生成仓库密钥并用仓库密码
+  包装后 `POST /api/v2/vaults/{id}/initialization` 一次提交（keyDoc + 加密状态 + keyEpoch + 信封下限 + 重置凭证，
+  同一事务；opId 幂等，响应丢失可续）。初始化完成前一切内容写入返回 409 `VAULT_NOT_READY`。服务器从不接触仓库密码。
+- **连接链接 v2**：网页「连接 Obsidian」生成二维码 / 链接，秘密只在 URL fragment；`GET /api/v2/pairings/{id}/envelope`
+  读取**不消费**；插件核对仓库与服务器后 `POST /api/v2/device-enrollments/redeem` 显式兑换（`exchangeId` 幂等，响应丢失
+  可续；仓库不符不消费）；关闭对话框即撤销；公开端点按 IP 限流。
+- **网页 Markdown 编辑**（`OBSYNC_WEB_EDITING=true` 才开启）：CodeMirror 6 源码编辑 + 分栏预览；加密只用与插件
+  同源的 crypto-core（`web/src/vendor/litesync-core`，`npm run build` 会校验 MANIFEST，手改即失败），协议与插件完全
+  相同（fileId、CAS、内容世代、operationId 幂等、墓碑与显式恢复），**信封不降级**。冲突用插件的三方合并，合并不干净
+  就保留双方（冲突副本），绝不最后写覆盖。未同步的修改以仓库密钥派生的独立密钥加密存进 IndexedDB（只有密文），
+  重新解锁后可恢复。空闲 15 分钟自动锁定。网页写入的审计身份由服务器生成（`web-…`），客户端自报的设备 ID 不作数。
+  网页每 30 秒（以及回到前台时）看一眼 `changes` 游标，别的设备的新建 / 修改 / 删除不刷新页面就能看到；
+  正在编辑且有未保存修改的笔记不会被覆盖，保存时合并。
+- **正文全文搜索**：在网页里逐篇下载密文、**在本机解密**建索引（只在页面内存里，锁定 / 刷新 / 切换仓库即清除），
+  服务器只看到普通的文件下载，搜索词与正文从不发给服务器。
+- **回收站**：`GET /api/v1/trash` 列出仍保留的删除记录；恢复走 `POST /api/v1/files/{fileId}/restore`
+  （fileId 与全部历史不变、revision 连续、内容世代前进）。路径加密仓库的服务器不知道已删除文件的原路径，网页不提供恢复。
+- **配额与限流**：见上表 `OBSYNC_QUOTA_*` / `OBSYNC_RATE_PER_USER`。存储配额在写锁内原子核算、历史计入总量；
+  超出返回 413 `QUOTA_EXCEEDED`（`retryable:false`，`details` 给出种类 / 上限 / 已用；旧插件按「跳过此文件」处理），
+  读取、导出、删除与清理历史永远可用。管理员可逐账号覆盖：`PUT /api/v1/admin/users/{userId}/quota`
+  `{bytes, vaults}`（0 = 跟随默认，-1 = 不限）。账号页与管理员列表显示用量。
+- **产品通知邮件**：新设备接入、Token 重置、仓库删除、退出所有设备时，给**已验证**的统一账号邮箱发纯文本通知（不含任何
+  秘密与笔记内容）。outbox 幂等、有限退避、硬退信与投诉进抑制表（配置错误不拉黑收件人）、同一收件人每天最多 20 封、
+  全局日预算。注册验证与找回密码邮件由身份服务发送，不经过这里。
+- **命令行**：`obsync identity link|list`（SSH 兜底认领，冲突不覆盖）、`obsync vaults pending`（列出未完成初始化的仓库）。
 
 ## 设备可信度：签名 checkpoint（0.15.0）
 
@@ -457,6 +517,33 @@ X-Canonical-Hash: canonical path HMAC，64 位小写 hex（0.12.0）
 | `STALE_META_GENERATION` | 412 | metaGeneration CAS 失败（重取后可重试） |
 | `CANONICAL_COLLISION` | 422 | canonical 归一化后与现有文件同名 |
 | `NOT_FOUND` / `TOO_LARGE` / `INTERNAL` | 404 / 413 / 5xx | — |
+| `AUTH_REQUIRED` | 401 | 0.20：网页会话失效（统一账号被撤销 / 退出），需重新登录，不得跨账号重发 |
+| `VAULT_REQUIRED` | 409 | 0.20：零仓库账号调用了需要仓库的接口 |
+| `VAULT_NOT_READY` | 409 | 0.20：仓库尚未完成加密初始化，拒绝内容写入 |
+| `EMAIL_NOT_VERIFIED` | 403 | 0.20：未验证邮箱的统一账号不能建仓库或连接设备 |
+| `PAIRING_USED` / `PAIRING_EXPIRED` / `PAIRING_REVOKED` | 410 | 0.20：连接链接已兑换 / 过期 / 撤销 |
+| `VAULT_MISMATCH` | 409 | 0.20：兑换时核对的仓库与链接不符（不消费链接） |
+| `QUOTA_EXCEEDED` | 413 / 409 | 0.20：**永久性**配额超限（存储 413、仓库数 409），`retryable:false`，`details {kind, limit, used}`；不要自动重试 |
+| `RATE_LIMITED` | 429 | 0.20：**临时**限流（请求速率 / 上传并发 / 公开端点），带 `Retry-After`，`retryable:true` |
+
+0.20 新增接口（细节见[公开化（0.20.0）](#公开化0200)）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/auth/config` | 登录页用：是否启用统一登录、注册模式、是否保留 Token 登录 |
+| GET | `/auth/login` · `/auth/callback` · `/auth/link/start` | OIDC 授权码 + PKCE；认领旧账号（强制重新认证） |
+| POST | `/auth/logout` · `/auth/backchannel-logout` | 退出本产品；身份服务的 back-channel logout（验签、拒 nonce、jti 防重放） |
+| GET | `/api/v2/me` | 账号、角色、引导状态、功能开关、用量与上限 |
+| POST | `/api/v2/account/logout-all` | 退出所有产品与设备（撤销全部设备凭据并给出全局退出地址） |
+| GET / DELETE | `/api/v2/devices` · `/api/v2/devices/{id}` | 本人设备列表与撤销 |
+| POST | `/api/v2/vaults` · `/api/v2/vaults/{id}/initialization` | 建 `pending_encryption` 仓库（clientRequestId 幂等）；一次提交加密初始化（opId 幂等） |
+| POST | `/api/v2/vaults/{id}/pairing-grants` · `/api/v2/pairings` · DELETE `/api/v2/pairings/{id}` | 发行连接链接、上传加密配对包、撤销 |
+| GET | `/api/v2/pairings/{id}/envelope` | **公开**，读取不消费；按 IP 限流 |
+| POST | `/api/v2/device-enrollments/redeem` | **公开**，显式兑换（exchangeId 幂等、可续传）；按 IP 限流 |
+| GET | `/api/v1/trash` | 回收站列表（恢复走 `POST /api/v1/files/{fileId}/restore`） |
+| PUT | `/api/v1/admin/users/{userId}/quota` | 管理员设置账号配额覆盖值 `{bytes, vaults}`（0 = 默认，-1 = 不限） |
+| GET | `/api/v1/admin/mail/status` | 管理员：邮件 outbox 计数（不含地址与正文） |
+| POST | `/hooks/mail/resend` | 邮件服务商回执（Svix 签名 + 时间窗）；未配置密钥时 404 |
 
 ## 功能说明
 
@@ -655,6 +742,81 @@ curl http://127.0.0.1:8080/health
 建议按 `obsync backup create` → 破坏测试副本 → `obsync backup restore --new-epoch`
 的顺序至少完整走一次。
 
+## PostgreSQL 元数据库（可选）
+
+默认的 SQLite 足够单机部署使用。需要把元数据放进统一管理的 PostgreSQL 时，设置
+`OBSYNC_DB=postgres` 与 `OBSYNC_PG_DSN`。**只有元数据进 PG**；密文 Blob 仍在数据目录，
+备份仍由 restic 负责，两者都不变。
+
+**数据库要求**
+
+- PostgreSQL 13 及以上（演练与 CI 用 16）；为 LiteSync 建**独立的库与账号**，账号只需要这个库的
+  建表与读写权限，不要用超级用户。
+- 库必须是 **C 排序**（与 SQLite 的字节序比较一致，路径排序与分页才不会因 locale 漂移）；
+  否则服务拒绝启动：
+
+  ```sql
+  CREATE ROLE litesync LOGIN PASSWORD '…';
+  CREATE DATABASE litesync OWNER litesync TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
+  ```
+- `OBSYNC_PG_DSN` 例：`postgres://litesync:…@db:5432/litesync?sslmode=require`。它只从环境变量读取，
+  不接受命令行参数，也不会出现在日志、报告与错误信息里。
+- 当前版本对 PG 使用**单连接**（与 SQLite 现状相同的事务与锁语义，正确性优先）。
+  吞吐与 SQLite 部署同一量级；连接并发优化是后续工作，届时会单独说明。
+
+**从现有 SQLite 迁移（需要一个短维护窗口）**
+
+```bash
+# 0. 先用当前版本在 SQLite 上正常启动一次（完成表结构升级），再停服务；做一次备份
+obsync backup create
+# 1. 只读演练：结构兼容性 + 逐表行数 + 每仓库摘要（不连接目标库）
+obsync migrate-to-pg --dry-run
+# 2. 正式导入（服务必须已停止）。目标库必须为空；单事务，任一步失败整体回滚
+OBSYNC_PG_DSN='postgres://…' obsync migrate-to-pg
+# 3. 切换：OBSYNC_DB=postgres（保留 OBSYNC_PG_DSN）后启动服务
+```
+
+导入后在**同一个源快照**上逐表校验（每个值按目标列类型规范化后做与行顺序无关的摘要），
+再用一个新快照复核一次（证明导入期间源库没有被写入）；另外核对每个仓库的对象/版本/
+墓碑/变更计数、content_hash 集合、repoEpoch / headSequence / formatEpoch / keyEpoch /
+信封下限、keyDoc 指纹，以及自增序列的高水位（id 永不复用）。任一不符即失败，源库不动。
+报告是机器可读的 JSON（标准输出 + `$OBSYNC_DATA_DIR/migrate-to-pg-report.json`）。
+重复运行是幂等的：目标已有与源库逐表一致的数据时只做校验；不一致则拒绝，不碰任何一边。
+
+迁移保留全部身份与世代（vaultId、fileId、revision、各 generation、墓碑、checkpoint、
+repoEpoch），**不旋转 epoch**——客户端游标照常续用，不会进入灾备合并。
+
+迁移成功后数据目录里会写入 `migrated-to-postgres.json`：此后以 SQLite 方式启动会被拒绝。
+旧 `sync.db` 停在切换那一刻，一旦 PG 上有了新写入，把它接回去等于让所有客户端看到一段倒退的
+历史，所以它只能作为只读的历史副本保留。**回退**请走经过校验的反向导出：
+
+```bash
+# 停服务 → 导出（导出后逐表校验）→ 用导出件替换 sync.db → 删除标记 → OBSYNC_DB=sqlite 启动
+OBSYNC_PG_DSN='postgres://…' obsync export-sqlite --out /data/sync.db.from-postgres
+```
+
+**备份与恢复（PG 部署）**
+
+- `backup create` 不再依赖 SQLite 的 `VACUUM INTO`：在 LiteSync 全局写锁窗口里，用
+  `REPEATABLE READ READ ONLY` 事务把 PG 导出成一个当前表结构的 SQLite 文件（导出后逐表校验），
+  同一窗口内 hard link Blob——元数据快照与 Blob 清单取自同一时刻（这就是 Blob 保留水位：
+  锁内没有上传提交，也没有 GC 删除）。备份格式与 SQLite 部署完全相同，所以任一种部署的备份
+  都能恢复到任一种部署。不需要安装与服务器主版本匹配的 `pg_dump`。
+- manifest 记录元数据引用的 blob 数与**缺失数**；缺失不会让备份失败（否则一个已隔离的坏 blob
+  会挡住全部后续备份），但会写进 manifest 与日志，恢复时再报告一次。
+- `backup restore --new-epoch <id>`：恢复写入 `OBSYNC_PG_RESTORE_DSN` 指向的**新的空库**
+  （非空直接拒绝，不覆盖任何已有数据），当前库只用来读备份配置、原样保留作为退路；
+  Blob 数据目录照旧挪开再换上。导入、逐表校验与**全部仓库**的 repoEpoch 旋转在同一个事务里完成，
+  不存在「数据已在、epoch 未转」的中间态。完成后把 `OBSYNC_PG_DSN` 指向恢复出的库再启动。
+
+**PG 部署上如实说明的差异**
+
+- 明文路径擦除（元数据加密迁移的最后一步）在 PG 上照样执行（`VACUUM FULL` 重写表），但报告**不会**
+  声称 WAL 已截断或数据文件已扫描：PG 的 WAL、流复制副本与 PG 自身的基础备份由数据库服务器管理，
+  明文路径可能在其中留存到被回收为止。报告里只断言逻辑表已无哨兵。
+- 完整性巡检里的数据库页级自检（SQLite 的 `integrity_check`）在 PG 上显示为 `not-run`：
+  页校验与索引校验是数据库服务器的职责（建库时开启 data checksums，按需使用 `amcheck`）。
+
 ## 运维命令
 
 服务停止时对着同一个数据目录运行（`OBSYNC_DATA_DIR` 指向它）；
@@ -680,7 +842,14 @@ obsync blobid migrate                        # dry-run：只报告要改名多�
 obsync blobid migrate --confirm              # 真正执行（**不可逆**，先 backup create）
 
 obsync rotate-epoch [--vault <id> | --all]   # 手工旋转 repoEpoch（restore 会自动做；多用户实例灾备恢复后用 --all）
+
+obsync migrate-to-pg --dry-run               # 只读源 SQLite：逐表行数与每仓库摘要（不连接目标库）
+obsync migrate-to-pg                         # SQLite → OBSYNC_PG_DSN：目标须为空；已完成则只校验；输出 JSON 报告
+obsync export-sqlite --out <path>            # PostgreSQL → 新 SQLite 文件并逐表校验（切换后的回退路径）
 ```
+
+`backup restore` 会旋转**全部**仓库的 repoEpoch（0.20 起；之前从 restore 路径进来只转了 default，
+多仓库实例恢复后请补跑一次 `obsync rotate-epoch --all`）。
 
 `restore` **强制要求 `--new-epoch`**：不旋转 repoEpoch 的话，客户端会带着
 恢复点之前的旧游标继续增量同步，从而静默跳过「恢复点之后曾经存在」的那段变更。
@@ -746,6 +915,10 @@ HEAD→blob 迁移、CSP 响应头、双设备协议场景，以及备份专项
   每一条都有测试认领；
 - **规模测试**：`LITESYNC_SCALE=20000 go test ./internal/sync/ -run TestScale`；
 - **灾备演练**：真实 restic 仓库上跑 create → 破坏 → restore 全流程。
+- **两种数据库各跑一遍**：同一套测试在 PostgreSQL 上再跑（CI 的 `test-postgres` job；
+  本地 `LITESYNC_TEST_PG_ADMIN_DSN=… scripts/test-pg.sh`，为本次运行建独立库、跑完删除）。
+  另有 PG 分支的灾备演练（恢复到全新实例、注入缺失 blob）与 MG-03 离线迁移演练
+  （`internal/pgdrill`：合成 SQLite → PG → 在 PG 上启动，逐项比对与越权抽查）。
 
 ## 许可（License）
 

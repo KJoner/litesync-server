@@ -9,6 +9,8 @@
 `litesync-server` = Go + SQLite + 内容寻址 Blob 存储实现的私有同步服务器，
 内嵌 Web 只读客户端、运维页与 Restic → Cloudflare R2 异地备份。
 配套的 Obsidian 插件在 [litesync](https://github.com/KJoner/litesync)。
+元数据库默认 SQLite（数据目录里的 `sync.db`），可选 PostgreSQL（批次 G：`OBSYNC_DB=postgres`，
+见 §3 的 `internal/db/pgdriver.go` 与 README「PostgreSQL 元数据库」）；Blob 始终在数据目录。
 
 **双仓结构**（2026-08 起）：
 
@@ -36,13 +38,28 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 Windows：`scripts\dev-server.ps1`；`$env:OBSYNC_TOKEN = '...'; go run ./cmd/obsync`。
 
+同一套测试在 PostgreSQL 上再跑一遍（批次 G；CI 的 `test-postgres` job 做同样的事）：
+
+```bash
+# 为本次运行建一个 C 排序的独立库，跑完删除；每个测试在里面再用独立 schema
+LITESYNC_TEST_PG_ADMIN_DSN='postgres://u:p@127.0.0.1:5432/postgres?sslmode=disable' scripts/test-pg.sh ./...
+# 或直接指定一个（C 排序的）测试库：
+LITESYNC_TEST_PG_DSN='postgres://u:p@127.0.0.1:5432/lstest?sslmode=disable' go test ./...
+# 可选第二个实例：恢复演练把它当「全新实例」
+LITESYNC_TEST_PG_RESTORE_DSN='postgres://u:p@127.0.0.1:5433/lstest?sslmode=disable'
+# MG-03 离线迁移演练（合成 SQLite → PG → 在 PG 上启动 → 逐项比对 + 越权抽查）
+LITESYNC_TEST_PG_DSN=... LITESYNC_MG03_FILES=200 go test ./internal/pgdrill -v
+```
+
 ## 3. 代码地图
 
 ```
 cmd/obsync/
 ├── main.go        进程入口、版本常量、启动自检、rotate-epoch [--vault|--all]
 ├── token.go       `obsync token reset`：API Token 重置的 SSH 兜底（v0.18）
-└── ops.go         运维 CLI：backup / integrity / migration / blobid
+├── ops.go         运维 CLI：backup / integrity / migration / blobid
+├── database.go    元数据库打开入口（OBSYNC_DB=sqlite|postgres）+「已迁移到 PG」标记拦截（批次 G）
+└── migrate_pg.go  `migrate-to-pg`（dry-run / 导入 / 校验 / 幂等）与 `export-sqlite`（反向导出）（批次 G）
 internal/
 ├── api/           HTTP 层：router、认证与 scope、各资源 handler、运维接口
 ├── sync/          业务核心：Service、对象读写、改名/恢复、迁移、完整性、维护任务
@@ -50,7 +67,8 @@ internal/
 ├── storage/       Blob 存储、blobID 域化、路径归一、分享密文
 ├── backup/        restic 旁路：一致性 staging、配置加密、恢复、保留策略
 ├── failpoint/     崩溃点注入（测试用，生产路径零开销）
-├── config/        环境变量解析与校验
+├── config/        环境变量解析与校验（database.go：OBSYNC_DB / OBSYNC_PG_DSN）
+├── pgdrill/       （只有测试）MG-03 离线迁移演练：合成 SQLite → PG → 在 PG 上启动逐项比对
 └── web/dist/      Web 前端构建产物（**已提交**，部署无需 Node）
 web/               Web 前端源码（只读端 / 运维页 / 分享页 / 配对落地页 / 离线查看器）
 viewer/            自包含单文件离线查看器（用户下载到本地保存）
@@ -71,7 +89,16 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/storage/blobid.go` | `blobID = HMAC(vaultSecret, contentHash)`，消除存在性预言机 |
 | `internal/sync/vault_state.go` | 每 Vault 一把写锁、每 Vault 保留策略 |
 | `internal/sync/service.go` | 协议 v6 核心：身份与展示名分离 |
-| `internal/backup/snapshot.go` | 一致性 staging；**锁语义在这里踩过坑**（见 §7） |
+| `internal/backup/snapshot.go` | 一致性 staging；**锁语义在这里踩过坑**（见 §7）；PG 部署走只读快照事务导出（批次 G） |
+| `internal/db/pgdriver.go` | PostgreSQL 方言适配（批次 G）：驱动层把 `?` 改写为 `$n`、DDL 类型映射、登记在案的 SQLite 专属语句翻译；**未登记的 SQLite 专属语句一律报错** |
+| `internal/db/dbcopy.go` / `dbrestore.go` | 跨方言整库复制 + 逐表摘要校验（迁移、反向导出、PG 备份共用）；恢复导入与全部仓库 epoch 旋转同一事务 |
+| `internal/api/oidc.go` + `internal/sync/identity.go` + `internal/db/identities.go` | 0.20 统一账号（ADR-011）：OIDC 依赖方（PKCE、state 绑浏览器、nonce/iss/aud/azp、back-channel logout）；`(issuer, subject)` → 本地用户，**邮箱从不参与匹配** |
+| `internal/api/vaults_v2.go` + `internal/sync/vault_init.go` + `internal/db/vault_init.go` | 浏览器端加密建库状态机（ADR-012）：`pending_encryption → initializing（10 分钟租约）→ ready`，提交原子、opId 幂等；`readyGate` + `guardWriteReady` 两道写入闸门 |
+| `internal/sync/pairing_v2.go` + `internal/db/enroll_v2.go` | 连接链接 v2（ADR-014）：envelope 读取不消费、显式兑换、exchangeId 加密暂存可续传、公开端点按 IP 限流 |
+| `internal/api/quota.go` + `internal/sync/quota.go` + `internal/db/quota.go` | 0.20 配额与限流：存储配额在 `Upload` 写锁内核算（历史计入）、仓库数、按身份令牌桶 + 上传并发、管理员逐用户覆盖 |
+| `internal/mail/` + `internal/db/mail_outbox.go` | 产品通知邮件（ADR-018）：log/smtp/resend、outbox 幂等与退避、抑制表、按收件人与全局日预算 |
+| `web/src/vendor/litesync-core/` | 与插件逐字节一致的 crypto-core / merge-core（MANIFEST 校验，`npm run build` 先跑 `check:core`）；**只能用 `web/scripts/vendor-core.mjs` 从插件仓重新生成，手改必失败** |
+| `web/src/write.ts` + `note-editor.ts` + `editor.ts` | 网页写端（ADR-015）：与插件同协议（CAS、世代、operationId、墓碑/恢复），信封不降级，冲突保留双方，加密草稿只存密文；CodeMirror 单独打包 `/editor.js` |
 
 ## 4. 数据模型（协议 v6）
 
@@ -133,6 +160,14 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 7. **转发头只在可信代理时采信**（`OBSYNC_TRUSTED_PROXIES`），
    否则客户端可以随便写自己的来源 IP。
 8. **日志不得泄露明文路径**（`logprivacy_test.go` 盯着这一条）。
+9. **网页会话的权限是白名单**（`session.go` 的 `webSessionAllowed`，0.20 起还有 `webContentWrite`）：
+   新增给网页用的接口要同时登记白名单；内容写入只在 `OBSYNC_WEB_EDITING=true` 时放行，且要求同源 Origin、
+   成员角色可写，审计身份由服务器生成（`web-…`）。
+10. **配额只拦新增，不拦读取与清理**：存储检查必须留在 `Upload` 的写锁内、幂等短路之后（否则并发上传会一起越过
+    上限，或把响应丢失后的原样重试误判为超限）。永久超限（`QUOTA_EXCEEDED`，`retryable:false`）与临时限流
+    （`RATE_LIMITED`，429 + `Retry-After`）不得混用——客户端靠它决定要不要重试。
+11. **CSP 不放宽**：`style-src 'self'` 拦内联 `<style>`。第三方组件（如 CodeMirror）的样式走
+    Constructable Stylesheets（`editor.ts` 的 `installCspSafeStyles`），不要为它们开 `'unsafe-inline'`。
 
 ## 7. 踩过的坑（都是真事故，别再来一遍）
 
@@ -156,6 +191,19 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 - **blobID 域化后 `CommitAs(tmp, blobID, contentHash, strict)` 的两个参数不能混**：
   「文件叫什么」和「内容应该哈希成什么」必须分开传，用文件名当期望哈希的老写法
   在域化之后会把每个 blob 都判成损坏。
+- **PostgreSQL 方言（批次 G，写 SQL 时两种库都要过）**：
+  ① `ON CONFLICT … DO UPDATE SET x = x + 1` 在 PG 上**整句报错**（未限定列名有歧义），
+  必须写 `x = 表名.x + 1`——GC 候选计数曾因此在 PG 上静默失效（报错被吞 → 永不删除）；
+  ② `EXISTS(...)` 在 PG 是布尔，扫不进 int64，要 `CASE WHEN … THEN 1 ELSE 0 END`；
+  ③ 唯一约束判断用 `db.IsUniqueViolation`，别匹配错误文案；
+  ④ 时间用 Go 传参，别用 `strftime`；`rowid`、`x'..'` 字面量、`PRAGMA`、`sqlite_master`
+  在 PG 上都不存在——驱动层只翻译 `pgRewrites` 表里登记的那几条，其余**当场报错**；
+  ⑤ 需要不同**行为**的地方（备份快照、擦除报告、页级自检）用 `db.IsPostgres` 显式分支，
+  而且报告文案要跟着变：PG 上 WAL 不归我们截断、数据文件扫不到，报告里不得沿用 SQLite 的断言；
+  ⑥ PG 库必须是 C 排序（`OpenPostgres` 会拒绝其他 locale），否则路径排序与分页和 SQLite 不一致。
+- **恢复后只转了 default 的 epoch**（批次 G 发现）：`backup restore` 曾调用按 `os.Args`
+  判断 `--all` 的 `rotateEpoch()`，从 restore 路径进来永远只转 default——多仓库部署里
+  其他仓库的客户端会沿用旧游标。现在恢复一律 `db.RotateAllEpochs`（PG 恢复在导入事务里做）。
 
 ## 8. 测试组织
 
@@ -171,6 +219,19 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/backup/staging_lock_test.go` | 真实锁语义 + 看门狗（见 §7 的死锁事故） |
 | `internal/sync/scale_test.go` | 规模上限（默认 2 000，可 `LITESYNC_SCALE=20000`） |
 | `internal/db/invariants_test.go` | 每条 INV 都有测试认领 |
+| `internal/db/pgdriver_test.go` | PG 改写器：占位符、字面量/注释、DDL 类型、登记语句、未登记语句拒绝（批次 G） |
+| `internal/db/dbcopy_test.go` | 跨方言复制：通用填充覆盖**每张表每一列**（新表自动纳入）、发散检测、非空拒绝、旧库拒绝、SQLite→PG→SQLite 往返 |
+| `internal/backup/restore_drill_pg_test.go` | PG 分支灾备演练：真 restic → 全新 PG 实例恢复 → 启动 → 旧设备视角（epoch 旋转、删除不复活）；注入缺失 blob 必须被报告 |
+| `internal/pgdrill/mg03_test.go` | MG-03 离线迁移演练：合成 SQLite（多用户/多仓库/LSM1/checkpoint/配对/身份/outbox）→ PG → 逐项比对 + 越权抽查 + 耗时 |
+| `internal/api/oidc_test.go` | 内嵌模拟身份服务：PKCE、回调重放、登录 CSRF、iss/aud/azp/nonce/exp/未知密钥篡改、注册模式、旧管理员认领、back-channel logout |
+| `internal/api/vault_init_test.go` | 建库状态机全周期、v1 兼容、配对 v2 发行/envelope/兑换/重放/撤销、8 路并发兑换只成功 1 个 |
+| `internal/api/web_edit_test.go` / `quota_test.go` | 网页写入闸门（默认只读、同源、只读成员、审计身份）、回收站；配额（原子、历史计入、幂等放行、覆盖值）与限流 |
+| `web/test/*.test.ts`（`cd web && npm test`） | crypto-core 冻结向量对比、网页写端协议层（信封不降级、世代、重试同密文、三方合并、加密草稿隔离、附件命名） |
+
+**两种库各跑一遍**：设置 `LITESYNC_TEST_PG_DSN` 后，测试二进制里的 `db.Open(path)` 改走 PG
+（每个路径一个独立 schema，重开同一路径 = 同一 schema，「关闭再打开模拟重启」语义不变）。
+专测旧 SQLite 文件库升级路径的用例（v5→v6、单行 repo_state、SQLite 部署的恢复演练）固定用
+`db.OpenSQLiteFile`，两种模式下都照常针对 SQLite 运行。
 
 **做过变异测试的地方**（去掉某条检查看矩阵是否变红）值得保持：去掉租户校验
 会产生 61 处断言失败，去掉 `object_versions` 的 repoint 会让迁移演练立刻失败。
