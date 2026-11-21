@@ -264,6 +264,126 @@ export async function restoreTombstone(
 	return { ok: true, fileId: out.fileId, path: out.path, revision: out.revision, metaGeneration: out.metaGeneration ?? 0 };
 }
 
+// ---------------------------------------------------------------- 带新内容的原子恢复（W4 / W5）
+
+/** 回收站条目里恢复要用的字段（GET /api/v1/trash）。 */
+export interface RestoreTarget {
+	fileId: string;
+	deletionRevision: number;
+	contentGeneration: number;
+	metaGeneration: number;
+}
+
+/**
+ * 一次恢复 = 一个 operationId + 一份**固定的**新密文：断网 / 401 / 限流后用同一份重试，
+ * 响应丢失后重试由服务器按 operationId 返回首次结果。恢复位置变了（原位置被占）才重新准备。
+ */
+export interface PreparedRestore {
+	fileId: string;
+	operationId: string;
+	/** 真实路径（界面显示；路径加密仓库里服务器看不到它） */
+	path: string;
+	/** 服务器寻址名：明文仓库 = 路径；路径加密仓库 = fileId */
+	pseudonym: string;
+	expectedTombstoneRevision: number;
+	expectedTombstoneGeneration: number;
+	payload: Uint8Array;
+	cipherHash: string;
+	generation: number;
+	envelope: TrackedFile["envelope"];
+	padded: boolean;
+	meta?: { metaEnc: string; canonicalHash: string; metaGeneration: number };
+}
+
+/**
+ * 准备恢复：删除前的明文 + 恢复位置 → 新世代的密文（世代 = max(墓碑世代, 删除前内容的世代) + 1）。
+ * 信封不降级：删除前是 LSE4 的保持 LSE4（与它的填充标记），仓库下限 ≥4 时同样写 LSE4。
+ * 路径加密仓库另附 LSM1：metaGeneration = 墓碑世代 + 1（与服务器恢复后的记账一致）。
+ */
+export async function prepareRestore(
+	b: RepoBinding,
+	k: WriteKeys | null,
+	it: RestoreTarget,
+	path: string,
+	plain: Uint8Array,
+	prior: { envelope: TrackedFile["envelope"]; padded: boolean; generation: number },
+): Promise<PreparedRestore> {
+	const generation = Math.max(it.contentGeneration, prior.generation) + 1;
+	const operationId = newOperationId();
+	const base = {
+		fileId: it.fileId, operationId, path, pseudonym: b.metaMode ? it.fileId : path,
+		expectedTombstoneRevision: it.deletionRevision, expectedTombstoneGeneration: it.contentGeneration, generation,
+	};
+	if (!b.encrypted) {
+		return { ...base, payload: plain, cipherHash: await sha256HexOf(plain), envelope: "plain", padded: false };
+	}
+	if (!k) throw new Error("仓库已锁定");
+	const binding3 = { vaultId: b.vaultIdentity, keyEpoch: b.keyEpoch, fileId: it.fileId, generation };
+	const buf = plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength) as ArrayBuffer;
+	const useV4 = prior.envelope === "LSE4" || b.minimumEnvelopeVersion >= 4;
+	const ct = new Uint8Array(useV4 ? await core.encryptFileV4(k.vmk, binding3, buf, prior.padded) : await core.encryptFileV3(k.vmk, binding3, buf));
+	let meta: PreparedRestore["meta"];
+	if (b.metaMode) {
+		if (!k.meta) throw new Error("路径加密仓库需要元数据密钥");
+		const metaGeneration = it.metaGeneration + 1;
+		meta = {
+			metaEnc: await core.encryptMeta(k.meta, { vaultId: b.vaultIdentity, keyEpoch: b.keyEpoch, fileId: it.fileId, metaGeneration }, { path }),
+			canonicalHash: await core.canonicalPathHmac(k.meta, path),
+			metaGeneration,
+		};
+	}
+	return { ...base, payload: ct, cipherHash: await sha256HexOf(ct), envelope: useV4 ? "LSE4" : "LSE3", padded: useV4 && prior.padded, meta };
+}
+
+export type RestoreOutcome =
+	| { kind: "restored"; fileId: string; path: string; revision: number; generation: number; metaGeneration: number; replayed: boolean }
+	| { kind: "offline"; message: string }
+	| { kind: "auth" }
+	/** 别处已经恢复或改动了它（墓碑锚点对不上 / 对象已是 live）：刷新回收站 */
+	| { kind: "changed"; code: string }
+	/** 恢复位置已被别的文件占用（大小写 / Unicode 归一后同名）：换一个位置 */
+	| { kind: "collision"; existing: string }
+	| { kind: "rejected"; status: number; code: string; message: string; details?: Record<string, unknown> };
+
+/** PUT /api/v1/files/{fileId}/restore：一次提交恢复与新内容。网络失败时调用方用**同一个** prepared 重试。 */
+export async function uploadRestore(b: RepoBinding, p: PreparedRestore, fetchFn: FetchLike = fetch): Promise<RestoreOutcome> {
+	const headers: Record<string, string> = {
+		...protocolHeaders(b, p.operationId),
+		"Content-Type": "application/octet-stream",
+		"X-File-Path": encodeURIComponent(p.pseudonym),
+		"X-Content-Hash": p.cipherHash,
+		"X-Expected-Tombstone-Revision": String(p.expectedTombstoneRevision),
+		"X-Expected-Tombstone-Generation": String(p.expectedTombstoneGeneration),
+		"X-File-Mtime": String(Date.now()),
+	};
+	if (p.meta) {
+		headers["X-Meta-Enc"] = p.meta.metaEnc;
+		headers["X-Canonical-Hash"] = p.meta.canonicalHash;
+	}
+	let res: Response;
+	try {
+		res = await fetchFn(`/api/v1/files/${encodeURIComponent(p.fileId)}/restore`, { method: "PUT", headers, body: p.payload as BodyInit });
+	} catch (e) {
+		return { kind: "offline", message: e instanceof Error ? e.message : String(e) };
+	}
+	if (res.status === 401) return { kind: "auth" };
+	if (res.status >= 500) return { kind: "offline", message: `HTTP ${res.status}` };
+	if (res.status === 429) return { kind: "offline", message: "服务器限流，稍后自动重试" };
+	if (!res.ok) {
+		const { code, message, body } = await readCode(res);
+		if (code === "CANONICAL_COLLISION") return { kind: "collision", existing: String(body.existing ?? "") };
+		if (code === "CONFLICT" || code === "STALE_REVISION" || code === "TOMBSTONE_PURGED") return { kind: "changed", code };
+		return { kind: "rejected", status: res.status, code, message, details: body.details as Record<string, unknown> | undefined };
+	}
+	const out = (await res.json()) as { fileId: string; path: string; revision: number; contentGeneration?: number; metaGeneration?: number; replayed?: boolean };
+	if (out.fileId !== p.fileId) return { kind: "rejected", status: 200, code: "FILE_ID_MISMATCH", message: "服务器恢复的不是请求的那个对象" };
+	return {
+		kind: "restored", fileId: out.fileId, path: out.path, revision: out.revision,
+		generation: typeof out.contentGeneration === "number" && out.contentGeneration > 0 ? out.contentGeneration : p.generation,
+		metaGeneration: out.metaGeneration ?? p.meta?.metaGeneration ?? 0, replayed: out.replayed === true,
+	};
+}
+
 /** 上传一份内容（新建或覆盖前置版本）；网络失败时用**同一份**密文最多重试 retries 次。 */
 export async function saveWithRetry(b: RepoBinding, k: WriteKeys | null, f: TrackedFile, plain: Uint8Array, retries = 2, fetchFn: FetchLike = fetch): Promise<SaveOutcome> {
 	const p = await prepareUpload(b, k, f, plain);

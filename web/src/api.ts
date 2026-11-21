@@ -25,6 +25,11 @@ export interface TrashItem {
 	deletedAt: number;
 	retainUntil?: number;
 	restorable: boolean;
+	/** v0.20.1：删除前内容所在的历史版本（恢复时先按 fileId 取回它重新加密）；没有 = 已被历史清理 */
+	priorRevision?: number;
+	priorGeneration?: number;
+	/** v0.20.1：路径加密仓库删除前最后一份 LSM1 密文（本机解开得到原路径）；没有 = 较早的记录 */
+	metaEnc?: string;
 }
 
 export interface VersionEntry {
@@ -309,6 +314,17 @@ export class Api {
 
 	async version(path: string, revision: number): Promise<ArrayBuffer> {
 		return (await this.versionWithIdentity(path, revision)).data;
+	}
+
+	/**
+	 * 按对象身份取历史版本（v0.20.1 回收站恢复）：已删除对象原来的路径可能已被别的对象占用，
+	 * 按路径寻址会解析到那个对象——身份必须以 fileId 为准，并由调用方核对响应里的 X-File-Id。
+	 */
+	async versionById(fileId: string, revision: number): Promise<{ data: ArrayBuffer; fileId: string | null; generation: number | null }> {
+		const res = await this.req(`/api/v1/version?fileId=${encodeURIComponent(fileId)}&revision=${revision}`);
+		if (!res.ok) throw new Error(`version: HTTP ${res.status}`);
+		const gen = res.headers.get("X-Content-Generation");
+		return { data: await res.arrayBuffer(), fileId: res.headers.get("X-File-Id"), generation: gen === null || gen === "" ? null : Number(gen) };
 	}
 
 	// ---------- 备份管理（ADMIN capability：需要 admin 会话，见 login(token, true)） ----------

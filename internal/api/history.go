@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/KJoner/litesync-server/internal/db"
 	"github.com/KJoner/litesync-server/internal/storage"
 	syncsvc "github.com/KJoner/litesync-server/internal/sync"
 )
@@ -62,9 +63,12 @@ func (h *handlers) history(w http.ResponseWriter, r *http.Request) {
 
 // version 返回某历史版本的原始字节。
 // GET /api/v1/version?path=...&revision=15
+// GET /api/v1/version?fileId=<32hex>&revision=15（v0.20.1：按对象身份寻址——回收站恢复读
+// 已删除对象的删除前内容；它原来的路径可能已被别的对象占用。只多一种寻址方式，path 语义不变）
 func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	if path == "" {
+	fileID := r.URL.Query().Get("fileId")
+	if path == "" && fileID == "" {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidPath, "missing path", false)
 		return
 	}
@@ -73,7 +77,13 @@ func (h *handlers) version(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid revision")
 		return
 	}
-	meta, rc, err := h.svc.OpenVersion(scopeOf(r), path, revision)
+	var meta *db.ObjectVersion
+	var rc io.ReadCloser
+	if fileID != "" {
+		meta, rc, err = h.svc.OpenVersionByID(scopeOf(r), fileID, revision)
+	} else {
+		meta, rc, err = h.svc.OpenVersion(scopeOf(r), path, revision)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, syncsvc.ErrCorrupted):

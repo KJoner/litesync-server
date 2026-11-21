@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -152,7 +153,9 @@ func rateGate(h *handlers, next http.Handler) http.Handler {
 			writeRateLimited(w, wait, "rate")
 			return
 		}
-		if r.Method == http.MethodPut && r.URL.Path == "/api/v1/file" {
+		// 上传并发：普通上传与带新内容的恢复（同样收一份密文）共用一个并发计数
+		if r.Method == http.MethodPut && (r.URL.Path == "/api/v1/file" ||
+			strings.HasPrefix(r.URL.Path, "/api/v1/files/") && strings.HasSuffix(r.URL.Path, "/restore")) {
 			release, ok := h.limiter.acquireUpload(key)
 			if !ok {
 				writeRateLimited(w, time.Second, "concurrency")

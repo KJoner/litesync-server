@@ -210,6 +210,10 @@ func migrateColumns(d *sql.DB) error {
 		// 用户级配额覆盖值（需求 §12）：0 = 跟随服务器默认，-1 = 不限，>0 = 指定值
 		{"users", "quota_bytes", `ALTER TABLE users ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0`, false},
 		{"users", "quota_vaults", `ALTER TABLE users ADD COLUMN quota_vaults INTEGER NOT NULL DEFAULT 0`, false},
+		// --- v0.20.1 回收站恢复（W5） ---
+		// 路径加密仓库的墓碑保留删除前最后一份 LSM1（客户端加密的元数据，服务器看不到里面的路径），
+		// 新设备只凭服务器上的密文与仓库密码就能看到原路径并恢复。存量墓碑为空串：客户端走「手动选择路径」
+		{"tombstones", "encrypted_metadata", `ALTER TABLE tombstones ADD COLUMN encrypted_metadata TEXT NOT NULL DEFAULT ''`, false},
 	}
 
 	for _, m := range migrations {

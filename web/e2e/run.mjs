@@ -45,6 +45,8 @@ const SUITES = [
 	{ name: "edit-off", file: "suites/edit-off.ts", server: "readonly", plugin: true, expect: 6, desc: "网页编辑默认关闭：只读界面 + 服务端拒绝会话写入" },
 	{ name: "w1-merge", file: "suites/w1-merge.ts", server: "editing", plugin: true, expect: 12, desc: "W1：上传/取远端期间继续输入，合并与冲突副本不丢输入（含输入法组合）" },
 	{ name: "w2-drafts", file: "suites/w2-drafts.ts", server: "editing", plugin: true, expect: 18, desc: "W2：旧上传成功不删更新的草稿；草稿逆序写入；多标签；强制结束后恢复" },
+	{ name: "w4-restore", file: "suites/w4-restore.ts", server: "editing", plugin: true, expect: 22, desc: "W4：回收站恢复断网/401/额度/刷新后可继续完成，HEAD 始终一致" },
+	{ name: "w5-meta-trash", file: "suites/w5-meta-trash.ts", server: "editing", plugin: false, expect: 14, desc: "W5：路径加密仓库回收站解密原路径并恢复（改名后删除、重名、旧墓碑、历史清理、新设备）" },
 	{ name: "w6-bytes", file: "suites/w6-bytes.ts", server: "editing", plugin: true, expect: 18, desc: "W6：CRLF/混合换行/BOM/emoji 的工具栏操作与无编辑不改字节" },
 ];
 

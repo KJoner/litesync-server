@@ -48,11 +48,13 @@ import {
 	indexedDbBackend,
 	memoryBackend,
 	newTrackedFile,
+	PreparedRestore,
+	prepareRestore,
 	renameFile,
 	RepoBinding,
-	restoreTombstone,
 	saveWithRetry,
 	TrackedFile,
+	uploadRestore,
 } from "./write";
 import {
 	decryptFile,
@@ -1813,8 +1815,49 @@ async function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer,
 	}
 }
 
-// ---------- 回收站（需求 §7.2「删除回收」） ----------
+// ---------- 回收站（需求 §7.2「删除回收」；v0.20.1 W4 原子恢复 / W5 路径加密仓库） ----------
+//
+// 恢复 = 先取回删除前的内容（按 fileId 寻址的历史版本，在本机解密）→ 以严格更新的世代重新加密
+// → PUT /api/v1/files/{fileId}/restore **一次**提交（期望的墓碑 revision / 世代 + operationId）。
+// 要么什么都没发生（删除记录原样留在回收站，可以重试），要么恢复与新内容同时生效——服务器上
+// 不再有「旧密文 + 新世代」的中间态，本页的防回退检查与其他设备都不会被它误导。
+// 断网 / 限流用同一份密文与同一个 operationId 重试；响应丢失后的重试由服务器返回首次结果。
+//
+// 路径加密仓库：删除记录里带着删除前最后一份 LSM1（客户端密文），这里用元数据密钥解开得到原路径
+// （新设备只要有仓库密码同样可以）。较早的记录没有 LSM1、或解不开时，让用户自己选择恢复位置。
+
+interface TrashView {
+	it: TrashItem;
+	/** 解出来的原路径（明文仓库就是 it.path）；null = 不知道原路径 */
+	path: string | null;
+	pathNote: string;
+}
+
+/** 本页内未完成的恢复（同一份密文与 operationId，用于重试）与它们最后一次失败的原因。 */
+const pendingRestores = new Map<string, PreparedRestore>();
+const restoreErrors = new Map<string, string>();
+
+const canonPath = (p: string) => p.normalize("NFC").toLowerCase();
+
+/** 原位置被占用时建议的恢复位置：「名字（恢复）.md」。 */
+function restoredCopyName(path: string): string {
+	const dot = path.lastIndexOf(".");
+	const slash = path.lastIndexOf("/");
+	return dot > slash ? `${path.slice(0, dot)}（恢复）${path.slice(dot)}` : `${path}（恢复）`;
+}
+
+async function trashViewOf(it: TrashItem, meta: boolean): Promise<TrashView> {
+	if (!meta) return { it, path: it.path, pathNote: it.path };
+	if (!it.metaEnc) {
+		return { it, path: null, pathNote: "这条删除记录没有保存加密的原路径（较早的版本删除，或在启用路径加密之前删除）：恢复时需要你指定位置。" };
+	}
+	const dec = S!.metaKeys && S!.binding?.vaultId ? await decryptMeta(S!.metaKeys, it.metaEnc, S!.binding.vaultId, it.fileId).catch(() => null) : null;
+	if (!dec) return { it, path: null, pathNote: "这条删除记录里的原路径用当前密钥解不开（可能来自密钥轮换之前）：恢复时需要你指定位置。" };
+	return { it, path: dec.path, pathNote: dec.path };
+}
+
 async function showTrash(): Promise<void> {
+	const alive = fence();
 	revokeAllBlobs();
 	markActive(null);
 	outlineEl.innerHTML = "";
@@ -1830,74 +1873,156 @@ async function showTrash(): Promise<void> {
 	try {
 		items = await S!.api.trash();
 	} catch (e) {
-		list.textContent = `加载失败：${e instanceof Error ? e.message : String(e)}`;
+		if (alive()) list.textContent = `加载失败：${e instanceof Error ? e.message : String(e)}`;
 		return;
 	}
-	list.innerHTML = "";
+	if (!alive()) return;
 	const meta = repoBinding().metaMode;
+	const views: TrashView[] = [];
+	for (const it of items) views.push(await trashViewOf(it, meta));
+	if (!alive()) return;
+	list.innerHTML = "";
 	if (meta) {
-		wrap.insertBefore(el("p", "banner warn", "这个仓库启用了路径加密：服务器只保留已删除文件的身份，不知道它原来的路径，因此不能在网页恢复。请在 Obsidian 中处理。"), list);
+		wrap.insertBefore(el("p", "muted small", "这个仓库启用了路径加密：服务器只保存删除记录的密文，原路径在这台设备上用仓库密钥解开后显示。"), list);
 	}
-	if (items.length === 0) {
+	if (views.length === 0) {
 		list.append(el("p", "muted", "回收站是空的。"));
 		return;
 	}
-	const canon = (p: string) => p.normalize("NFC").toLowerCase();
-	for (const it of items) {
-		const row = el("div", "trash-row");
-		const info = el("div", "trash-info");
-		info.append(
-			el("div", "recent-title", meta ? `已删除的文件（${it.fileId.slice(0, 8)}…）` : noteTitle(it.path)),
-			el("div", "muted small", `${meta ? "" : it.path + " · "}删除于 ${fmtTime(it.deletedAt * 1000)}`),
-		);
-		row.append(info);
-		if (!meta && canEdit()) {
-			const btn = el("button", "ghost small-btn", "恢复") as HTMLButtonElement;
-			const clash = S!.files.find((f) => canon(f.path) === canon(it.path));
-			if (!it.restorable) {
-				btn.disabled = true;
-				btn.title = "删除前的内容已被历史清理，无法恢复";
-			} else if (clash) {
-				btn.disabled = true;
-				btn.title = `原位置已有文件「${clash.path}」，请先把它改名或删除`;
-			}
-			btn.onclick = () => void restoreFromTrash(it, btn);
-			row.append(btn);
+	for (const v of views) list.append(trashRow(v));
+}
+
+function trashRow(v: TrashView): HTMLElement {
+	const { it } = v;
+	const row = el("div", "trash-row");
+	row.dataset.fileId = it.fileId;
+	const info = el("div", "trash-info");
+	info.append(
+		el("div", "recent-title", v.path ? noteTitle(v.path) : `原路径未知的文件（${it.fileId.slice(0, 8)}…）`),
+		el("div", "muted small", `${v.pathNote} · 删除于 ${fmtTime(it.deletedAt * 1000)}`),
+	);
+	const err = restoreErrors.get(it.fileId);
+	if (err) {
+		const e = el("div", "banner warn small trash-pending", err);
+		e.setAttribute("role", "alert");
+		info.append(e);
+	}
+	row.append(info);
+	if (canEdit()) {
+		const clash = v.path ? S!.files.find((f) => canonPath(f.path) === canonPath(v.path!)) : undefined;
+		const label = pendingRestores.has(it.fileId) ? "重试恢复" : !v.path ? "选择位置恢复…" : clash ? "恢复到其他位置…" : "恢复";
+		const btn = el("button", "ghost small-btn", label) as HTMLButtonElement;
+		if (!it.restorable) {
+			btn.disabled = true;
+			btn.title = "删除前的内容已被历史清理，无法恢复内容";
+			info.append(el("div", "muted small", "删除前的内容已被历史清理，无法恢复。"));
+		} else if (clash) {
+			btn.title = `原位置已有文件「${clash.path}」：恢复时请换一个位置`;
 		}
-		list.append(row);
+		btn.onclick = () => void restoreFromTrash(v, btn);
+		row.append(btn);
+	}
+	return row;
+}
+
+/** 让用户选择 / 确认恢复位置；返回规范化后的路径，取消返回 null。 */
+function chooseRestorePath(v: TrashView, reason: string): string | null {
+	for (;;) {
+		const suggestion = v.path ? restoredCopyName(v.path) : "";
+		const input = prompt(`${reason}\n请输入恢复后的路径（可以包含文件夹，例如「工作/周记.md」）`, suggestion);
+		if (input === null) return null;
+		const p = normalizeNotePath(input);
+		if (!p) {
+			alert("路径不合法：不能为空、不能以 / 开头、不能包含 .. 或以 . 开头的段。");
+			continue;
+		}
+		const clash = S!.files.find((f) => canonPath(f.path) === canonPath(p));
+		if (clash) {
+			reason = `「${clash.path}」已经存在（大小写或 Unicode 归一后同名也算）。`;
+			continue;
+		}
+		return p;
 	}
 }
 
-/**
- * 从回收站恢复（与插件 push.restoreObject 同协议）：
- *   1. POST restore（revision 连续、fileId 不变、contentGeneration = 删除时 + 1）；
- *   2. 服务器此时的 HEAD 是删除前的内容（旧世代密文）：取回、解密、以 +1 世代重新加密上传。
- * 第 2 步失败时内容已经是删除前的版本、可以正常打开；在网页里修改保存一次即可补齐世代。
- */
-async function restoreFromTrash(it: TrashItem, btn: HTMLButtonElement): Promise<void> {
+async function restoreFromTrash(v: TrashView, btn: HTMLButtonElement): Promise<void> {
+	const alive = fence();
+	const { it } = v;
+	let target = pendingRestores.get(it.fileId)?.path ?? v.path;
+	if (!target) {
+		target = chooseRestorePath(v, v.pathNote);
+	} else if (!pendingRestores.has(it.fileId) && S!.files.some((f) => canonPath(f.path) === canonPath(target!))) {
+		target = chooseRestorePath(v, `原位置「${target}」已有文件。`);
+	}
+	if (!target) return;
 	btn.disabled = true;
 	btn.textContent = "恢复中…";
+	restoreErrors.delete(it.fileId);
+	const fail = (msg: string, keepPending: boolean) => {
+		if (!alive()) return;
+		if (!keepPending) pendingRestores.delete(it.fileId);
+		restoreErrors.set(it.fileId, msg);
+		if (location.hash === "#/trash") void showTrash(); // 用户已经去了别处：状态留着，回到回收站时显示
+	};
 	try {
 		const b = repoBinding();
-		const keys = S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null;
-		const nextGen = it.contentGeneration + 1;
-		const r = await restoreTombstone(b, it.fileId, { expectedTombstoneRevision: it.deletionRevision, contentGeneration: nextGen, pseudonym: it.path });
-		if (!r.ok) throw new Error(r.code === "CONFLICT" || r.code === "STALE_REVISION" ? "这个文件刚被别的设备恢复或改动过，请刷新回收站" : writeError(r.code, r.message));
-		const restored: TrackedFile = { path: it.path, serverPath: r.path, fileId: it.fileId, revision: r.revision, generation: nextGen, envelope: "LSE3", padded: false, metaGeneration: r.metaGeneration };
-		recordSaved(restored, true); // 已经是 live：先进文件树，第 2 步失败也找得到它
-		const dl = await S!.api.fileWithIdentity(r.path);
-		const plain = await decodeContent(it.path, dl.data, { fileId: dl.fileId, historical: true });
-		const env = envelopeOf(dl.data);
-		const tracked = { ...restored, envelope: env.envelope, padded: env.padded };
-		const out = await saveWithRetry(b, keys, tracked, new Uint8Array(plain));
-		if (out.kind !== "saved") {
-			throw new Error(`已恢复为删除前的内容，但重新加密上传没有完成（${out.kind === "rejected" ? out.code : out.kind}）；打开这篇笔记修改并保存一次即可补齐`);
+		let prepared = pendingRestores.get(it.fileId);
+		if (!prepared || prepared.path !== target) {
+			if (!it.priorRevision) return fail("删除前的内容已被历史清理，无法恢复。", false);
+			// 1) 按 fileId 取回删除前的内容（历史版本本来就是旧世代：不做 HEAD 防回退比较）
+			const ver = await S!.api.versionById(it.fileId, it.priorRevision);
+			if (!alive()) return;
+			if (ver.fileId !== it.fileId) return fail("服务器返回的内容身份与删除记录不符，已停止恢复。", false);
+			const plain = await decodeContent(target, ver.data, { fileId: ver.fileId, historical: true });
+			if (!alive()) return;
+			const env = envelopeOf(ver.data);
+			const priorGen = lse3Header(ver.data)?.generation ?? it.priorGeneration ?? 0;
+			const keys = S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null;
+			// 2) 以严格更新的世代重新加密（路径加密仓库另附 LSM1）——固定下来，重试复用同一份字节
+			prepared = await prepareRestore(b, keys, it, target, new Uint8Array(plain), { envelope: env.envelope, padded: env.padded, generation: priorGen });
+			if (!alive()) return;
+			pendingRestores.set(it.fileId, prepared);
 		}
-		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId }, false);
-		location.hash = "#/n/" + encodeURIComponent(it.path);
+		// 3) 一次提交；断网 / 限流用同一份密文与 operationId 重试
+		let out = await uploadRestore(b, prepared);
+		for (let i = 0; i < 2 && out.kind === "offline" && alive(); i++) {
+			await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+			out = await uploadRestore(b, prepared);
+		}
+		if (!alive()) return;
+		switch (out.kind) {
+			case "restored": {
+				pendingRestores.delete(it.fileId);
+				restoreErrors.delete(it.fileId);
+				recordSaved({
+					path: target, serverPath: out.path, fileId: out.fileId, revision: out.revision, generation: out.generation,
+					envelope: prepared.envelope, padded: prepared.padded, metaGeneration: out.metaGeneration,
+				}, true);
+				location.hash = "#/n/" + encodeURIComponent(target);
+				return;
+			}
+			case "offline":
+				return fail("恢复没有完成：网络连接中断。服务器上的删除记录原样保留，内容没有任何改动——联网后点「重试恢复」。", true);
+			case "auth":
+				return fail("恢复没有完成：登录已过期。删除记录原样保留——重新登录并解锁后回到回收站重试。", true);
+			case "changed":
+				return fail("这个文件刚在别处被恢复或改动过（删除记录已变化）：已刷新回收站，请按最新状态操作。", false);
+			case "collision": {
+				pendingRestores.delete(it.fileId);
+				const again = chooseRestorePath({ ...v, path: target }, `「${target}」已被别的文件占用（大小写或 Unicode 归一后同名也算）。`);
+				if (!again) return fail("恢复没有完成：恢复位置已被占用。", false);
+				btn.disabled = false;
+				return restoreFromTrash({ ...v, path: again }, btn);
+			}
+			case "rejected":
+				if (out.code === "QUOTA_EXCEEDED") {
+					return fail("恢复没有完成：已达到账号的存储配额（恢复会写入一份新的加密内容，历史版本也计入）。删除记录原样保留——清理空间或联系管理员调整配额后点「重试恢复」。", true);
+				}
+				return fail(`恢复被服务器拒绝：${writeError(out.code, out.message)}`, false);
+		}
 	} catch (e) {
-		alert(`恢复：${e instanceof Error ? e.message : String(e)}`);
-		void showTrash();
+		if (e instanceof AuthError) return fail("恢复没有完成：登录已过期。删除记录原样保留——重新登录并解锁后回到回收站重试。", true);
+		fail(`恢复没有完成：${e instanceof Error ? e.message : String(e)}。删除记录原样保留，可以重试。`, true);
 	}
 }
 

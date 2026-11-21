@@ -184,9 +184,13 @@ function deferred<T = void>(): Deferred<T> {
 const flush = async (n = 30) => {
 	for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
 };
-async function until(cond: () => boolean, n = 2000): Promise<void> {
-	for (let i = 0; i < n && !cond(); i++) await new Promise((r) => setImmediate(r));
-	assert.ok(cond(), "条件在限定轮数内没有成立");
+/** 按墙钟时间等条件成立（Date 没有被 mock；机器繁忙时 WebCrypto 线程池可能很慢，不能按轮数算）。 */
+async function until(cond: () => boolean, ms = 15000): Promise<void> {
+	const end = Date.now() + ms;
+	while (!cond()) {
+		if (Date.now() > end) assert.fail(`条件在 ${ms} ms 内没有成立`);
+		await new Promise((r) => setImmediate(r));
+	}
 }
 
 const vaultIdentity = "0123456789abcdef0123456789abcdef";
@@ -255,7 +259,7 @@ interface Rig {
 	ds: DraftStore;
 	host: NoteEditorHost & { aliveFlag: boolean; volatile: boolean; fetchHold: Deferred<void> | null; fetchArrived: Deferred<void>; authClaims: string[] };
 	notice: () => string;
-	click: (label: string) => void;
+	click: (label: string) => Promise<void>;
 }
 
 async function rig(text: string, shared?: { ds: DraftStore; server: FakeServer }): Promise<Rig> {
@@ -295,10 +299,10 @@ async function rig(text: string, shared?: { ds: DraftStore; server: FakeServer }
 	return {
 		ed, cm: lastEditor!, server, ds, host,
 		notice: () => noticeEl().text(),
-		click: (label) => {
-			const b = noticeEl().find(label);
-			assert.ok(b, `通知里没有「${label}」按钮：${noticeEl().text()}`);
-			b!.onclick!();
+		click: async (label) => {
+			// offerDraft 等异步提示：先等按钮出现
+			await until(() => noticeEl().find(label) !== null).catch(() => assert.fail(`通知里没有「${label}」按钮：${noticeEl().text()}`));
+			noticeEl().find(label)!.onclick!();
 		},
 	};
 }
@@ -370,7 +374,7 @@ test("W1 远端删除：「另存为新笔记」保存的是点按钮那一刻�
 	await saving;
 	assert.match(r.notice(), /别处被删除/);
 	r.cm.type("three 提示之后输入");
-	r.click("另存为新笔记");
+	await r.click("另存为新笔记");
 	await until(() => r.server.copies.size === 1);
 	const copy = [...r.server.copies.values()][0];
 	for (const s of ["one 网页", "two 上传期间输入", "three 提示之后输入"]) assert.ok(copy.includes(s), `新笔记缺「${s}」：${JSON.stringify(copy)}`);
@@ -413,8 +417,8 @@ test("W2 旧上传成功晚到：较新的草稿不删除，而是以新的 base
 	assert.equal(drafts[0].baseText, "草稿基线\nA 随上传发出\n");
 	// 强制结束：不经过 lock / leave，直接丢掉这个编辑器；新实例只看得到服务器与本机草稿
 	const again = await rig(r.server.text, { ds: r.ds, server: r.server });
-	assert.match(again.notice(), /草稿/);
-	again.click("恢复草稿");
+	await until(() => /草稿/.test(again.notice()));
+	await again.click("恢复草稿");
 	await until(() => again.cm.getText().includes("B 上传期间输入"));
 	assert.equal(again.cm.getText(), "草稿基线\nA 随上传发出\nB 上传期间输入");
 	await until(() => (again.ed as any).drafted !== null);
@@ -443,7 +447,7 @@ test("W2 上传进行中锁定（会话失效）：迟到的成功结果被丢�
 	assert.equal(drafts.length, 1, "迟到的成功不得删除草稿");
 	assert.equal(drafts[0].inflightText, "锁定基线\n锁定前上传的\n", "草稿记下了在途上传的那一版");
 	const again = await rig(r.server.text, { ds: r.ds, server: r.server });
-	again.click("恢复草稿");
+	await again.click("恢复草稿");
 	await until(() => again.cm.getText().includes("锁定前最后输入的"));
 	assert.equal(again.cm.getText(), "锁定基线\n锁定前上传的\n锁定前最后输入的", "以在途那一版为 base：干净合并，不需要冲突副本");
 	assert.equal(again.server.copies.size, 0);
@@ -456,10 +460,14 @@ test("W2 草稿加密逆序完成：较早开始、较晚完成的那次写入�
 	const orig = subtle.encrypt.bind(subtle);
 	const gate = deferred();
 	let n = 0;
+	let firstDone = false;
 	subtle.encrypt = async (alg: any, key: CryptoKey, data: BufferSource) => {
 		const res = await orig(alg, key, data);
 		const aad = alg?.additionalData ? new TextDecoder().decode(alg.additionalData) : "";
-		if (aad.startsWith("litesync/web-draft/") && ++n === 1) await gate.promise; // 第一次草稿加密被拖住
+		if (aad.startsWith("litesync/web-draft/") && ++n === 1) {
+			await gate.promise; // 第一次草稿加密被拖住
+			firstDone = true;
+		}
 		return res;
 	};
 	try {
@@ -470,7 +478,8 @@ test("W2 草稿加密逆序完成：较早开始、较晚完成的那次写入�
 		t.mock.timers.tick(900); // 第二次草稿写入完成
 		await until(() => (r.ed as any).drafted?.version === r.cm.version());
 		gate.resolve(); // 第一次随后才完成
-		await flush(100);
+		await until(() => firstDone);
+		await flush(200); // 让第一次写入的条件写也走完（它必须被拒绝）
 		const drafts = await r.ds.loadAll(r.server.fileId);
 		assert.equal(drafts.length, 1);
 		assert.ok(drafts[0].text.includes("第二版"), `较早的写入覆盖了较新的草稿：${JSON.stringify(drafts[0].text)}`);

@@ -82,8 +82,9 @@ func New(opts Options, svc *syncsvc.Service) http.Handler {
 	mux.HandleFunc("PUT /api/v1/file", h.putFile)
 	mux.HandleFunc("DELETE /api/v1/file", h.deleteFile)
 	mux.HandleFunc("POST /api/v1/file/rename", h.renameFile)             // v6：改名 = 元数据更新，不产生 tombstone
-	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile) // v6：显式恢复已删除对象
-	mux.HandleFunc("GET /api/v1/trash", h.trash)                         // v0.20：回收站（只读列表；恢复仍走上一行）
+	mux.HandleFunc("POST /api/v1/files/{fileId}/restore", h.restoreFile)           // v6：显式恢复已删除对象（插件；语义不变）
+	mux.HandleFunc("PUT /api/v1/files/{fileId}/restore", h.restoreFileWithContent) // v0.20.1：带新内容的原子恢复（W4）
+	mux.HandleFunc("GET /api/v1/trash", h.trash)                                   // v0.20：回收站（只读列表）
 	mux.HandleFunc("GET /api/v1/history", h.history)
 	mux.HandleFunc("DELETE /api/v1/history", h.purgeHistory)
 	mux.HandleFunc("GET /api/v1/version", h.version)
@@ -460,4 +461,7 @@ var serverCapabilities = []string{
 	"vault-bound-pairing",
 	"web-session-oidc", // 网页统一登录（ADR-011；是否启用看 /auth/config）
 	"account-v2",       // /api/v2/me、账户设备与退出全部
+	// v0.20.1（W4/W5）：PUT /api/v1/files/{fileId}/restore 带新内容的原子恢复；
+	// 回收站返回 priorRevision 与 LSM1（metaEnc）；GET /api/v1/version 可按 fileId 寻址
+	"restore-with-content",
 }
