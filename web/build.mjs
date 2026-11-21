@@ -1,6 +1,6 @@
 // 构建 Web 只读端并输出到 internal/web/dist（产物提交进仓库，服务器无需 Node）
 import esbuild from "esbuild";
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -22,8 +22,11 @@ await esbuild.build({
 	logLevel: "info",
 });
 
+// 产物逐字节入库：换行统一为 LF，与 checkout 的换行风格无关（Windows 默认 core.autocrlf=true
+// 会把源码模板检出成 CRLF——直接复制的话，同一份源码在不同机器上构建出不同字节）
+const lf = (p) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 for (const f of ["index.html", "share.html", "pair.html", "join.html", "styles.css"]) {
-	copyFileSync(join(root, f), join(outdir, f));
+	writeFileSync(join(outdir, f), lf(join(root, f)));
 }
 console.log("web dist ->", outdir);
 
@@ -37,7 +40,7 @@ const viewerJs = await esbuild.build({
 	target: "es2020",
 	write: false,
 });
-const viewerHtml = readFileSync(join(root, "viewer.html"), "utf8").replace(
+const viewerHtml = lf(join(root, "viewer.html")).replace(
 	"/*__VIEWER_JS__*/",
 	() => viewerJs.outputFiles[0].text.replaceAll("</script", "<\\/script"),
 );

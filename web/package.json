@@ -7,7 +7,8 @@
     "build": "node scripts/check-core.mjs && tsc -noEmit -skipLibCheck && node build.mjs",
     "check:core": "node scripts/check-core.mjs",
     "vendor:core": "node scripts/vendor-core.mjs",
-    "test": "node scripts/run-tests.mjs"
+    "test": "node scripts/run-tests.mjs",
+    "check:dist": "node scripts/check-dist.mjs"
   },
   "devDependencies": {
     "@codemirror/commands": "^6.9.0",

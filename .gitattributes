@@ -1,0 +1,9 @@
+# 按字节校验 / 按字节入库的文件：任何平台都不做换行转换。
+#
+# Windows 版 Git 默认 core.autocrlf=true：全新 checkout 会把这些文件改写成 CRLF，
+#   - vendor 副本的 SHA-256（MANIFEST.json）当场对不上，`npm run check:core` / `npm run build` 失败；
+#   - 构建产物（go:embed 进二进制、用户下载的离线查看器）与仓库里的字节不再一致，
+#     「构建后 git diff --exit-code」也就失去了意义。
+web/src/vendor/** -text
+internal/web/dist/** -text
+viewer/** -text
