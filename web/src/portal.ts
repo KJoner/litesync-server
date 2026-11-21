@@ -730,10 +730,13 @@ export async function renderAccountCenter(host: PortalHost, me: Me, cfg: AuthCon
 		acct.append(link);
 	}
 	if (me.accountConsoleUrl) {
-		const a = h("a", "button", "修改登录密码 / 两步验证 / 登录会话");
+		const a = h("a", "button", "修改登录密码 / 两步验证 / 网页登录");
 		a.href = me.accountConsoleUrl;
 		a.rel = "noopener";
-		acct.append(a, h("p", "muted small", "这些设置在账号中心管理。重置登录密码只恢复账号访问，不能解密忘记了仓库密码的仓库。"));
+		// 账号中心只管浏览器里的登录：它的「退出所有浏览器」不会断开 Obsidian（预发布真机验收，2026-11-22）
+		acct.append(a, h("p", "muted small",
+			"这些设置在账号中心管理。账号中心只列出、只退出浏览器里的登录；已连接的 Obsidian 在下面「已授权的设备」里，" +
+			"要一次断开全部请用「退出所有产品与设备」。重置登录密码只恢复账号访问，不能解密忘记了仓库密码的仓库。"));
 	}
 	main.append(acct);
 
@@ -988,7 +991,7 @@ function openRevocationResult(first: RevocationView): void {
 					extra.push(here);
 				}
 				stepRow(list, "身份中心", ic.state === "pending" ? "进行中" : "没有完成", ic.state === "pending" ? "warn" : "danger",
-					`${IDENTITY_ERRORS[ic.error ?? ""] ?? "没有完成"}。请打开账号中心，在「设备活动」里手动退出其他浏览器的登录。`, extra);
+					`${IDENTITY_ERRORS[ic.error ?? ""] ?? "没有完成"}。请打开账号中心，在「网页登录」（Keycloak 原名「设备活动」）里手动退出其他浏览器的登录。`, extra);
 			}
 		}
 		const peers = current.peers ?? [];
