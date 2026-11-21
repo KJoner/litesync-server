@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/KJoner/litesync-server/internal/api"
 	"github.com/KJoner/litesync-server/internal/db"
@@ -189,12 +190,28 @@ func TestPerAccountRateLimit(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 		return e.do(t, req)
 	}
+	start := time.Now()
 	for i := 0; i < 60; i++ {
 		if r, _ := whoami(alice); r.StatusCode != http.StatusOK {
 			t.Fatalf("request %d within burst = %d", i, r.StatusCode)
 		}
 	}
-	resp, body := whoami(alice)
+	// 令牌每秒回补 1 个：慢的数据库（例如 Windows 上的 Docker PG）跑完上面 60 个请求要几秒，
+	// 这期间回补的令牌数 ≈ 已用秒数。继续请求直到被限流；多放行的次数不得超过回补上限（+1 容错），
+	// 否则就是限流没生效（原来的写法假设 60 个请求在 1 秒内跑完，在慢环境里会误报）
+	var resp *http.Response
+	var body map[string]any
+	extra := 0
+	for {
+		resp, body = whoami(alice)
+		if resp.StatusCode != http.StatusOK || extra > 120 {
+			break
+		}
+		extra++
+	}
+	if allowed := int(time.Since(start).Seconds()) + 1; extra > allowed {
+		t.Fatalf("%d requests beyond the burst were allowed, more than the refill (%d) in %v", extra, allowed, time.Since(start))
+	}
 	if resp.StatusCode != http.StatusTooManyRequests || body["code"] != "RATE_LIMITED" || body["retryable"] != true || resp.Header.Get("Retry-After") == "" {
 		t.Fatalf("over the rate: %d %v Retry-After=%q", resp.StatusCode, body, resp.Header.Get("Retry-After"))
 	}

@@ -38,7 +38,9 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 Windows：`scripts\dev-server.ps1`；`$env:OBSYNC_TOKEN = '...'; go run ./cmd/obsync`。
 
-同一套测试在 PostgreSQL 上再跑一遍（批次 G；CI 的 `test-postgres` job 做同样的事）：
+同一套测试在 PostgreSQL 上再跑一遍（批次 G；CI 的 `go-postgres` job 在 PG 16 与 17.10 上各跑一遍，
+**不允许任何跳过**——`scripts/check-skips.py` 检查 `go test -json` 的输出；SQLite job 只允许跳过原因写着
+`LITESYNC_TEST_PG_DSN` 的 PG 专用用例）：
 
 ```bash
 # 为本次运行建一个 C 排序的独立库，跑完删除；每个测试在里面再用独立 schema
@@ -96,7 +98,10 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/api/vaults_v2.go` + `internal/sync/vault_init.go` + `internal/db/vault_init.go` | 浏览器端加密建库状态机（ADR-012）：`pending_encryption → initializing（10 分钟租约）→ ready`，提交原子、opId 幂等；`readyGate` + `guardWriteReady` 两道写入闸门 |
 | `internal/sync/pairing_v2.go` + `internal/db/enroll_v2.go` | 连接链接 v2（ADR-014）：envelope 读取不消费、显式兑换、exchangeId 加密暂存可续传、公开端点按 IP 限流 |
 | `internal/api/quota.go` + `internal/sync/quota.go` + `internal/db/quota.go` | 0.20 配额与限流：存储配额在 `Upload` 写锁内核算（历史计入）、仓库数、按身份令牌桶 + 上传并发、管理员逐用户覆盖 |
-| `internal/mail/` + `internal/db/mail_outbox.go` | 产品通知邮件（ADR-018）：log/smtp/resend、outbox 幂等与退避、抑制表、按收件人与全局日预算 |
+| `internal/mail/` + `internal/db/mail_outbox.go` | 产品通知邮件（ADR-018）：log/smtp/resend、outbox 幂等与退避、抑制表、按收件人与全局日预算。0.20.1（SV-05）：业务操作在**自己的事务里**写 `security_events`（`db.RecordSecurityEvent`），`sync.Notifier` 只负责 Wake，worker 渲染 / 入队 / 发送并记下每条事件的去向；`ErrOutcomeUnknown` = 已发出没拿到结果（同幂等键重试，`uncertain_attempts` 计数）。SMTP TLS 只认 `mail.ParseTLSMode` 的三个值（SV-04） |
+| `internal/db/revocation.go` + `internal/sync/revocation*.go` + `internal/api/revocation.go` | 0.20.1 账号撤销（ADR-019）：`users.auth_epoch` 代次，**`db.RevokeAccountTx` 是动作 B 的唯一实现**（C 的本产品部分、D、管理员停用、Token 重置、收到的跨产品事件都走它）；凭据 / 授权签发时记**签发者凭据**的代次（`authIdentity.AuthEpoch`），每次校验比较；跨产品事件 outbox 与 B 同一事务、HMAC 接收端 `/api/internal/v1/account-revocations`。**back-channel 永远只是 A**，不得升级为撤销设备 |
+| `internal/api/central.go` | 0.20.1 中心状态检查（ADR-019 §2.5，动作 D）：只读服务账号、60 秒 / 单飞 / 3 秒超时 / 15 分钟宽限；401/403 是配置错误，不是「用户被停用」 |
+| `internal/datalock/` | 0.20.1 数据目录独占锁（SV-03）：服务启动时持有；`migrate-to-pg` 拿不到即拒绝（源库停写的机器检查）。`dbcopy` 的导入与校验在同一个目标事务里，报告 `targetState` |
 | `web/src/vendor/litesync-core/` | 与插件逐字节一致的 crypto-core / merge-core（MANIFEST 校验，`npm run build` 先跑 `check:core`）；**只能用 `web/scripts/vendor-core.mjs` 从插件仓重新生成，手改必失败** |
 | `web/src/write.ts` + `note-editor.ts` + `editor.ts` | 网页写端（ADR-015）：与插件同协议（CAS、世代、operationId、墓碑/恢复），信封不降级，冲突保留双方，加密草稿只存密文；CodeMirror 单独打包 `/editor.js` |
 
@@ -223,7 +228,8 @@ viewer/            自包含单文件离线查看器（用户下载到本地保�
 | `internal/db/dbcopy_test.go` | 跨方言复制：通用填充覆盖**每张表每一列**（新表自动纳入）、发散检测、非空拒绝、旧库拒绝、SQLite→PG→SQLite 往返 |
 | `internal/backup/restore_drill_pg_test.go` | PG 分支灾备演练：真 restic → 全新 PG 实例恢复 → 启动 → 旧设备视角（epoch 旋转、删除不复活）；注入缺失 blob 必须被报告 |
 | `internal/pgdrill/mg03_test.go` | MG-03 离线迁移演练：合成 SQLite（多用户/多仓库/LSM1/checkpoint/配对/身份/outbox）→ PG → 逐项比对 + 越权抽查 + 耗时 |
-| `internal/api/oidc_test.go` | 内嵌模拟身份服务：PKCE、回调重放、登录 CSRF、iss/aud/azp/nonce/exp/未知密钥篡改、注册模式、旧管理员认领、back-channel logout |
+| `internal/api/oidc_test.go` | 内嵌模拟身份服务：PKCE、回调重放、登录 CSRF、iss/aud/azp/nonce/exp/未知密钥篡改、注册模式、旧管理员认领、back-channel logout；0.20.1 起还有 Account REST `DELETE /account/sessions`、管理端 `GET /admin/realms/{realm}/users/{id}`（按 Keycloak 26.8.1 实测建模） |
+| `internal/api/revocation_test.go` + `review_regression_test.go` | ADR-019 §10 矩阵：A 不撤销设备、B/C 全部失效、C 逐项真实状态与重发、接收端签名 / 时间窗 / 去重、D 的 60 秒 / 单飞 / 宽限 / 403、停用与恢复、撤销与兑换并发（两种库）；审查反例转正 |
 | `internal/api/vault_init_test.go` | 建库状态机全周期、v1 兼容、配对 v2 发行/envelope/兑换/重放/撤销、8 路并发兑换只成功 1 个 |
 | `internal/api/web_edit_test.go` / `quota_test.go` | 网页写入闸门（默认只读、同源、只读成员、审计身份）、回收站；配额（原子、历史计入、幂等放行、覆盖值）与限流 |
 | `web/test/*.test.ts`（`cd web && npm test`） | crypto-core 冻结向量对比、网页写端协议层（信封不降级、世代、重试同密文、三方合并、加密草稿隔离、附件命名） |

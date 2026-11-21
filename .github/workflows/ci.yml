@@ -1,31 +1,57 @@
 name: CI
 
+# 门禁（v0.20.1 / 复审 R-E）：任何分支的 push（包括功能分支）与 PR 都跑全部检查。
+# 打 tag 发布镜像走 docker-publish.yml，它自己再跑一遍测试。
 on:
   push:
-    branches: [master]
+    branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  # Go：SQLite 元数据库（默认部署）。PG 专用用例在这里跳过——它们由下面的 PostgreSQL job 负责，
+  # 那边不允许任何跳过。
+  go-sqlite:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # restic：灾备恢复实机演练需要它；没装时那几条演练会跳过（不能拿跳过当通过）
+      - name: Install restic
+        run: sudo apt-get update && sudo apt-get install -y restic
       - name: Vet
         run: go vet ./...
-      - name: Test
-        run: go test ./...
+      - name: Test (SQLite)
+        run: |
+          set -o pipefail
+          go test -count=1 -json ./... | tee go-test-sqlite.json | jq -rj 'select(.Action == "output") | .Output'
+      - name: Only PostgreSQL-only cases may be skipped
+        if: always()
+        # 允许跳过的只有原因里写着「需要 LITESYNC_TEST_PG_DSN」的用例（PG job 会跑它们）；其余任何跳过都算失败
+        run: python3 scripts/check-skips.py go-test-sqlite.json 'LITESYNC_TEST_PG_DSN'
+
       - name: Build
         run: go build ./...
 
-  # 批次 G：同一套测试在 PostgreSQL 上再跑一遍（db.Open 的测试重定向 + 每测试独立 schema）。
-  test-postgres:
+  # Go：真实 PostgreSQL（16 与共享 compose 实际使用的 17.10）。同一套测试在 PG 上再跑一遍
+  # （db.Open 的测试重定向 + 每测试独立 schema）；必须零跳过。
+  go-postgres:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16-alpine", "17.10-alpine"]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.pg }}
         env:
           POSTGRES_PASSWORD: postgres
           # C 排序：与 SQLite 的字节序比较一致（OpenPostgres 拒绝其他排序规则）
@@ -33,12 +59,83 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test on PostgreSQL
+      - name: Install restic and psql
+        run: sudo apt-get update && sudo apt-get install -y restic postgresql-client
+      - name: Create test databases (TEMPLATE template0, C collation)
+        run: |
+          for db in lstest lsrestore; do
+            psql -h localhost -U postgres -v ON_ERROR_STOP=1 -q \
+              -c "CREATE DATABASE $db TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'"
+          done
+          psql -h localhost -U postgres -tAc "select version()"
+      - name: Test on PostgreSQL ${{ matrix.pg }}
         env:
-          LITESYNC_TEST_PG_ADMIN_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
-        run: scripts/test-pg.sh ./...
+          LITESYNC_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/lstest?sslmode=disable
+          # 恢复演练把它当作「全新实例」
+          LITESYNC_TEST_PG_RESTORE_DSN: postgres://postgres:postgres@localhost:5432/lsrestore?sslmode=disable
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 1800s -json ./... | tee go-test-pg.json | jq -rj 'select(.Action == "output") | .Output'
+      - name: No skipped tests on PostgreSQL
+        if: always()
+        # 必需的 PG 用例（跨方言复制、MG-03 演练、PG 恢复演练、迁移失败语义、撤销与兑换并发……）
+        # 不能用 skip 冒充通过：这里一个跳过都不允许
+        run: python3 scripts/check-skips.py go-test-pg.json
+
+  # Web：类型检查、单元测试、构建产物一致性（产物已入库，部署不需要 Node）、真实浏览器 E2E。
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # E2E 要启动真实的服务端
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: npm ci
+        run: npm ci
+      - name: Vendored crypto-core / merge-core unchanged (MANIFEST)
+        run: npm run check:core
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Committed build output matches the sources
+        working-directory: .
+        run: |
+          # 改了 web/ 却没重建（或手改了产物）时这里失败：线上跑的会是旧资产
+          git status --porcelain -- internal/web/dist viewer
+          git diff --exit-code -- internal/web/dist viewer
+          test -z "$(git status --porcelain -- internal/web/dist viewer)"
+      - name: Build the server for E2E
+        working-directory: .
+        run: go build -o "$RUNNER_TEMP/obsync" ./cmd/obsync && echo "OBSYNC_BIN=$RUNNER_TEMP/obsync" >> "$GITHUB_ENV"
+      - name: Install the E2E browser (Playwright Chromium)
+        run: npx playwright install --with-deps chromium
+      - name: Browser E2E
+        run: npm run test:e2e
+      - name: Upload E2E traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-traces
+          path: |
+            web/test-results
+            web/playwright-report
+          if-no-files-found: ignore
