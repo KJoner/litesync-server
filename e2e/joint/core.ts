@@ -101,6 +101,9 @@ try {
 	await n.getByRole("button", { name: "登录或创建账号" }).click();
 	await n.waitForURL((u: URL) => u.href.startsWith(`${KC}/`));
 	await n.locator('#kc-registration a, a[href*="registrations"]').first().click();
+	// v12.0.3 I1：注册填 用户名 / 昵称 / 邮箱（密码在验证邮箱后设置）；姓 / 名只在旧的身份配置里还有
+	if (await n.locator("#username").count()) await n.locator("#username").fill(`dana-${randomBytes(3).toString("hex")}`);
+	if (await n.locator("#nickname").count()) await n.locator("#nickname").fill("达娜");
 	await n.locator("#email").fill(DANA);
 	if (await n.locator("#firstName").count()) await n.locator("#firstName").fill("达娜");
 	if (await n.locator("#lastName").count()) await n.locator("#lastName").fill("测试");
@@ -131,7 +134,7 @@ try {
 		if (req.isNavigationRequest() && req.url().startsWith(KC)) kcHops++;
 	});
 	await l.goto(`${LS}/`);
-	await l.getByRole("link", { name: "登录", exact: true }).click();
+	await l.getByRole("link", { name: "登录账号", exact: true }).click();
 	await l.waitForURL((u: URL) => u.href.startsWith(LS) && !u.pathname.startsWith("/auth/"), { timeout: 30000 });
 	await l.getByRole("heading", { name: "我的仓库" }).waitFor({ timeout: 20000 });
 	const lMe = await pageApi(l, "/api/v2/me");
@@ -184,9 +187,10 @@ try {
 	C("CORE-12", o1.revision === 1 && o1.generation === 1, `revision=${o1.revision} generation=${o1.generation}`);
 
 	// ── 6. 在网页编辑同一篇 Markdown，另一设备收到加密同步结果 ──
-	await l.locator(".vault-card", { hasText: "联合-工作" }).getByRole("button", { name: "解锁并打开" }).click();
-	await l.locator('input[placeholder="仓库密码"]').fill(PW1);
-	await l.getByRole("button", { name: "解锁", exact: true }).click();
+	// UI v2：仓库卡片的主按钮是「打开仓库」，解锁页的密码框是 #vault-password、按钮是「解锁并打开」
+	await l.locator(".vault-card", { hasText: "联合-工作" }).getByRole("button", { name: "打开仓库" }).click();
+	await l.locator("#vault-password").fill(PW1);
+	await l.getByRole("button", { name: "解锁并打开" }).click();
 	await l.locator(".tree").waitFor({ timeout: 60000 });
 	await l.evaluate((p: string) => (location.hash = "#/n/" + encodeURIComponent(p)), NOTE);
 	await l.locator(".edit-bar").waitFor({ timeout: 15000 });
@@ -207,7 +211,7 @@ try {
 	const ctxB = await browser.newContext({ locale: "zh-CN" });
 	const lb = await ctxB.newPage();
 	await lb.goto(`${LS}/`);
-	await lb.getByRole("link", { name: "登录", exact: true }).click();
+	await lb.getByRole("link", { name: "登录账号", exact: true }).click();
 	await kcLogin(lb, erin);
 	await lb.getByRole("heading", { name: "我的仓库" }).waitFor({ timeout: 30000 });
 	const eVaults = await pageApi(lb, "/api/v1/vaults");
@@ -230,7 +234,7 @@ try {
 	rmSync(statePath, { force: true });
 	const l2 = await ctxA2.newPage();
 	await l2.goto(`${LS}/`);
-	await l2.locator('input[placeholder="仓库密码"]').waitFor({ timeout: 30000 });
+	await l2.locator("#vault-password").waitFor({ timeout: 30000 }); // UI v2 解锁页的仓库密码框
 	C("CORE-17", !(await l2.locator("body").innerText()).includes("网页里补的一段"), "需要仓库密码；页面文本里没有笔记明文");
 	await l2.screenshot({ path: `${OUT}/core-04-reopen-needs-unlock.png` });
 
@@ -279,7 +283,7 @@ try {
 	const ctxD = await browser.newContext({ locale: "zh-CN" });
 	const d = await ctxD.newPage();
 	await d.goto(`${LS}/`);
-	await d.getByRole("link", { name: "登录", exact: true }).click();
+	await d.getByRole("link", { name: "登录账号", exact: true }).click();
 	await kcLogin(d, adminClaim.user);
 	await d.waitForURL((u: URL) => u.href.startsWith(LS) && !u.pathname.startsWith("/auth/"), { timeout: 30000 });
 	const dMe = await pageApi(d, "/api/v2/me");

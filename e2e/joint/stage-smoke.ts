@@ -43,15 +43,16 @@ async function loginLiteSync(ctx: any, u: any) {
 	const p = await ctx.newPage();
 	await p.goto(`${LS}/`);
 	if ((await pageApi(p, "/api/v2/me")).status === 200) return p;
-	await p.getByRole("link", { name: "登录", exact: true }).click();
+	await p.getByRole("link", { name: "登录账号", exact: true }).click();
 	await p.waitForURL((x: URL) => x.href.startsWith(KC) || (x.href.startsWith(LS) && !x.pathname.startsWith("/auth/")), { timeout: 45000 });
 	if (p.url().startsWith(KC)) await kcLogin(p, u);
 	await p.waitForURL((x: URL) => x.href.startsWith(LS) && !x.pathname.startsWith("/auth/"), { timeout: 45000 });
 	return p;
 }
 async function createVault(page: any, name: string, password: string) {
-	const first = (await page.getByRole("button", { name: "新建第一个仓库" }).count()) > 0;
-	await page.getByRole("button", { name: first ? "新建第一个仓库" : "新建仓库" }).click();
+	// UI v2：没有仓库时空状态里是「创建第一个仓库」，有仓库时是页头的「新建仓库」
+	const first = (await page.getByRole("button", { name: "创建第一个仓库" }).count()) > 0;
+	await page.getByRole("button", { name: first ? "创建第一个仓库" : "新建仓库" }).click();
 	await page.getByLabel("仓库名称").fill(name);
 	await page.getByRole("button", { name: "下一步" }).click();
 	const pw = page.locator(".dialog input[type=password]");
