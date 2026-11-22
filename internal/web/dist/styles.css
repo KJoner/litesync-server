@@ -1694,3 +1694,44 @@ button.danger-solid:hover:not(:disabled) {
 	color: var(--text);
 	padding: 0 10px;
 }
+
+/* ---------- UI 焕新 U4b ---------- */
+/* W05：工具栏里带 hidden 的按钮真的隐藏（.fmt-bar 的 inline-flex 曾经盖过 hidden，阅读态也露出格式按钮）。 */
+.edit-bar [hidden],
+.save-risk[hidden] {
+	display: none !important;
+}
+/* W05：分栏需要两栏的宽度——放宽正文容器，并收起右侧大纲（手机仍是上下两段）。 */
+.note-wrap:has(.note-editor[data-mode="split"]) {
+	max-width: 1480px;
+}
+@media (min-width: 1101px) {
+	.layout:has(.note-editor[data-mode="split"]) {
+		grid-template-columns: 250px minmax(0, 1fr);
+		grid-template-areas:
+			"header header"
+			"tree content"
+			"footer footer";
+	}
+	.layout:has(.note-editor[data-mode="split"]) > .outline {
+		display: none;
+	}
+}
+/* W06：容量不足是单独的状态；丢失风险单独一行、全文显示（不截断）。 */
+.save-status[data-state="quota"] {
+	color: var(--danger);
+}
+.save-risk {
+	margin: 8px 0 0;
+	padding: 8px 12px;
+	border: 1px solid var(--danger);
+	border-left-width: 4px;
+	border-radius: var(--radius);
+	background: var(--danger-bg);
+	color: var(--text);
+	line-height: 1.6;
+	overflow-wrap: anywhere;
+}
+.save-risk button {
+	margin-left: 4px;
+}

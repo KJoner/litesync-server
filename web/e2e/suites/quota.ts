@@ -38,7 +38,7 @@ await new Suite().run(async (s) => {
 		await page.locator(".edit-notice .banner", { hasText: "存储配额" }).waitFor({ timeout: 20000 });
 		const notice = (await page.locator(".edit-notice .banner").textContent()) ?? "";
 		await s.shot(page, "q01-quota-exceeded");
-		s.check("超出配额：编辑器说明原因、给出上限，并说明修改已加密保存在本机", notice.includes("上限") && notice.includes("本机") && (await page.locator(".save-status").getAttribute("data-state")) === "error", notice);
+		s.check("超出配额：编辑器说明原因、给出上限，并说明修改已加密保存在本机；状态是单独的「容量不足」", notice.includes("上限") && notice.includes("本机") && (await page.locator(".save-status").getAttribute("data-state")) === "quota" && ((await page.locator(".save-status").textContent()) ?? "").includes("容量不足"), notice);
 		const editorHas = await page.evaluate(() => Array.from(document.querySelectorAll(".cm-line")).some((l) => (l.textContent ?? "").includes("很长的一段。")));
 		s.check("被拒的修改仍在编辑器里（不丢草稿）", editorHas);
 

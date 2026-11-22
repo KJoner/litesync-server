@@ -69,7 +69,7 @@ export interface NoteEditorHost {
 }
 
 type Mode = "read" | "edit" | "split";
-type SaveState = "clean" | "dirty" | "drafted" | "uploading" | "synced" | "offline" | "conflict" | "auth" | "locked" | "error";
+type SaveState = "clean" | "dirty" | "drafted" | "uploading" | "synced" | "offline" | "conflict" | "quota" | "auth" | "locked" | "error";
 
 const LABEL: Record<SaveState, string> = {
 	clean: "未修改",
@@ -79,6 +79,7 @@ const LABEL: Record<SaveState, string> = {
 	synced: "已同步",
 	offline: "离线，待同步",
 	conflict: "有冲突，需要处理",
+	quota: "容量不足，未上传",
 	auth: "登录已过期，请重新登录",
 	locked: "已锁定",
 	error: "保存失败",
@@ -162,6 +163,10 @@ export class NoteEditor {
 	private readonly editorEl: HTMLElement;
 	private readonly toolbarEl: HTMLElement;
 	private readonly noticeEl: HTMLElement;
+	private readonly saveBtn: HTMLButtonElement;
+	/** 丢失风险的完整说明（草稿没落盘、只在本页内存）：单独一行全文显示，不挤在会被截断的状态文字里。 */
+	private readonly riskEl: HTMLElement;
+	private riskText = "";
 
 	constructor(
 		private root: HTMLElement,
@@ -228,11 +233,15 @@ export class NoteEditor {
 		save.textContent = "保存";
 		save.title = "保存（Ctrl/⌘+S）";
 		save.onclick = () => void this.saveNow();
+		this.saveBtn = save;
 		this.statusEl = document.createElement("span");
 		this.statusEl.className = "save-status";
 		this.statusEl.setAttribute("role", "status");
 		this.statusEl.setAttribute("aria-live", "polite");
 		bar.append(modes, this.toolbarEl, this.statusEl, save);
+		this.riskEl = document.createElement("div");
+		this.riskEl.className = "save-risk";
+		this.riskEl.hidden = true;
 		this.noticeEl = document.createElement("div");
 		this.noticeEl.className = "edit-notice";
 		this.bodyEl = document.createElement("div");
@@ -242,7 +251,7 @@ export class NoteEditor {
 		this.previewEl = document.createElement("div");
 		this.previewEl.className = "markdown-body preview-pane";
 		this.bodyEl.append(this.editorEl, this.previewEl);
-		root.append(bar, this.noticeEl, this.bodyEl);
+		root.append(bar, this.riskEl, this.noticeEl, this.bodyEl);
 		this.host.renderPreview(this.previewEl, original);
 		this.render();
 		// 打开时（阅读模式也一样）就检查本机草稿：用户不必先点「编辑」才知道有未同步的修改
@@ -294,11 +303,40 @@ export class NoteEditor {
 		const volatile = this.host.draftsVolatile?.() === true;
 		let text = this.state === "drafted" && volatile ? "已暂存在本页内存，等待同步" : LABEL[this.state];
 		if (this.state === "synced" && this.lastSyncedAt) text += " " + hhmmss(this.lastSyncedAt);
-		if ((this.state === "drafted" || this.state === "offline") && this.drafted && !volatile) text += `（本机草稿 ${hhmmss(this.drafted.at)}）`;
+		if ((this.state === "drafted" || this.state === "offline" || this.state === "quota") && this.drafted && !volatile) text += `（本机草稿 ${hhmmss(this.drafted.at)}）`;
 		if (this.draftFailed) text += " · 本机草稿保存失败";
-		else if (volatile && this.state !== "clean" && this.state !== "synced") text += " · 浏览器不允许持久存储，刷新或关闭页面即丢失";
+		else if (volatile && this.state !== "clean" && this.state !== "synced") text += " · 只在本页内存";
 		this.statusEl.textContent = text;
+		this.statusEl.title = text;
 		this.statusEl.dataset.state = this.state;
+		// 阅读态没有可保存的内容时（UI 焕新 W05）：不摆「保存」主按钮，也不写「未修改」；
+		// 有没同步的修改（切回阅读也算）时照常显示，随时可以保存或重试
+		const idle = this.state === "clean" || this.state === "synced";
+		this.saveBtn.hidden = this.mode === "read" && idle;
+		this.statusEl.hidden = this.mode === "read" && this.state === "clean";
+		this.renderRisk(volatile);
+	}
+
+	/** 丢失风险全文（W06）：只在文字变化时重写，免得读屏反复播报同一句。 */
+	private renderRisk(volatile: boolean): void {
+		const dirty = this.dirty;
+		const risk = this.draftFailed && dirty
+			? "本机草稿保存失败：这些修改目前只在编辑器里，关闭或刷新页面就会丢失。网络和存储恢复后会照常保存；也可以先导出一份。"
+			: volatile && dirty
+				? "浏览器不允许持久存储（例如隐私模式）：没同步的修改只在这个页面的内存里，关闭或刷新页面就会丢失。"
+				: "";
+		if (risk === this.riskText) return;
+		this.riskText = risk;
+		this.riskEl.innerHTML = "";
+		this.riskEl.hidden = !risk;
+		if (!risk) return;
+		this.riskEl.setAttribute("role", this.draftFailed ? "alert" : "status");
+		const exp = document.createElement("button");
+		exp.type = "button";
+		exp.className = "small-btn";
+		exp.textContent = "导出为文件";
+		exp.onclick = () => this.exportText();
+		this.riskEl.append(document.createTextNode(risk), " ", exp);
 	}
 
 	private setState(s: SaveState): void {
@@ -558,7 +596,7 @@ export class NoteEditor {
 				await this.resolveConflict(snap, out.deleted);
 				return;
 			case "rejected":
-				this.setState("error");
+				this.setState(out.code === "QUOTA_EXCEEDED" ? "quota" : "error");
 				this.notice(this.rejectText(out.code, out.message, out.details), "danger");
 				return;
 		}
