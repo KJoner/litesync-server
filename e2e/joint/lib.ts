@@ -149,9 +149,9 @@ export async function kcLogin(page: any, user: { email: string; password: string
 }
 export async function loginNexus(ctx: any, user: any) {
 	const p = await ctx.newPage();
-	await p.goto(`${NX}/`);
+	await p.goto(`${NX}/account/connect`);
 	if ((await pageApi(p, "/api/v2/me", {}, true)).status === 200) return p; // 已登录
-	await p.getByRole("button", { name: "使用统一账号登录" }).click();
+	await p.getByRole("button", { name: "登录或创建账号" }).click();
 	await p.waitForURL((u: URL) => u.href.startsWith(KC) || (u.href.startsWith(NX) && !u.pathname.startsWith("/auth/")), { timeout: 30000 });
 	if (p.url().startsWith(KC)) await kcLogin(p, user);
 	await p.waitForURL((u: URL) => u.href.startsWith(NX) && !u.pathname.startsWith("/auth/"), { timeout: 30000 });

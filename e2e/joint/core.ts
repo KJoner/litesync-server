@@ -97,8 +97,8 @@ try {
 	// ── 1. 新用户从 Nexus 注册并验证邮箱 ──
 	const ctxA = await browser.newContext({ locale: "zh-CN", viewport: { width: 1280, height: 860 } });
 	const n = await ctxA.newPage();
-	await n.goto(`${NX}/`);
-	await n.getByRole("button", { name: "使用统一账号登录" }).click();
+	await n.goto(`${NX}/account/connect`);
+	await n.getByRole("button", { name: "登录或创建账号" }).click();
 	await n.waitForURL((u: URL) => u.href.startsWith(`${KC}/`));
 	await n.locator('#kc-registration a, a[href*="registrations"]').first().click();
 	await n.locator("#email").fill(DANA);
@@ -215,8 +215,8 @@ try {
 	const eKey = await pageApi(lb, "/api/v1/vault-key", { headers: { "X-Vault-ID": v1.id } });
 	C("CORE-15", (eVaults.body?.vaults ?? []).length === 0 && eSnap.status === 404 && eKey.status === 404, `vaults=${(eVaults.body?.vaults ?? []).length} snapshot=${eSnap.status} vault-key=${eKey.status}`);
 	const nb = await ctxB.newPage();
-	await nb.goto(`${NX}/`);
-	await nb.getByRole("button", { name: "使用统一账号登录" }).click();
+	await nb.goto(`${NX}/account/connect`);
+	await nb.getByRole("button", { name: "登录或创建账号" }).click();
 	await nb.waitForURL((u: URL) => u.href.startsWith(NX) && !u.pathname.startsWith("/auth/"), { timeout: 30000 });
 	const eItems = await pageApi(nb, "/api/v2/items", {}, true);
 	C("CORE-16", eItems.status === 200 && !(eItems.body?.items ?? []).some((i: any) => i.url === NEXUS_ITEM_URL), `items ${eItems.status}`);

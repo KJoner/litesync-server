@@ -31,9 +31,9 @@ const pageApi = (page: any, path: string, init: any = {}, nexus = false) => page
 async function kcLogin(p: any, u: any) { await p.locator("#username").fill(u.email); await p.locator("#password").fill(u.password); await p.locator("[type=submit]").first().click(); }
 async function loginNexus(ctx: any, u: any) {
 	const p = await ctx.newPage();
-	await p.goto(`${NX}/`);
+	await p.goto(`${NX}/account/connect`);
 	if ((await pageApi(p, "/api/v2/me", {}, true)).status === 200) return p;
-	await p.getByRole("button", { name: "使用统一账号登录" }).click();
+	await p.getByRole("button", { name: "登录或创建账号" }).click();
 	await p.waitForURL((x: URL) => x.href.startsWith(KC) || (x.href.startsWith(NX) && !x.pathname.startsWith("/auth/")), { timeout: 45000 });
 	if (p.url().startsWith(KC)) await kcLogin(p, u);
 	await p.waitForURL((x: URL) => x.href.startsWith(NX) && !x.pathname.startsWith("/auth/"), { timeout: 45000 });
@@ -116,8 +116,8 @@ try {
 	const controlled = await nA.evaluate(async () => { await navigator.serviceWorker.ready; const t0 = Date.now(); while (!navigator.serviceWorker.controller && Date.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 300)); return !!navigator.serviceWorker.controller; }).catch(() => false);
 	check("SW-1", "Nexus 页面已被 Service Worker 接管", controlled);
 	const outA = await pageApi(nA, "/api/auth/logout", { method: "POST" }, true);
-	await nA.goto(`${NX}/`);
-	await nA.getByRole("button", { name: "使用统一账号登录" }).click();
+	await nA.goto(`${NX}/account/connect`);
+	await nA.getByRole("button", { name: "登录或创建账号" }).click();
 	await nA.waitForURL((x: URL) => x.href.startsWith(NX) && !x.pathname.startsWith("/auth/"), { timeout: 45000 }).catch(() => undefined);
 	check("SW-2", "SW 接管后退出再登录：/auth/* 走网络、回到 Nexus 且已登录", outA.status < 400 && (await pageApi(nA, "/api/v2/me", {}, true)).status === 200, nA.url());
 
@@ -154,8 +154,8 @@ try {
 	const idcIn = await waitFor(async () => (await pageApi(nA2, "/api/v2/me", {}, true)).status === 401, 30000);
 	check("C-4", "A 另一个浏览器里的 Nexus 会话结束", idcIn !== null, idcIn === null ? "超时" : `${idcIn} ms`);
 	const p2 = await ctxA2.newPage();
-	await p2.goto(`${NX}/`);
-	await p2.getByRole("button", { name: "使用统一账号登录" }).click();
+	await p2.goto(`${NX}/account/connect`);
+	await p2.getByRole("button", { name: "登录或创建账号" }).click();
 	await p2.waitForURL((x: URL) => x.href.startsWith(KC) || x.href.startsWith(NX), { timeout: 45000 });
 	await sleep(1500);
 	check("C-5", "A 另一个浏览器再次登录必须重新输入密码（账号中心会话已结束）", p2.url().startsWith(KC) && (await p2.locator("#password").count()) > 0, p2.url().slice(0, 60));
