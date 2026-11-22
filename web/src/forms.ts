@@ -1,4 +1,4 @@
-import { openDialog } from "./portal";
+import { openDialog } from "./dialog";
 
 /**
  * 笔记的新建 / 重命名 / 移动到 / 删除（UI 焕新 U4，审查 03）：产品内的对话框代替浏览器原生

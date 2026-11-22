@@ -33,12 +33,15 @@ import {
 	unlockVaultKey,
 	VaultKeyDoc,
 } from "./vendor/litesync-core/crypto/crypto";
+import { openDialog } from "./dialog";
 
 export interface PortalHost {
 	root: HTMLElement;
 	/** 进入某个仓库的笔记工作台（preset：刚建库时手里已有的密钥，免得立刻再输一次密码）。 */
 	openVault(vaultId: string, preset?: { doc: VaultKeyDoc; vmk: CryptoKey }): void;
 	toggleTheme(): void;
+	/** 这个浏览器上次打开的仓库（W03：从工作台离开后回来，一眼找到继续的入口）。 */
+	lastVault?(): string;
 }
 
 // ---------------------------------------------------------------- 小工具
@@ -124,55 +127,7 @@ function newId(prefix: string): string {
 	return prefix + "_" + Array.from(randomBytes(12)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** 模态对话框：焦点进入、Esc 关闭并把焦点还给触发按钮（UI 规格 §6「焦点」）。 */
-export function openDialog(title: string, onClose?: () => void): { body: HTMLElement; close: (silent?: boolean) => void; setTitle: (t: string) => void } {
-	const opener = document.activeElement as HTMLElement | null;
-	const backdrop = h("div", "dialog-backdrop");
-	const dlg = h("div", "dialog");
-	dlg.setAttribute("role", "dialog");
-	dlg.setAttribute("aria-modal", "true");
-	const head = h("div", "dialog-head");
-	const t = h("h2", "dialog-title", title);
-	t.id = "dlg-" + Math.random().toString(36).slice(2);
-	dlg.setAttribute("aria-labelledby", t.id);
-	const x = button("✕", "icon-btn dialog-close", () => close());
-	x.setAttribute("aria-label", "关闭");
-	head.append(t, x);
-	const body = h("div", "dialog-body");
-	dlg.append(head, body);
-	backdrop.append(dlg);
-	document.body.append(backdrop);
-	let closed = false;
-	const onKey = (e: KeyboardEvent) => {
-		if (e.key === "Escape") close();
-		if (e.key === "Tab") {
-			// 简单的焦点陷阱：Tab 不离开对话框
-			const f = Array.from(dlg.querySelectorAll<HTMLElement>("button,input,select,textarea,a[href]")).filter((n) => !n.hasAttribute("disabled"));
-			if (f.length === 0) return;
-			const first = f[0], last = f[f.length - 1];
-			if (e.shiftKey && document.activeElement === first) {
-				last.focus();
-				e.preventDefault();
-			} else if (!e.shiftKey && document.activeElement === last) {
-				first.focus();
-				e.preventDefault();
-			}
-		}
-	};
-	document.addEventListener("keydown", onKey);
-	/** silent：只关窗，不触发 onClose（例如关窗后立刻切到别的页面，不能再回头重绘列表）。 */
-	const close = (silent = false) => {
-		if (closed) return;
-		closed = true;
-		document.removeEventListener("keydown", onKey);
-		backdrop.remove();
-		if (silent) return;
-		onClose?.();
-		opener?.focus?.();
-	};
-	setTimeout(() => (dlg.querySelector<HTMLElement>("input,button.primary,button") ?? x).focus(), 0);
-	return { body, close, setTitle: (s) => (t.textContent = s) };
-}
+export { openDialog };
 
 // ---------------------------------------------------------------- 外框
 
@@ -323,6 +278,7 @@ function vaultCard(host: PortalHost, me: Me, v: VaultCard): HTMLElement {
 	const card = h("article", "vault-card");
 	const top = h("div", "vault-card-top");
 	top.append(h("h3", "vault-name", v.name || v.id), stateChip(v));
+	if (v.initState === "ready" && host.lastVault?.() === v.id) top.append(h("span", "chip", "上次打开"));
 	card.append(top);
 	card.append(h("p", "muted small", v.initState === "ready"
 		? `${v.fileCount} 个文件 · ${fmtBytes(v.bytesUsed)} · ${fmtWhen(v.updatedAt)}`

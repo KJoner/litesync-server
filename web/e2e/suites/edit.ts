@@ -318,6 +318,8 @@ await new Suite().run(async (s) => {
 		confirms.length = 0;
 		const downloadP = page.waitForEvent("download", { timeout: 20000 });
 		await page.getByRole("button", { name: "我的仓库" }).click();
+		// UI 焕新 W03：离开工作台之前先说明会锁定（已解锁的加密仓库）
+		await page.getByRole("dialog").getByRole("button", { name: "锁定并前往" }).click();
 		const download = await downloadP;
 		const exported = readFileSync((await download.path())!, "utf8");
 		s.check("离开前先提示，并把未保存的内容导出为 Markdown 文件", confirms.some((m) => m.includes("没能加密保存到本机")) && exported.includes("（切库前未保存）") && download.suggestedFilename() === "改名后.md", download.suggestedFilename());
