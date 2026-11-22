@@ -1865,3 +1865,30 @@ button.drawer-item:focus-visible {
 	color: var(--muted);
 	cursor: pointer;
 }
+
+/* 登录页与登录没完成的页面（U3 未完成项）：与账号中心主题同一套说法 */
+.login-title {
+	margin: 4px 0 0;
+	font-size: 22px;
+}
+.center-card .login-title + .muted {
+	margin-top: 0;
+}
+/* W10：连接设备——过期 / 用过的链接收起二维码与复制；复制失败时的手动说明 */
+.qr-wrap.expired canvas {
+	opacity: 0.12;
+	filter: grayscale(1);
+}
+.copy-note:empty {
+	display: none;
+}
+.warn-text {
+	color: var(--warn);
+}
+a.button[aria-disabled="true"] {
+	opacity: 0.55;
+	pointer-events: none;
+}
+.connect-actions {
+	justify-content: flex-start;
+}

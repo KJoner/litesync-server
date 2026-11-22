@@ -169,25 +169,34 @@ export function renderLoginPage(host: PortalHost, cfg: AuthConfig, error?: strin
 	const wrap = h("div", "center-screen");
 	const card = h("div", "center-card login-card");
 	card.append(h("div", "brand", "◈ LiteSync"));
-	card.append(h("p", "muted", "端到端加密的笔记同步。每个仓库都用你自己设置的仓库密码在本机加密。"));
 	const invite = new URLSearchParams(location.search).get("invite") ?? "";
 	const errEl = h("p", "error", error ?? "");
 	errEl.setAttribute("role", "alert");
 
 	if (cfg.oidc) {
+		// 与账号中心主题同一套说法（U3）：登录你的账号 / 一个账号可用于 LiteSync 和 Nexus；
+		// 注册按真实的开放状态说清楚，不摆一个点了也注册不成的按钮（只改展示，登录流程不变）
+		card.append(h("h1", "login-title", "登录你的账号"), h("p", "muted", "一个账号可用于 LiteSync 和 Nexus。"));
 		const q = new URLSearchParams({ returnTo: "/#/vaults" });
 		if (invite) q.set("invite", invite);
 		const signIn = h("a", "button primary block", "登录");
 		signIn.href = "/auth/login?" + q.toString();
 		card.append(signIn);
-		if (cfg.registrationMode !== "closed") {
-			const rq = new URLSearchParams(q);
-			rq.set("intent", "register");
-			const reg = h("a", "button block", cfg.registrationMode === "invite" && !invite ? "使用邀请注册" : "注册新账号");
+		const rq = new URLSearchParams(q);
+		rq.set("intent", "register");
+		if (cfg.registrationMode === "open" || (cfg.registrationMode === "invite" && invite)) {
+			if (invite) card.append(h("p", "muted small", "你收到了邀请：用这个页面创建账号，之后就能新建仓库、连接 Obsidian。"));
+			const reg = h("a", "button block", invite ? "用邀请创建账号" : "创建账号");
 			reg.href = "/auth/login?" + rq.toString();
 			card.append(reg);
+		} else if (cfg.registrationMode === "invite") {
+			card.append(h("p", "muted small", "LiteSync 目前只接受邀请注册：请用收到的邀请链接打开这个页面。已经有账号的，直接登录。"));
+		} else {
+			card.append(h("p", "muted small", "LiteSync 暂未开放注册。已经有账号的，直接登录。"));
 		}
-		card.append(h("p", "muted small", "登录与注册由账号中心完成；LiteSync 不会看到你的登录密码。登录后仍需输入各仓库的仓库密码才能解密笔记。"));
+		card.append(h("p", "muted small", "登录与注册在账号中心完成，LiteSync 看不到你的账号密码。登录后，打开每个仓库还要输入它的仓库密码——它和账号密码不是同一个。"));
+	} else {
+		card.append(h("p", "muted", "端到端加密的笔记同步。每个仓库都用你自己设置的仓库密码在本机加密。"));
 	}
 	if (cfg.legacyTokenLogin) {
 		const box = cfg.oidc ? h("details", "legacy-login") : h("div", "legacy-login");
@@ -582,92 +591,158 @@ function scopeLabels(): string {
 	return "同步笔记与附件、创建分享链接、管理加密密钥、为本仓库添加新设备";
 }
 
+/**
+ * 连接 Obsidian（配对 v2，ADR-014）。UI 焕新 U4b / W10：同设备直接「在 Obsidian 中打开」，跨设备扫码或复制；
+ * 复制失败时选中链接让人手动复制；过期后原位「重新生成」（调用同一个创建接口）。
+ * 链接的语义一律不变：5 分钟、只能用一次、关闭窗口即作废尚未使用的链接——这里只是把规则写在动作旁边。
+ */
 export async function openConnectDialog(me: Me, vault: Pick<VaultCard, "id" | "name">): Promise<void> {
+	const vaultName = vault.name || "默认仓库";
 	let pairId = "";
 	let alive = true;
 	let timer = 0;
-	const dlg = openDialog(`连接到「${vault.name}」`, () => {
+	const revoke = (id: string) => void accountApi.deletePairing(vault.id, id).catch(() => undefined);
+	const dlg = openDialog(`连接到「${vaultName}」`, () => {
 		alive = false;
 		window.clearInterval(timer);
 		// 关闭窗口即撤销尚未兑换的链接（与插件「添加新设备」一致）
-		if (pairId) void accountApi.deletePairing(vault.id, pairId).catch(() => undefined);
+		if (pairId) revoke(pairId);
 	});
-	dlg.body.append(h("p", "muted", "正在生成一次性连接链接…"));
-	let grant: PairingGrantResp;
-	let url = "";
-	try {
-		grant = await accountApi.pairingGrant(vault.id);
-		const secret = randomBytes(32);
-		const config = {
-			v: 2,
-			serverUrl: location.origin,
-			enrollmentSecret: grant.enrollmentSecret,
-			selectedVault: grant.vault,
-			accountLabel: grant.accountLabel,
-			protocolVersion: grant.protocolVersion,
-			requiredCapabilities: grant.requiredCapabilities,
-			trust: grant.trust,
-		};
-		const ciphertext = await encryptPairingPackage(secret, config);
-		const up = await accountApi.uploadPairing(vault.id, grant.grantId, ciphertext);
-		pairId = up.pairId;
-		url = `${location.origin}/p/${pairId}#secret=${b64urlEncode(secret)}`;
-		secret.fill(0);
-	} catch (e) {
-		dlg.body.innerHTML = "";
-		dlg.body.append(h("div", "banner danger", "生成连接链接失败：" + errText(e)));
-		return;
-	}
-	if (!alive) return;
-	dlg.body.innerHTML = "";
-	const facts = h("dl", "facts");
-	for (const [k, v] of [
-		["服务器", location.host],
-		["账号", grant.accountLabel || me.account.email],
-		["仓库", grant.vault.displayName || vault.name],
-		["新设备将获得", scopeLabels()],
-	]) {
-		facts.append(h("dt", "", k), h("dd", "", v));
-	}
-	const qrWrap = h("div", "qr-wrap");
-	qrWrap.append(qrCanvas(url));
-	const link = h("input", "link-input");
-	link.readOnly = true;
-	link.value = url;
-	link.setAttribute("aria-label", "连接链接");
-	link.onclick = () => link.select();
-	const copy = button("复制链接", "primary", () => {
-		void navigator.clipboard.writeText(url).then(() => (copy.textContent = "已复制 ✓"), () => link.select());
-	});
-	const status = h("p", "muted small");
-	status.setAttribute("aria-live", "polite");
-	const trustNote = grant.trust.mode === "new_vault_genesis"
-		? "这是一个新仓库：新设备会从空白状态开始，不需要继承任何历史信任。"
-		: "首次信任：新设备会信任服务器当前提供的历史起点（与在插件里手动连接时相同）。如需从已信任的设备转移信任，请在那台设备的插件里「添加新设备」。";
-	dlg.body.append(
-		h("p", "", "在新设备上用系统相机扫码（或打开链接），按提示在 Obsidian 中导入；之后输入这个仓库的仓库密码即可开始同步。"),
-		facts, qrWrap, link, h("div", "dialog-actions"),
-		h("p", "muted small", "链接 5 分钟内有效、只能使用一次，关闭本窗口即作废；链接里不包含你的账号密码、仓库密码或任何长期凭据。需要 LiteSync 插件 0.20 或更高版本。"),
-		h("p", "muted small", trustNote), status,
-	);
-	dlg.body.querySelector(".dialog-actions")!.append(copy);
-	const tick = async () => {
-		const left = Math.max(0, grant.expiresAt - Math.floor(Date.now() / 1000));
-		if (left === 0) {
-			status.textContent = "链接已过期。关闭窗口后可以重新生成。";
-			window.clearInterval(timer);
-			return;
-		}
-		if (left % 5 === 0 && !(await accountApi.pairingAlive(pairId).catch(() => true))) {
-			status.textContent = "链接已被使用（或已失效）。新设备接入后会出现在「账号与设备」里。";
+	// 手机 / 平板（粗指针）：多半就是要在这台设备上打开；电脑上多半是给手机扫码
+	const touch = window.matchMedia?.("(pointer: coarse)").matches ?? false;
+
+	const generate = async (): Promise<void> => {
+		window.clearInterval(timer);
+		if (pairId) {
+			revoke(pairId); // 重新生成：上一条（过期 / 用过）作废，与关窗同一规则
 			pairId = "";
-			window.clearInterval(timer);
+		}
+		dlg.body.innerHTML = "";
+		dlg.body.append(h("p", "muted", "正在生成一次性连接链接…"));
+		let grant: PairingGrantResp;
+		let url = "";
+		let deep = "";
+		try {
+			grant = await accountApi.pairingGrant(vault.id);
+			const secret = randomBytes(32);
+			const config = {
+				v: 2,
+				serverUrl: location.origin,
+				enrollmentSecret: grant.enrollmentSecret,
+				selectedVault: grant.vault,
+				accountLabel: grant.accountLabel,
+				protocolVersion: grant.protocolVersion,
+				requiredCapabilities: grant.requiredCapabilities,
+				trust: grant.trust,
+			};
+			const ciphertext = await encryptPairingPackage(secret, config);
+			const up = await accountApi.uploadPairing(vault.id, grant.grantId, ciphertext);
+			const s64 = b64urlEncode(secret);
+			secret.fill(0);
+			if (!alive) {
+				revoke(up.pairId); // 生成期间窗口已经关了：这条链接没人看见，按「关窗即作废」立刻撤销
+				return;
+			}
+			pairId = up.pairId;
+			url = `${location.origin}/p/${pairId}#secret=${s64}`;
+			// 与扫码落地页（/p/…）交给 Obsidian 的深链完全相同，只是省掉落地页这一步
+			deep = "obsidian://litesync-import?server=" + encodeURIComponent(location.origin) + "&id=" + encodeURIComponent(pairId) + "&secret=" + encodeURIComponent(s64);
+		} catch (e) {
+			if (!alive) return;
+			dlg.body.innerHTML = "";
+			dlg.body.append(h("div", "banner danger", "生成连接链接失败：" + errText(e)));
+			const retry = h("div", "dialog-actions");
+			retry.append(button("重试", "primary", () => void generate()));
+			dlg.body.append(retry);
 			return;
 		}
-		status.textContent = `剩余有效时间 ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+		dlg.body.innerHTML = "";
+		const facts = h("dl", "facts");
+		for (const [k, v] of [
+			["服务器", location.host],
+			["账号", grant.accountLabel || me.account.email],
+			["仓库", grant.vault.displayName || vaultName],
+			["新设备将获得", scopeLabels()],
+		]) {
+			facts.append(h("dt", "", k), h("dd", "", v));
+		}
+		const qrWrap = h("div", "qr-wrap");
+		qrWrap.append(qrCanvas(url));
+		const link = h("input", "link-input");
+		link.readOnly = true;
+		link.value = url;
+		link.setAttribute("aria-label", "连接链接");
+		link.onclick = () => link.select();
+		const copyNote = h("p", "muted small copy-note");
+		copyNote.setAttribute("aria-live", "polite");
+		const manualCopy = (why: string) => {
+			link.focus();
+			link.select();
+			copyNote.className = "warn-text small copy-note";
+			copyNote.textContent = `${why}链接已经选中，请按 Ctrl+C（Mac 上 ⌘+C；手机上长按选择「拷贝」）。`;
+		};
+		const copy = button("复制链接", touch ? "" : "primary", () => {
+			if (!navigator.clipboard?.writeText) return manualCopy("这个浏览器不能直接复制：");
+			void navigator.clipboard.writeText(url).then(() => {
+				copy.textContent = "已复制 ✓";
+				copyNote.className = "muted small copy-note";
+				copyNote.textContent = "已复制。把它发到新设备上打开，或者粘贴到那台设备的 LiteSync 插件里。";
+			}, () => manualCopy("浏览器没有允许复制："));
+		});
+		const open = h("a", touch ? "button primary" : "button", "在 Obsidian 中打开");
+		open.href = deep;
+		open.title = "这台设备装了 Obsidian 与 LiteSync 插件时，直接在这里接入";
+		const status = h("p", "muted small");
+		status.setAttribute("aria-live", "polite");
+		const trustNote = grant.trust.mode === "new_vault_genesis"
+			? "这是一个新仓库：新设备会从空白状态开始，不需要继承任何历史信任。"
+			: "首次信任：新设备会信任服务器当前提供的历史起点（与在插件里手动连接时相同）。如需从已信任的设备转移信任，请在那台设备的插件里「添加新设备」。";
+		const actions = h("div", "dialog-actions connect-actions");
+		actions.append(touch ? open : copy, touch ? copy : open);
+		dlg.body.append(
+			h("p", "", touch
+				? "在这台设备上：点「在 Obsidian 中打开」。要连接另一台设备：用那台设备扫码，或者把链接发过去打开。之后输入这个仓库的仓库密码即可开始同步。"
+				: "连接另一台设备：用它的相机扫码，或者复制链接发过去打开。这台电脑上装了 Obsidian：直接点「在 Obsidian 中打开」。之后输入这个仓库的仓库密码即可开始同步。"),
+			facts, qrWrap, link, actions, copyNote,
+			h("p", "muted small", "链接 5 分钟内有效，只能使用一次。新设备完成接入之前请不要关闭这个窗口：关闭会立即作废还没用过的链接。链接里不包含你的账号密码、仓库密码或任何长期凭据。需要 LiteSync 插件 0.20 或更高版本。"),
+			h("p", "muted small", trustNote), status,
+		);
+		/** 链接不能再用（过期 / 已被使用）：收起复制与打开，给出下一步。 */
+		const finished = (msg: string, again: string) => {
+			window.clearInterval(timer);
+			status.className = "warn-text small";
+			status.textContent = msg;
+			qrWrap.classList.add("expired");
+			qrWrap.setAttribute("aria-hidden", "true");
+			link.disabled = true;
+			copy.disabled = true;
+			open.removeAttribute("href");
+			open.setAttribute("aria-disabled", "true");
+			copyNote.textContent = "";
+			actions.innerHTML = "";
+			const regen = button(again, "primary", () => void generate());
+			actions.append(button("完成", "ghost", () => dlg.close()), regen);
+			regen.focus();
+		};
+		const tick = async () => {
+			if (!alive) return;
+			const left = Math.max(0, grant.expiresAt - Math.floor(Date.now() / 1000));
+			if (left === 0) {
+				finished("链接已过期：为了安全，连接链接只有 5 分钟有效。", "重新生成");
+				return;
+			}
+			if (left % 5 === 0 && !(await accountApi.pairingAlive(pairId).catch(() => true))) {
+				pairId = "";
+				finished("链接已被使用（或已失效）。新设备接入后会出现在「账号与设备」里。", "再连接一台设备");
+				return;
+			}
+			status.className = "muted small";
+			status.textContent = `剩余有效时间 ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+		};
+		void tick();
+		timer = window.setInterval(() => void tick(), 1000);
 	};
-	void tick();
-	timer = window.setInterval(() => void tick(), 1000);
+	await generate();
 }
 
 function qrCanvas(text: string): HTMLCanvasElement {

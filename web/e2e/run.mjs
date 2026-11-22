@@ -50,6 +50,7 @@ const SUITES = [
 	{ name: "w4-restore", file: "suites/w4-restore.ts", server: "editing", plugin: true, expect: 22, desc: "W4：回收站恢复断网/401/额度/刷新后可继续完成，HEAD 始终一致" },
 	{ name: "w5-meta-trash", file: "suites/w5-meta-trash.ts", server: "editing", plugin: false, expect: 14, desc: "W5：路径加密仓库回收站解密原路径并恢复（改名后删除、重名、旧墓碑、历史清理、新设备）" },
 	{ name: "w6-bytes", file: "suites/w6-bytes.ts", server: "editing", plugin: true, expect: 18, desc: "W6：CRLF/混合换行/BOM/emoji 的工具栏操作与无编辑不改字节" },
+	{ name: "u4b-ui", file: "suites/u4b-ui.ts", server: "editing", plugin: true, expect: 30, desc: "UI 焕新 U4b：阅读态与保存状态、新笔记首次保存后的菜单、抽屉键盘、当前仓库、离开说明、低频操作表单、连接设备、登录页注册状态" },
 ];
 
 function fail(msg, code = 2) {

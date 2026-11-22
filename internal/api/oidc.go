@@ -240,9 +240,28 @@ func writePage(w http.ResponseWriter, status int, title, body string) {
 		html.EscapeString(title), body)
 }
 
+// authErrorPage 登录没走完时的页面（UI 焕新 U4b：与账号中心主题同一套说法——「账号中心」「账号密码」，
+// 两个出口：重新登录、回到 LiteSync 首页）。只改展示，认证流程与各分支的判断不变。
 func authErrorPage(w http.ResponseWriter, status int, msg string) {
-	writePage(w, status, "登录未完成",
-		`<p>`+html.EscapeString(msg)+`</p><p><a class="primary" href="/auth/login">重新登录</a> · <a href="/">返回首页</a></p>`)
+	writePage(w, status, "登录没有完成",
+		`<h1 class="login-title">登录没有完成</h1><p>`+html.EscapeString(msg)+`</p>`+
+			`<p class="muted small">一个账号可用于 LiteSync 和 Nexus。</p>`+
+			`<a class="button primary block" href="/auth/login">重新登录</a><a class="button block" href="/">返回 LiteSync 首页</a>`)
+}
+
+// providerErrorText 把账号中心回调里的 error 参数（OAuth 2.0 / OIDC 标准代码）换成普通人看得懂的话；
+// 不认识的代码原样附在括号里，方便排查。
+func providerErrorText(code string) string {
+	switch code {
+	case "access_denied":
+		return "你在账号中心取消了登录。"
+	case "temporarily_unavailable", "server_error":
+		return "账号中心暂时不可用，请稍后再试。"
+	case "login_required", "interaction_required", "consent_required", "account_selection_required":
+		return "需要在账号中心重新登录。"
+	default:
+		return "账号中心没有完成登录（" + code + "）。"
+	}
 }
 
 // bouncePage 同站跳转页：Strict 会话 Cookie 在跨站重定向链上不会被携带，
@@ -303,7 +322,7 @@ func (h *handlers) startOIDC(w http.ResponseWriter, r *http.Request, linkUserID 
 	}
 	if err := h.rp.ensure(r.Context()); err != nil {
 		h.opts.Logger.Warn("oidc discovery failed", "error", err)
-		authErrorPage(w, http.StatusServiceUnavailable, "身份服务暂时不可用，请稍后再试。")
+		authErrorPage(w, http.StatusServiceUnavailable, "账号中心暂时连不上，请稍后再试。笔记和已连接的设备不受影响。")
 		return
 	}
 	q := r.URL.Query()
@@ -391,7 +410,7 @@ func (h *handlers) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if e := q.Get("error"); e != "" {
 		h.opts.Logger.Info("oidc callback error from provider", "error", e)
-		authErrorPage(w, http.StatusBadRequest, "身份服务没有完成登录（"+e+"）。")
+		authErrorPage(w, http.StatusBadRequest, providerErrorText(e))
 		return
 	}
 	code := q.Get("code")
@@ -402,7 +421,7 @@ func (h *handlers) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(h.rp.ctx(r.Context()), 15*time.Second)
 	defer cancel()
 	if err := h.rp.ensure(ctx); err != nil {
-		authErrorPage(w, http.StatusServiceUnavailable, "身份服务暂时不可用，请稍后再试。")
+		authErrorPage(w, http.StatusServiceUnavailable, "账号中心暂时连不上，请稍后再试。笔记和已连接的设备不受影响。")
 		return
 	}
 	tok, err := h.rp.oauth.Exchange(ctx, code, oauth2.VerifierOption(in.verifier))
@@ -414,7 +433,7 @@ func (h *handlers) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	rawID, _ := tok.Extra("id_token").(string)
 	if rawID == "" {
 		h.opts.Logger.Warn("oidc callback rejected", "reason", "missing-id-token")
-		authErrorPage(w, http.StatusBadRequest, "身份服务没有返回身份信息，请重新登录。")
+		authErrorPage(w, http.StatusBadRequest, "账号中心没有返回身份信息，请重新登录。")
 		return
 	}
 	idt, err := h.rp.verifier.Verify(ctx, rawID) // 签名、iss、aud、exp

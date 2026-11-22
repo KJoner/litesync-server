@@ -658,6 +658,33 @@ func TestOIDCCallbackStateAndBrowserBinding(t *testing.T) {
 	}
 }
 
+// UI 焕新 U4b：账号中心回调带 error（用户取消、账号中心暂时不可用）时，页面说人话并给出两个出口，
+// 仍然不建立会话。
+func TestOIDCCallbackProviderErrorPage(t *testing.T) {
+	e := newOIDCEnv(t, "open", true)
+	for _, tc := range []struct{ code, want string }{
+		{"access_denied", "你在账号中心取消了登录"},
+		{"temporarily_unavailable", "账号中心暂时不可用"},
+		{"invalid_scope", "账号中心没有完成登录（invalid_scope）"},
+	} {
+		b := e.newBrowser(t)
+		auth, err := url.Parse(b.startLogin(""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, page := b.get("/auth/callback?error=" + tc.code + "&state=" + url.QueryEscape(auth.Query().Get("state")))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(page, tc.want) {
+			t.Fatalf("%s: status %d, page %q", tc.code, resp.StatusCode, page)
+		}
+		if !strings.Contains(page, `href="/auth/login"`) || !strings.Contains(page, "返回 LiteSync 首页") {
+			t.Fatalf("%s: error page lacks the two ways out: %q", tc.code, page)
+		}
+		if code, _ := b.me(); code != http.StatusUnauthorized {
+			t.Fatalf("%s: an error callback must not create a session, /api/v2/me = %d", tc.code, code)
+		}
+	}
+}
+
 func TestOIDCRegistrationModes(t *testing.T) {
 	closed := newOIDCEnv(t, "closed", true)
 	b := closed.newBrowser(t)
