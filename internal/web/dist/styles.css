@@ -1452,7 +1452,7 @@ input[aria-invalid="true"] {
 	gap: 9px;
 	margin-top: 16px;
 }
-.connected-products span {
+.connected-products > span {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
