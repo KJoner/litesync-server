@@ -52,7 +52,7 @@ await new Suite().run(async (s) => {
 		await api(`/api/v1/admin/users/${adminId}/quota`, { method: "PUT", body: JSON.stringify({ bytes: 10 * 1024 * 1024, vaults: 5 }) });
 		await page.evaluate(() => (location.hash = "#/me"));
 		await page.getByRole("heading", { name: "账号与设备" }).waitFor({ timeout: 20000 });
-		const facts = (await page.locator("dl.facts").textContent()) ?? "";
+		const facts = (await page.locator("dl.usage-facts").textContent()) ?? "";
 		await s.shot(page, "q02-account-usage");
 		s.check("账号页显示存储用量 / 上限（含历史版本）与仓库数 / 上限", facts.includes("存储") && facts.includes("10.0 MB") && facts.includes("含历史版本") && /仓库\s*\d+ \/ 5/.test(facts), facts);
 		s.check("控制台无意外错误", errors.length === 0, errors.join(" | "));

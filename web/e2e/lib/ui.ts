@@ -13,7 +13,8 @@ export async function tokenLogin(page: Page, token = E2E.token): Promise<void> {
 /** 在网页新建仓库并完成浏览器端加密初始化，进入工作台；返回仓库 ID。 */
 export async function createVault(page: Page, name: string, password: string): Promise<string> {
 	await page.getByRole("heading", { name: "我的仓库" }).waitFor({ timeout: 20000 });
-	await page.getByRole("button", { name: "新建仓库" }).click();
+	// 没有仓库时只有空状态里的「创建第一个仓库」（UI v2：同一个动作不摆两遍）
+	await page.getByRole("button", { name: /^(新建仓库|创建第一个仓库)$/ }).first().click();
 	await page.getByLabel("仓库名称").fill(name);
 	await page.getByRole("button", { name: "下一步" }).click();
 	const pw = page.locator(".dialog input[type=password]");
@@ -32,13 +33,13 @@ export async function createVault(page: Page, name: string, password: string): P
 export async function openVaultCard(page: Page, name: string): Promise<void> {
 	await page.getByRole("heading", { name: "我的仓库" }).waitFor({ timeout: 20000 });
 	const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const card = page.locator(".vault-card").filter({ has: page.locator("h3.vault-name", { hasText: new RegExp(`^${esc}$`) }) });
-	await card.getByRole("button", { name: /打开/ }).first().click();
+	const card = page.locator(".vault-card").filter({ has: page.locator(".vault-name", { hasText: new RegExp(`^${esc}$`) }) });
+	await card.getByRole("button", { name: "打开仓库" }).first().click();
 }
 
 /** 登录后进入指定仓库：可能直接落在解锁页（记住了上次的仓库），也可能落在仓库中心。 */
 export async function enterVault(page: Page, name: string, password: string): Promise<void> {
-	const pw = page.locator('input[placeholder="仓库密码"]');
+	const pw = page.locator("#vault-password");
 	const center = page.getByRole("heading", { name: "我的仓库" });
 	await Promise.race([pw.waitFor({ timeout: 20000 }), center.waitFor({ timeout: 20000 })]).catch(() => undefined);
 	if (await center.isVisible().catch(() => false)) await openVaultCard(page, name);
@@ -46,9 +47,9 @@ export async function enterVault(page: Page, name: string, password: string): Pr
 }
 
 export async function unlock(page: Page, password: string): Promise<void> {
-	await page.locator('input[placeholder="仓库密码"]').waitFor({ timeout: 20000 });
-	await page.locator('input[placeholder="仓库密码"]').fill(password);
-	await page.getByRole("button", { name: "解锁", exact: true }).click();
+	await page.locator("#vault-password").waitFor({ timeout: 20000 });
+	await page.locator("#vault-password").fill(password);
+	await page.getByRole("button", { name: "解锁并打开" }).click();
 	await page.locator(".tree").waitFor({ timeout: 60000 });
 }
 
@@ -202,6 +203,15 @@ export async function renameNote(page: Page, from: string, to: string): Promise<
 		await dlg.getByRole("button", { name: "重命名", exact: true }).click();
 	}
 	await page.waitForFunction((p: string) => location.hash === "#/n/" + encodeURIComponent(p), to, { timeout: 15000 });
+}
+
+/** 侧栏的仓库选择器 → 「切换仓库」对话框里选另一个仓库（按名字精确匹配；UI v2 代替原来的下拉切换器）。 */
+export async function switchVaultTo(page: Page, name: string): Promise<void> {
+	const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	await page.locator(".vault-select").click();
+	const dlg = page.getByRole("dialog", { name: "切换仓库" });
+	await dlg.waitFor({ timeout: 10000 });
+	await dlg.locator(".modal-item").filter({ has: page.locator("strong", { hasText: new RegExp(`^${esc}$`) }) }).click();
 }
 
 /** 当前笔记的「更多」→ 删除… → 确认框「删除笔记」。 */

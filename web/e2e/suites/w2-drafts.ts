@@ -3,7 +3,7 @@
 // 强制结束（渲染进程崩溃）之后，全部输入都能从已验证的加密草稿里恢复。真实 Chromium，合成数据。
 import { api, E2E, sleep, Suite, until } from "../lib/harness";
 import { PluginDevice, snapshotPaths } from "../lib/plugin";
-import { createVault, draftRecords, editorText, enterVault, hold, offline, openNote, openVaultCard, tokenLogin, unlock, waitState } from "../lib/ui";
+import { createVault, draftRecords, editorText, enterVault, hold, offline, openNote, openVaultCard, switchVaultTo, tokenLogin, unlock, waitState } from "../lib/ui";
 
 const PASSWORD = "W2 草稿测试密码 · 2026-11-21";
 const PASSWORD2 = "W2 第二个仓库 · 2026-11-21";
@@ -198,8 +198,8 @@ await new Suite().run(async (s) => {
 			s.check(`${label}：全部输入保存在当前文档、冲突副本或已验证草稿中`, kept.ok, kept.where);
 			s.check(`${label}：恢复草稿后干净合并（编辑器里就是完整内容，不需要冲突副本）`, offered && needles.every((n) => text.includes(n)), JSON.stringify(text));
 		};
-		const lockBtn = () => page.locator('button[title="锁定（丢弃内存中的密钥）"]');
-		const unlockPage = () => page.locator('input[placeholder="仓库密码"]');
+		const lockBtn = () => page.locator(".lock-btn");
+		const unlockPage = () => page.locator("#vault-password");
 		await inflight("D 锁定", notes[3], async () => {
 			await lockBtn().click();
 			await unlockPage().waitFor({ timeout: 20000 });
@@ -214,13 +214,13 @@ await new Suite().run(async (s) => {
 		await unlock(page, PASSWORD);
 		let otherDrafts = -1;
 		await inflight("F 切库", notes[5], async () => {
-			await page.locator("select.vault-switch").selectOption(vault2);
+			await switchVaultTo(page, `${vaultName}-二`);
 			await unlockPage().waitFor({ timeout: 30000 });
 		}, async () => {
 			await unlock(page, PASSWORD2);
 			await sleep(800);
 			otherDrafts = await page.locator(".draft-card").count();
-			await page.locator("select.vault-switch").selectOption(vaultId);
+			await switchVaultTo(page, vaultName);
 			await unlock(page, PASSWORD);
 		});
 		s.check("F 切库：另一个仓库的首页看不到这个仓库的草稿", otherDrafts === 0, `draft cards=${otherDrafts}`);

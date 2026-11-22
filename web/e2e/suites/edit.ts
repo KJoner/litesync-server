@@ -235,7 +235,7 @@ await new Suite().run(async (s) => {
 		// ---- 7c. 恢复到历史版本：生成新版本，revision 只前进 ----
 		await openNote(page, P2, "read");
 		const beforeRestore = await dev.read(P2);
-		await page.getByRole("button", { name: "🕘 历史版本" }).click();
+		await page.getByRole("button", { name: "历史版本" }).click();
 		await page.locator(".drawer-item", { hasText: "版本 3 " }).click();
 		await page.getByRole("button", { name: "恢复到此版本" }).click();
 		// UI 焕新 U4b：确认改成产品内对话框（不再是浏览器原生 confirm）
@@ -298,13 +298,15 @@ await new Suite().run(async (s) => {
 		});
 		let over = await overflowing();
 		s.check("390px 宽度编辑页无横向溢出", over.length === 0, over.join(" "));
-		await page.locator(".more-btn").click();
-		await page.locator(".header-actions", { hasText: "我的仓库" }).waitFor();
+		// UI v2：手机上次要操作都在侧栏抽屉里（仓库选择器、搜索、回收站、账号与设备），顶栏只留菜单 / 当前仓库 / 状态 / 锁定
+		await page.locator(".menu-btn").click();
+		await page.locator("#sidebar .account-link").waitFor();
 		await s.shot(page, "e07b-menu-390");
 		over = await overflowing();
-		s.check("390px 顶栏「⋯」菜单可用且展开后不溢出", over.length === 0 && (await page.locator(".header-actions").isVisible()), over.join(" "));
+		s.check("390px 侧栏抽屉可用（含账号与设备、仓库选择器）且展开后不溢出", over.length === 0 && (await page.locator("#sidebar .account-link").isVisible()) && (await page.locator("#sidebar .vault-select").isVisible()), over.join(" "));
 		await page.keyboard.press("Escape");
-		s.check("Esc 关闭「⋯」菜单", !(await page.locator(".header-actions").isVisible()));
+		await page.waitForTimeout(300);
+		s.check("Esc 关闭侧栏抽屉", !(await page.evaluate(() => document.body.classList.contains("sidebar-open"))));
 		await page.setViewportSize({ width: 1440, height: 900 });
 
 		// ---- 8b. 主动离开仓库时本机草稿落不了盘：暂停并导出（需求 §7.3） ----
@@ -322,7 +324,9 @@ await new Suite().run(async (s) => {
 		s.check("本机草稿保存失败时状态栏如实显示", ((await page.locator(".save-status").textContent()) ?? "").includes("本机草稿保存失败"));
 		confirms.length = 0;
 		const downloadP = page.waitForEvent("download", { timeout: 20000 });
-		await page.getByRole("button", { name: "我的仓库" }).click();
+		// UI v2：去「我的仓库」在侧栏的仓库选择器里（「切换仓库」→ 我的仓库）
+		await page.locator(".vault-select").click();
+		await page.getByRole("dialog", { name: "切换仓库" }).getByRole("button", { name: "我的仓库" }).click();
 		// UI 焕新 W03：离开工作台之前先说明会锁定（已解锁的加密仓库）
 		await page.getByRole("dialog").getByRole("button", { name: "锁定并前往" }).click();
 		const download = await downloadP;
@@ -330,7 +334,7 @@ await new Suite().run(async (s) => {
 		s.check("离开前先提示，并把未保存的内容导出为 Markdown 文件", confirms.some((m) => m.includes("没能加密保存到本机")) && exported.includes("（切库前未保存）") && download.suggestedFilename() === "改名后.md", download.suggestedFilename());
 		await page.getByRole("heading", { name: "我的仓库" }).waitFor({ timeout: 20000 });
 		await page.unroute("**/api/v1/file");
-		await page.locator(".vault-card", { hasText: VAULT_NAME }).getByRole("button", { name: "解锁并打开" }).click();
+		await page.locator(".vault-card", { hasText: VAULT_NAME }).getByRole("button", { name: "打开仓库" }).click();
 		await unlock(page, PASSWORD);
 
 		// ---- 8c. 完整 Markdown 夹具（验收 ED-02）：无修改不改字节；局部编辑后其余字节逐字节保留 ----
@@ -395,7 +399,8 @@ await new Suite().run(async (s) => {
 			if (u.includes(QUERY) || (req.postData() ?? "").includes(QUERY)) leaked.push(`${req.method()} ${u}`);
 		};
 		page.on("request", onReq);
-		await page.locator("input.search").fill(QUERY);
+		await page.locator(".side-search").click(); // UI v2：侧栏「搜索笔记」（或 Ctrl+K）打开搜索对话框
+		await page.locator(".dialog input.search").fill(QUERY);
 		await page.keyboard.press("Enter");
 		await page.locator(".search-progress", { hasText: "已在本机索引" }).waitFor({ timeout: 30000 });
 		await page.locator(".search-hit mark", { hasText: QUERY }).first().waitFor({ timeout: 10000 });
@@ -406,7 +411,7 @@ await new Suite().run(async (s) => {
 
 		// ---- 9. 手动锁定 ----
 		await openNote(page, P2, "read");
-		await page.locator('button[title="锁定（丢弃内存中的密钥）"]').click();
+		await page.locator(".lock-btn").click();
 		await page.locator(".banner", { hasText: "已锁定" }).waitFor({ timeout: 15000 });
 		await s.shot(page, "e08-locked");
 		s.check("锁定后回到解锁页并说明原因", true);

@@ -35,7 +35,9 @@ await new Suite().run(async (s) => {
 		s.check("仓库选择按账号分区（litesync-vault:<账号>），不再有不分账号的旧键", keys.includes(`litesync-vault:${adminId}`) && !keys.includes("litesync-vault"), keys.join(","));
 
 		// 标签页 1 退出 → 标签页 2 立刻清掉明文
-		await tab1.locator('button[title="退出登录"]').click();
+		// UI v2：退出在「账号与设备」里（三种范围各一个按钮）；这里用「只退出这个浏览器」
+		await tab1.evaluate(() => (location.hash = "#/me"));
+		await tab1.getByRole("button", { name: "退出此浏览器" }).click();
 		await tab1.getByRole("button", { name: "使用 Token 登录" }).waitFor({ timeout: 20000 });
 		await tab2.getByRole("button", { name: "使用 Token 登录" }).waitFor({ timeout: 20000 });
 		const tab2Text = await tab2.evaluate(() => document.body.innerText);

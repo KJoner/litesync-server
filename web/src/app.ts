@@ -31,9 +31,11 @@ import {
 	Me,
 	Usage,
 } from "./api";
-import { openConnectDialog, PortalHost, renderAccountCenter, renderLoginPage, renderVaultCenter } from "./portal";
+import { openConnectDialog, PortalHost, portalHeader, renderAccountCenter, renderLoginPage, renderVaultCenter } from "./portal";
 import { DrawerHandle, openDialog, openDrawer } from "./dialog";
 import { followSystemTheme, toggleTheme } from "./theme";
+import { icon, IconName } from "./icons";
+import { brand, fmtRelative, iconButton, labelButton, themeButton } from "./ui";
 import { confirmDialog, fieldsDialog, folderOf, foldersOf, noteLocationDialog, titleOf, typedConfirmDialog } from "./forms";
 import {
 	deriveMetaKeys as coreDeriveMetaKeys,
@@ -485,6 +487,10 @@ async function pollRemote(): Promise<void> {
 	const alive = fence();
 	try {
 		const c = await S.api.changes(lastSequence, 1);
+		if (pollOffline) {
+			pollOffline = false;
+			updateSyncPill();
+		}
 		if (!alive() || (!c.resyncRequired && c.changes.length === 0)) return;
 		const list = await loadFileList();
 		if (!alive() || !S) return; // 轮询期间锁定 / 换号：结果作废
@@ -500,8 +506,12 @@ async function pollRemote(): Promise<void> {
 			else if (cur && cur.revision > ed.file.revision) await ed.remoteChanged();
 		}
 		updateStatus("已载入其他设备的修改");
-	} catch {
-		/* 网络抖动：下一次再问 */
+	} catch (e) {
+		// 网络抖动：下一次再问；连不上服务器时顶栏如实显示「离线」
+		if (e instanceof TypeError) {
+			pollOffline = true;
+			updateSyncPill();
+		}
 	} finally {
 		polling = false;
 	}
@@ -755,8 +765,10 @@ async function leaveEditor(): Promise<void> {
 	const p = pending.done.finally(() => {
 		if (backgroundSaves.get(id) === p) backgroundSaves.delete(id);
 		if (location.hash === "#/" || location.hash === "") void renderDraftList();
+		else void refreshDraftCount();
 	});
 	backgroundSaves.set(id, p);
+	updateSyncPill();
 }
 
 /** 打开一篇笔记前：它若还在后台上传，先等那一轮结束（最多 5 秒），免得读到上传前的版本。 */
@@ -786,16 +798,23 @@ async function renderDraftList(): Promise<void> {
 	const all = await ds.listFiles().catch(() => []);
 	if (!alive()) return;
 	const items = all.filter((d) => !backgroundSaves.has(d.fileKey));
+	draftCount = items.length;
+	updateSyncPill();
 	box.innerHTML = "";
 	if (items.length === 0) return;
 	box.append(el("h2", "section-title", "本机未同步的草稿"));
 	box.append(el("p", "muted small", S?.draftsVolatile
 		? "这些修改只在这个页面的内存里（浏览器不允许持久存储），还没有到达服务器；关闭或刷新页面就会丢失。打开即可继续同步。"
 		: "这些修改只以加密形式保存在这台设备的浏览器里，还没有到达服务器。打开即可继续同步。"));
-	const list = el("div", "recent-list");
+	const list = el("div", "note-list");
 	for (const it of items) {
-		const card = el("button", "recent-card draft-card");
-		card.append(el("div", "recent-title", noteTitle(it.path)), el("div", "muted small", `草稿 ${new Date(it.savedAt).toLocaleString()}${it.count > 1 ? `（共 ${it.count} 份）` : ""}`));
+		const card = el("button", "note-row draft-card") as HTMLButtonElement;
+		card.type = "button";
+		const sym = el("span", "note-symbol");
+		sym.append(icon("clock"));
+		const meta = el("span", "note-meta");
+		meta.append(el("strong", "", noteTitle(it.path)), el("small", "", `本机草稿 · ${fmtRelative(it.savedAt)}${it.count > 1 ? `（共 ${it.count} 份）` : ""}`));
+		card.append(sym, meta, icon("chevron", "row-chev"));
 		card.onclick = () => {
 			const existing = S!.files.find((f) => f.fileId === it.fileKey);
 			if (existing) {
@@ -816,6 +835,7 @@ async function openDraftAsNew(file: TrackedFile): Promise<void> {
 	markActive(null);
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
+	setHere(noteTitle(file.path));
 	const wrap = el("div", "note-wrap");
 	wrap.append(el("div", "note-head"), el("h1", "note-title", noteTitle(file.path)), el("p", "muted small new-note-hint", "新笔记：第一次保存后才会出现在服务器与其他设备上"));
 	const body = el("div", "note-editor");
@@ -913,14 +933,21 @@ function editingFile(fileId: string | undefined): TrackedFile | null {
 }
 
 /** 笔记标题上方一行的「位置 + 历史版本」。历史按钮在点击时取这篇笔记现在的路径（改名 / 移动后不过时）。 */
+function fillCrumb(crumb: HTMLElement, path: string): void {
+	crumb.replaceChildren(icon("folder"));
+	const parts = path.split("/").slice(0, -1);
+	if (parts.length === 0) crumb.append(el("span", "", "仓库根目录"));
+	parts.forEach((p, i) => {
+		if (i > 0) crumb.append(icon("chevron", "sep"));
+		crumb.append(el("span", "", p));
+	});
+}
+
 function noteHeadParts(path: string, fileId: string | undefined): HTMLElement[] {
 	const crumb = el("div", "crumb");
-	const parts = path.split("/");
-	parts.forEach((p, i) => {
-		if (i === parts.length - 1) crumb.append(el("span", "", noteTitle(p)));
-		else crumb.append(el("span", "muted", p), el("span", "muted", " / "));
-	});
-	const histBtn = el("button", "ghost", "🕘 历史版本");
+	crumb.setAttribute("aria-label", "位置");
+	fillCrumb(crumb, path);
+	const histBtn = labelButton("history", "历史版本", "btn ghost hist-btn");
 	histBtn.setAttribute("aria-controls", "drawer");
 	histBtn.setAttribute("aria-expanded", "false");
 	histBtn.onclick = () => void openHistory(editingFile(fileId)?.path ?? path, histBtn);
@@ -949,8 +976,9 @@ async function moveNote(tracked: TrackedFile, to: string): Promise<string | null
 	markActive(to);
 	const title = contentEl.querySelector(".note-title");
 	if (title) title.textContent = noteTitle(to);
-	const crumb = contentEl.querySelector(".crumb");
-	if (crumb) crumb.textContent = to.replace(/\.md$/i, "").split("/").join(" / ");
+	const crumb = contentEl.querySelector<HTMLElement>(".crumb");
+	if (crumb) fillCrumb(crumb, to);
+	setHere(noteTitle(to));
 	location.hash = "#/n/" + encodeURIComponent(to);
 	return null;
 }
@@ -992,6 +1020,7 @@ async function openNewNote(path: string): Promise<void> {
 	markActive(null);
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
+	setHere(noteTitle(path));
 	const wrap = el("div", "note-wrap");
 	wrap.append(el("div", "note-head"), el("h1", "note-title", noteTitle(path)), el("p", "muted small new-note-hint", "新笔记：第一次保存后才会出现在服务器与其他设备上"));
 	const body = el("div", "note-editor");
@@ -1010,8 +1039,7 @@ function renderCentered(children: HTMLElement[]): void {
 	app.innerHTML = "";
 	const wrap = el("div", "center-screen");
 	const card = el("div", "center-card");
-	const brand = el("div", "brand", "◈ LiteSync");
-	card.append(brand, ...children);
+	card.append(brand(), ...children);
 	wrap.append(card);
 	app.append(wrap);
 }
@@ -1050,58 +1078,106 @@ function renderLogin(err?: string): void {
 	input.focus();
 }
 
+/**
+ * 解锁页（V2 / L2）：左边说明、右边独立的解锁卡片，写明解锁的是哪个仓库；页头与「我的仓库」相同。
+ * 密码处理、锁定原因、异步隔离（fence）与切库语义都沿用原来的实现——这里只换版式。
+ */
 function renderUnlock(err?: string): void {
 	// 多仓库（v0.19）：解锁的对象是**当前选中的仓库**——把这一点讲明白，
 	// 并让「密码其实是另一个仓库的」当场就能切，而不是对着「密码错误」发呆
 	const multi = (S?.vaults.length ?? 0) > 1;
+	const name = currentVaultName();
+	app.innerHTML = "";
+	const page = el("div", "portal unlock-page");
+	const main = el("main", "unlock-layout");
+
+	const info = el("section", "unlock-info");
+	info.setAttribute("aria-label", "关于仓库密码");
+	const glyph = el("div", "vault-glyph");
+	glyph.append(icon("lock"));
+	const head = el("p", "unlock-headline");
+	head.append("你的笔记，", el("br"), "只向你打开。");
+	const lead = el("p", "lead");
+	lead.append(`正在打开「${name}」。`, el("br"), "输入这个仓库的独立密码，继续上次的思考。");
+	const points = el("ul", "unlock-points");
+	for (const [n, t] of [["shield", "仓库密码与账号密码相互独立"], ["monitor", "只在这台设备上解密"], ["lock", "锁定或离开工作台后，需要重新解锁"]] as const) {
+		const li = el("li");
+		li.append(icon(n), el("span", "", t));
+		points.append(li);
+	}
+	info.append(glyph, el("p", "eyebrow", "A little privacy, by design"), head, lead, points);
+
+	const card = el("section", "unlock-card");
 	// UI 焕新 W02 / W03：单仓库也写明解锁的是哪个仓库；离开工作台回来的人一眼看到「输入密码 → 继续」
-	const title = el("h1", "unlock-title", `解锁「${currentVaultName()}」`);
+	const title = el("h1", "unlock-title", `解锁「${name}」`);
+	title.id = "unlock-title";
+	card.setAttribute("aria-labelledby", title.id);
 	// UI 规格：一句关键说明 + 密码框 + 明确的错误反馈 + 帮助入口；术语统一用「仓库密码」
-	const sub = el("p", "muted", "输入这个仓库的仓库密码。它只在这台设备上用来解密，和账号的登录密码不是同一个。");
-	const input = el("input") as HTMLInputElement;
-	input.type = "password";
-	input.placeholder = "仓库密码";
-	input.setAttribute("aria-label", "仓库密码");
-	input.autocomplete = "current-password";
-	const btn = el("button", "primary", "解锁");
-	const errEl = el("p", "error", err ?? "");
-	errEl.setAttribute("role", "alert");
-	const hint = el("details", "unlock-help");
-	hint.append(
-		el("summary", "muted small", "忘记了仓库密码？"),
-		el("p", "muted small", "服务器从来没有见过仓库密码，所以无法替你找回。如果还有一台已解锁的设备（比如 Obsidian），可以在那台设备上更换仓库密码；否则这个仓库里的内容无法解密。重置账号的登录密码也解不开仓库。"),
-	);
-	const extras: HTMLElement[] = [];
-	// 锁定原因（手动锁定 / 空闲自动锁定）：只显示一次
+	card.append(title, el("p", "sub", "仓库密码只在这台设备上用来解密，和账号的登录密码不是同一个。"));
+	// 锁定原因（手动锁定 / 空闲自动锁定 / 离开工作台）：只显示一次
 	try {
 		const why = sessionStorage.getItem("litesync-lock-reason");
 		if (why) {
 			// 原因里已经按草稿的真实结局说明了「修改现在在哪里」（lockMessage），这里不再笼统补一句
 			sessionStorage.removeItem("litesync-lock-reason");
-			extras.push(el("p", "banner info", why));
+			card.append(el("p", "banner info", why));
 		}
 	} catch {
 		/* ignore */
 	}
+	const form = el("form", "unlock-form");
+	form.noValidate = true;
+	const label = el("label", "field-label", "仓库密码") as HTMLLabelElement;
+	label.htmlFor = "vault-password";
+	const input = el("input") as HTMLInputElement;
+	input.id = "vault-password";
+	input.type = "password";
+	input.placeholder = "输入仓库密码";
+	input.autocomplete = "current-password";
+	input.setAttribute("aria-describedby", "unlock-error");
+	const reveal = iconButton("eye", "显示仓库密码", "icon-btn pw-toggle");
+	reveal.setAttribute("aria-pressed", "false");
+	reveal.onclick = () => {
+		const show = input.type === "password";
+		input.type = show ? "text" : "password";
+		reveal.replaceChildren(icon(show ? "eyeOff" : "eye"));
+		reveal.setAttribute("aria-label", show ? "隐藏仓库密码" : "显示仓库密码");
+		reveal.title = reveal.getAttribute("aria-label")!;
+		reveal.setAttribute("aria-pressed", String(show));
+		input.focus();
+	};
+	const pw = el("div", "password-wrap");
+	pw.append(input, reveal);
+	const errEl = el("p", "error unlock-error", err ?? "");
+	errEl.id = "unlock-error";
+	errEl.setAttribute("role", "alert");
+	const btn = labelButton("unlock", "解锁并打开", "btn primary wide unlock-submit");
+	btn.type = "submit";
+	form.append(label, pw, errEl, btn);
+	card.append(form);
 	if (multi) {
-		extras.push(el("p", "muted small", "每个仓库的仓库密码相互独立；要解锁另一个仓库，先在这里切换："));
-		const sel = el("select", "vault-switch") as HTMLSelectElement;
-		for (const v of S!.vaults) {
-			const opt = el("option", "", v.name || v.id) as HTMLOptionElement;
-			opt.value = v.id;
-			if (v.current) opt.selected = true;
-			sel.append(opt);
-		}
-		sel.onchange = () => {
-			rememberVault(sel.value);
-			location.hash = "";
-			location.reload(); // 与主界面切换器同一语义：整页重进，仓库间密钥/状态彻底隔离
-		};
-		extras.push(sel);
+		const sw = labelButton("folder", "切换到其他仓库", "btn text switch-vault", () => openVaultSwitcher(false));
+		card.append(el("p", "muted small switch-note", "每个仓库的仓库密码相互独立；密码是另一个仓库的，就先切换过去。"), sw);
 	}
+	const hint = el("details", "unlock-help");
+	hint.append(
+		el("summary", "", "忘记了仓库密码？"),
+		el("p", "muted small", "服务器从来没有见过仓库密码，所以无法替你找回。如果还有一台已解锁的设备（比如 Obsidian），可以在那台设备上更换仓库密码；否则这个仓库里的内容无法解密。重置账号的登录密码也解不开仓库。"),
+	);
+	const back = el("a", "back-link") as HTMLAnchorElement;
+	back.href = "#/vaults";
+	back.append(icon("back"), el("span", "", "返回我的仓库"));
+	card.append(hint, back);
+	main.append(info, card);
+	page.append(portalHeader(portalHost, ""), main);
+	app.append(page);
+
+	const busy = (on: boolean) => {
+		btn.disabled = on;
+		btn.replaceChildren(icon("unlock"), el("span", "", on ? "解锁中…" : "解锁并打开"));
+	};
 	const submit = async () => {
-		btn.textContent = "解锁中…";
-		btn.disabled = true;
+		busy(true);
 		const alive = fence();
 		const raw = await unlockVaultKey(S!.vaultDoc!, input.value);
 		if (!alive()) {
@@ -1110,10 +1186,11 @@ function renderUnlock(err?: string): void {
 		}
 		if (!raw) {
 			errEl.textContent = multi
-				? "仓库密码不对。如果这是你另一个仓库的密码，请先在上方切换到那个仓库。"
+				? "仓库密码不对。如果这是你另一个仓库的密码，请先切换到那个仓库。"
 				: "仓库密码不对。注意它不是账号的登录密码。";
-			btn.textContent = "解锁";
-			btn.disabled = false;
+			input.setAttribute("aria-invalid", "true");
+			busy(false);
+			input.focus();
 			return;
 		}
 		// VMK 只保留在内存 CryptoKey：不写任何浏览器存储，刷新即需重新解锁
@@ -1126,14 +1203,68 @@ function renderUnlock(err?: string): void {
 		}
 		await enterMain();
 	};
-	btn.onclick = () => void submit();
-	input.onkeydown = (e) => {
-		if (e.key === "Enter") void submit();
+	form.onsubmit = (e) => {
+		e.preventDefault();
+		if (!btn.disabled) void submit();
 	};
-	const back = el("a", "button ghost small-btn unlock-back", "返回我的仓库") as HTMLAnchorElement;
-	back.href = "#/vaults";
-	renderCentered([title, sub, ...extras, input, btn, errEl, hint, back]);
+	input.oninput = () => input.removeAttribute("aria-invalid");
 	input.focus();
+}
+
+/**
+ * 切换仓库（侧栏的仓库选择器、解锁页）：列出名下仓库，选中另一个 = 整页重进那个仓库（各仓库的 E2EE 独立解锁，
+ * 与原来的下拉切换器同一语义）。在工作台里先走草稿保护：未同步的修改落不了盘就不切（需求 §7.3）。
+ */
+function openVaultSwitcher(inWorkspace: boolean, opener?: HTMLElement): void {
+	const dlg = openDialog("切换仓库");
+	const list = el("div", "modal-list");
+	for (const v of S?.vaults ?? []) {
+		const b = el("button", "modal-item" + (v.current ? " current" : "")) as HTMLButtonElement;
+		b.type = "button";
+		const text = el("span", "modal-item-text");
+		const pending = v.initState !== undefined && v.initState !== "ready";
+		const note = v.current ? "当前仓库"
+			: pending ? "还没有完成加密设置"
+			: v.encryptionState === "encrypted" ? "切换后需要输入它的仓库密码"
+			: v.encryptionState === "migrating" ? "加密迁移中"
+			: "未加密的旧仓库";
+		text.append(el("strong", "", v.name || "默认仓库"), el("small", "", note));
+		b.append(icon("folder"), text, icon(v.current ? "check" : "chevron"));
+		if (v.current) b.setAttribute("aria-current", "true");
+		b.onclick = () => {
+			if (v.current) {
+				dlg.close();
+				return;
+			}
+			dlg.close(true);
+			void switchVault(v.id, inWorkspace);
+		};
+		list.append(b);
+	}
+	const actions = el("div", "dialog-actions");
+	const all = labelButton("folder", "我的仓库", "btn", () => {
+		dlg.close(true);
+		opener?.focus();
+		if (inWorkspace) confirmLeave("#/vaults");
+		else location.hash = "#/vaults";
+	});
+	const cancel = el("button", "btn ghost", "取消") as HTMLButtonElement;
+	cancel.type = "button";
+	cancel.onclick = () => dlg.close();
+	actions.append(all, cancel);
+	dlg.body.append(el("p", "muted small", "每个仓库都用自己的仓库密码；切换后要输入那个仓库的密码。"), list, actions);
+}
+
+async function switchVault(id: string, inWorkspace: boolean): Promise<void> {
+	if (inWorkspace) {
+		// 主动切库：草稿落不了盘就暂停切换（需求 §7.3）
+		if (!(await guardVaultLeave())) return;
+		await leaveEditor();
+		await waitBackgroundSaves();
+	}
+	rememberVault(id);
+	history.replaceState(null, "", "#/");
+	location.reload(); // 仓库间的密钥/状态彻底隔离：整页重进最干净
 }
 
 /** 当前仓库的显示名（默认仓库没有名字）。 */
@@ -1169,10 +1300,10 @@ function confirmLeave(target: "#/vaults" | "#/me"): void {
 	const keepLine = el("label", "check-line");
 	keepLine.append(keep, document.createTextNode(" 以后不再提示"));
 	const actions = el("div", "dialog-actions");
-	const stay = el("button", "ghost", "留在这里") as HTMLButtonElement;
+	const stay = el("button", "btn ghost", "留在这里") as HTMLButtonElement;
 	stay.type = "button";
 	stay.onclick = () => dlg.close();
-	const go = el("button", "primary", "锁定并前往") as HTMLButtonElement;
+	const go = el("button", "btn primary", "锁定并前往") as HTMLButtonElement;
 	go.type = "button";
 	go.onclick = () => {
 		if (keep.checked) {
@@ -1195,22 +1326,31 @@ function confirmLeave(target: "#/vaults" | "#/me"): void {
 	setTimeout(() => go.focus(), 0);
 }
 
-// ---------- 主布局 ----------
+// ---------- 主布局（UI 焕新 v2 / V2：240 侧栏 + 顶栏 + 正文） ----------
+//
+// 侧栏：品牌 → 仓库选择器（锁定状态）→ 搜索 / 新建 → 概览与文件树 → 回收站、实例管理（管理员）、账号与设备。
+// 顶栏：仓库 / 位置、真实的保存同步状态、主题、锁定。离开工作台（我的仓库、账号与设备）仍先说明会锁定
+// （confirmLeave），整页重载释放密钥——共享的外观不是绕过锁定的捷径。
 let treeEl: HTMLElement;
 let contentEl: HTMLElement;
 let outlineEl: HTMLElement;
 let statusEl: HTMLElement;
-let searchInput: HTMLInputElement;
-let searchResults: HTMLElement;
+let sidebarEl: HTMLElement | null = null;
+let mainEl: HTMLElement | null = null;
+let crumbHereEl: HTMLElement | null = null;
+let syncPillEl: HTMLElement | null = null;
+let homeLinkEl: HTMLAnchorElement | null = null;
 
-// ---------- 手机上的文件树抽屉（W08）：键盘可开关，焦点进出正确，关着时整棵树 inert ----------
+// ---------- 手机上的侧栏抽屉（W08）：键盘可开关，焦点进出正确，关着时整个侧栏 inert，开着时正文 inert ----------
 const narrowScreen = window.matchMedia("(max-width: 760px)");
 let menuBtnEl: HTMLButtonElement | null = null;
 
 function syncSidebar(): void {
 	const open = document.body.classList.contains("sidebar-open");
-	menuBtnEl?.setAttribute("aria-expanded", String(open && narrowScreen.matches));
-	if (treeEl) treeEl.inert = narrowScreen.matches && !open;
+	const narrow = narrowScreen.matches;
+	menuBtnEl?.setAttribute("aria-expanded", String(open && narrow));
+	if (sidebarEl) sidebarEl.inert = narrow && !open;
+	if (mainEl) mainEl.inert = narrow && open;
 }
 
 function setSidebar(open: boolean, moveFocus = true): void {
@@ -1218,194 +1358,254 @@ function setSidebar(open: boolean, moveFocus = true): void {
 	document.body.classList.toggle("sidebar-open", open);
 	syncSidebar();
 	if (!moveFocus || open === was || !narrowScreen.matches) return;
-	if (open) treeEl?.querySelector<HTMLElement>(".tree-file.active, .tree-new, .tree-file, summary, .tree-trash")?.focus();
-	else if (!treeEl || treeEl.contains(document.activeElement) || document.activeElement === document.body) menuBtnEl?.focus();
+	if (open) (sidebarEl?.querySelector<HTMLElement>(".tree-file.active") ?? sidebarEl?.querySelector<HTMLElement>(".mobile-close"))?.focus();
+	else if (!sidebarEl || sidebarEl.contains(document.activeElement) || document.activeElement === document.body) menuBtnEl?.focus();
 }
 narrowScreen.addEventListener("change", syncSidebar);
 document.addEventListener("keydown", (e) => {
-	if (e.key !== "Escape" || !document.body.classList.contains("sidebar-open") || !narrowScreen.matches) return;
+	if (!document.body.classList.contains("sidebar-open") || !narrowScreen.matches || !sidebarEl) return;
 	if (document.querySelector(".dialog-backdrop, .drawer")) return; // 上面还有对话框 / 抽屉：交给它们
-	setSidebar(false);
+	if (e.key === "Escape") {
+		setSidebar(false);
+		return;
+	}
+	if (e.key !== "Tab") return;
+	// 抽屉开着时 Tab 只在抽屉里循环（正文已 inert）
+	const f = Array.from(sidebarEl.querySelectorAll<HTMLElement>("a[href],button:not([disabled]),summary,input,select"))
+		.filter((n) => n.offsetParent !== null && !n.closest("[hidden]"));
+	if (f.length === 0) return;
+	const first = f[0], last = f[f.length - 1];
+	if (e.shiftKey && (document.activeElement === first || !sidebarEl.contains(document.activeElement))) {
+		last.focus();
+		e.preventDefault();
+	} else if (!e.shiftKey && (document.activeElement === last || !sidebarEl.contains(document.activeElement))) {
+		first.focus();
+		e.preventDefault();
+	}
 });
+// Ctrl/⌘+K：在工作台里打开搜索
+document.addEventListener("keydown", (e) => {
+	if (e.isComposing || !(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "k") return;
+	if (!sidebarEl?.isConnected || document.querySelector(".dialog-backdrop")) return;
+	e.preventDefault();
+	openSearchDialog();
+});
+
+const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
+function sideLink(href: string, name: IconName, text: string, cls = "side-link"): HTMLAnchorElement {
+	const a = el("a", cls) as HTMLAnchorElement;
+	a.href = href;
+	a.append(icon(name), el("span", "", text));
+	return a;
+}
 
 function renderMain(): void {
 	app.innerHTML = "";
-	const layout = el("div", "layout");
+	const shell = el("div", "shell");
+	const name = currentVaultName();
+	const encrypted = S!.vaultDoc?.enabled === true;
 
-	// Header
-	const header = el("header");
-	const menuBtn = el("button", "icon-btn menu-btn", "☰") as HTMLButtonElement;
-	menuBtn.setAttribute("aria-label", "文件树");
-	menuBtn.setAttribute("aria-controls", "tree");
+	// ---- 侧栏 ----
+	sidebarEl = el("aside", "sidebar");
+	sidebarEl.id = "sidebar";
+	sidebarEl.setAttribute("aria-label", "仓库导航");
+	const top = el("div", "sidebar-top");
+	top.append(brand("#/", "LiteSync 概览"), iconButton("close", "关闭仓库导航", "icon-btn mobile-close", () => setSidebar(false)));
+	// 仓库选择器：当前仓库与锁定状态一直看得到（W02），点开切换仓库或去「我的仓库」
+	const vaultSel = el("button", "vault-select") as HTMLButtonElement;
+	vaultSel.type = "button";
+	vaultSel.setAttribute("aria-haspopup", "dialog");
+	const vs = el("span", "vault-select-text");
+	vs.append(el("strong", "", name), el("small", "", encrypted ? "已解锁 · 仅本次会话" : "未加密的旧仓库"), el("span", "sr-only", "，切换仓库"));
+	vaultSel.append(icon("folder"), vs, icon("down", "chev"));
+	vaultSel.onclick = () => openVaultSwitcher(true, vaultSel);
+	const tools = el("div", "sidebar-tools");
+	const search = el("button", "btn side-search") as HTMLButtonElement;
+	search.type = "button";
+	search.append(icon("search"), el("span", "", "搜索笔记"), el("kbd", "", isMac ? "⌘ K" : "Ctrl K"));
+	search.onclick = () => openSearchDialog();
+	tools.append(search);
+	if (canEdit()) {
+		tools.append(labelButton("plus", "新建笔记", "btn subtle tree-new", () => showNewNote()));
+	} else if (readOnlyMember()) {
+		tools.append(el("p", "muted small tree-readonly", "你在这个仓库里是只读成员：可以阅读和搜索，不能新建或修改。"));
+	}
+	const nav = el("nav", "side-nav");
+	nav.setAttribute("aria-label", "笔记目录");
+	homeLinkEl = sideLink("#/", "home", "概览", "side-link home-link");
+	treeEl = el("div", "tree");
+	treeEl.id = "tree";
+	nav.append(homeLinkEl, el("p", "side-label", "笔记"), treeEl);
+	const bottom = el("div", "sidebar-bottom");
+	bottom.append(sideLink("#/trash", "trash", "回收站"));
+	// v0.18 角色化导航：运维/设置/用户管理只属于管理员（服务端另有硬关卡，这里只是别把用户点不动的入口摆出来）；
+	// 实例管理与普通用户的动作分开放
+	if (S!.me?.role !== "user") {
+		const admin = document.createElement("details");
+		admin.className = "side-group";
+		const sum = document.createElement("summary");
+		sum.className = "side-link";
+		sum.append(icon("tools"), el("span", "", "实例管理"), icon("chevron", "trail chev"));
+		admin.append(sum,
+			sideLink("#/settings/backup", "database", "备份"),
+			sideLink("#/settings/ops", "tools", "运维"),
+			sideLink("#/settings/users", "users", "用户管理"));
+		admin.open = location.hash.startsWith("#/settings/");
+		bottom.append(admin);
+	}
+	bottom.append(themeButton(toggleTheme, "side-link theme-row", true));
+	const account = el("button", "side-link account-link") as HTMLButtonElement;
+	account.type = "button";
+	account.title = "账号与设备（会锁定当前仓库）";
+	account.append(icon("settings"), el("span", "", "账号与设备"), icon("lock", "trail"));
+	account.onclick = () => confirmLeave("#/me");
+	bottom.append(account);
+	sidebarEl.append(top, vaultSel, tools, nav, bottom);
+
+	// ---- 顶栏 + 正文 ----
+	mainEl = el("div", "main");
+	const header = el("header", "app-header");
+	const menuBtn = iconButton("menu", "打开仓库导航", "icon-btn menu-btn");
+	menuBtn.setAttribute("aria-controls", "sidebar");
 	menuBtn.setAttribute("aria-expanded", "false");
 	menuBtn.onclick = () => setSidebar(!document.body.classList.contains("sidebar-open"));
 	menuBtnEl = menuBtn;
-	const brand = el("a", "brand-small", "◈ ") as HTMLAnchorElement;
-	brand.append(el("span", "brand-word", "LiteSync"));
-	brand.setAttribute("aria-label", "LiteSync 首页");
-	brand.href = "#/";
-	// 仓库切换器（v0.19 多仓库；名下只有一个仓库时不渲染）。
-	// 切换 = 换一个仓库重新进入（各仓库的 E2EE 独立解锁）
-	let vaultSel: HTMLSelectElement | null = null;
-	if (S!.vaults.length > 1) {
-		vaultSel = el("select", "vault-switch") as HTMLSelectElement;
-		for (const v of S!.vaults) {
-			const opt = el("option", "", v.name || v.id) as HTMLOptionElement;
-			opt.value = v.id;
-			if (v.current) opt.selected = true;
-			vaultSel.append(opt);
-		}
-		vaultSel.onchange = async () => {
-			// 主动切库：草稿落不了盘就暂停切换（需求 §7.3）
-			if (!(await guardVaultLeave())) {
-				vaultSel!.value = currentVaultId();
-				return;
-			}
-			await leaveEditor();
-			await waitBackgroundSaves();
-			rememberVault(vaultSel!.value);
-			history.replaceState(null, "", "#/");
-			location.reload(); // 仓库间的密钥/状态彻底隔离：整页重进最干净
-		};
-	}
-	const searchWrap = el("div", "search-wrap");
-	searchInput = el("input", "search") as HTMLInputElement;
-	searchInput.placeholder = "🔍 搜索笔记…";
-	searchInput.setAttribute("aria-label", "搜索笔记（回车在正文中搜索）");
-	searchResults = el("div", "search-results");
-	searchResults.hidden = true;
-	searchInput.oninput = () => renderSearch(searchInput.value.trim());
-	searchInput.onkeydown = (e) => {
-		// 回车 = 在正文中搜索（文件名匹配已在下拉里即时显示）
-		if (e.key === "Enter" && searchInput.value.trim() && !e.isComposing) {
-			searchResults.hidden = true;
-			location.hash = `#/search/${encodeURIComponent(searchInput.value.trim())}`;
-		}
-	};
-	searchInput.onblur = () => setTimeout(() => (searchResults.hidden = true), 200);
-	searchInput.onfocus = () => renderSearch(searchInput.value.trim());
-	searchWrap.append(searchInput, searchResults);
-	const spacer = el("div", "spacer");
-	// v0.18 角色化导航：运维/设置/用户管理只属于管理员（服务端另有硬关卡，
-	// 这里只是别把用户点不动的按钮摆出来）；「账户」对所有人可见
-	const isAdmin = S!.me?.role !== "user";
-	const settingsBtn = el("button", "icon-btn", "⚙");
-	settingsBtn.title = "设置（备份管理）";
-	settingsBtn.hidden = !isAdmin;
-	settingsBtn.onclick = () => {
-		location.hash = "#/settings/backup";
-	};
-	// 运维入口（§11.3）：设备撤销、迁移进度、完整性告警、分享与灾备恢复。
-	// 单独一个入口而不是塞进备份页——出事时要能一眼找到
-	const opsBtn = el("button", "icon-btn", "🛠");
-	opsBtn.title = "运维（设备 / 迁移 / 完整性 / 恢复）";
-	opsBtn.hidden = !isAdmin;
-	opsBtn.onclick = () => {
-		location.hash = "#/settings/ops";
-	};
-	const usersBtn = el("button", "icon-btn", "👥");
-	usersBtn.title = "用户管理（邀请 / 禁用 / 删除）";
-	usersBtn.hidden = !isAdmin;
-	usersBtn.onclick = () => {
-		location.hash = "#/settings/users";
-	};
-	const vaultsBtn = el("button", "ghost small-btn", "我的仓库");
-	vaultsBtn.title = "返回仓库列表（会锁定当前仓库）";
-	vaultsBtn.onclick = () => confirmLeave("#/vaults");
-	const accountBtn = el("button", "ghost small-btn", "账号");
-	accountBtn.title = "账号与设备（会锁定当前仓库）";
-	accountBtn.onclick = () => confirmLeave("#/me");
-	const themeBtn = el("button", "icon-btn", "☀");
-	themeBtn.title = "切换主题";
-	themeBtn.onclick = toggleTheme;
-	const lockBtn = el("button", "icon-btn", "🔒");
-	lockBtn.title = "锁定（丢弃内存中的密钥）";
-	lockBtn.hidden = !S!.vaultDoc?.enabled;
-	lockBtn.onclick = () => {
+	const crumbs = el("nav", "crumbs");
+	crumbs.setAttribute("aria-label", "当前位置");
+	// W02：单仓库、手机宽度也一直看得到当前仓库
+	const chip = el("span", "vault-crumb vault-chip");
+	chip.title = `当前仓库：${name}`;
+	chip.append(el("span", "sr-only", "当前仓库："), document.createTextNode(name));
+	crumbHereEl = el("span", "crumb-here", "概览");
+	crumbs.append(chip, el("span", "slash", "/"), crumbHereEl);
+	const right = el("div", "header-right");
+	syncPillEl = el("span", "pill sync-pill");
+	const lockBtn = iconButton("lock", "锁定当前仓库", "icon-btn lock-btn", () => {
 		// 先把未保存的编辑加密写入本机草稿（有限等待），再丢弃内存里的密钥
 		void lockNow("已锁定", true);
-	};
-	const outBtn = el("button", "icon-btn", "⏻");
-	outBtn.title = "退出登录";
-	outBtn.onclick = () => {
-		void logout().then(() => {
-			announceAccount(""); // 同一浏览器的其他标签页随之清掉可见内容
-			location.hash = "";
-			location.reload();
-		});
-	};
-	// 次要操作：桌面宽度下与原来一样平铺在顶栏（display: contents）；
-	// 手机宽度下收进「⋯」菜单，顶栏只留 菜单 / 品牌 / 搜索 / 锁定（390px 不出现横向滚动）
-	settingsBtn.dataset.label = "设置";
-	opsBtn.dataset.label = "运维";
-	usersBtn.dataset.label = "用户管理";
-	themeBtn.dataset.label = "切换主题";
-	outBtn.dataset.label = "退出登录";
-	outBtn.classList.add("out-btn");
-	const actions = el("div", "header-actions");
-	actions.id = "header-actions";
-	actions.append(vaultsBtn, usersBtn, opsBtn, settingsBtn, accountBtn, themeBtn, outBtn);
-	const moreBtn = el("button", "icon-btn more-btn", "⋯");
-	moreBtn.title = "更多操作";
-	moreBtn.setAttribute("aria-label", "更多操作");
-	moreBtn.setAttribute("aria-controls", actions.id);
-	moreBtn.setAttribute("aria-expanded", "false");
-	const setMenu = (open: boolean) => {
-		header.classList.toggle("actions-open", open);
-		moreBtn.setAttribute("aria-expanded", String(open));
-	};
-	moreBtn.onclick = (e) => {
-		e.stopPropagation();
-		setMenu(!header.classList.contains("actions-open"));
-	};
-	actions.addEventListener("click", () => setMenu(false));
-	document.addEventListener("click", (e) => {
-		if (!actions.contains(e.target as Node)) setMenu(false);
 	});
-	document.addEventListener("keydown", (e) => {
-		if (e.key === "Escape" && header.classList.contains("actions-open")) {
-			setMenu(false);
-			moreBtn.focus();
-		}
-	});
-	header.append(menuBtn, brand);
-	// W02：单仓库、手机宽度也一直看得到当前仓库（多仓库的桌面上由切换器显示）
-	const chip = el("span", "vault-chip" + (vaultSel ? " has-switch" : ""));
-	chip.title = `当前仓库：${currentVaultName()}`;
-	chip.append(el("span", "sr-only", "当前仓库："), document.createTextNode(currentVaultName()));
-	header.append(chip);
-	if (vaultSel) header.append(vaultSel);
-	header.append(searchWrap, spacer, actions, lockBtn, moreBtn);
-
-	// 三栏
-	treeEl = el("aside", "tree");
-	treeEl.id = "tree";
-	treeEl.setAttribute("aria-label", "文件树");
+	lockBtn.title = "锁定仓库（丢弃内存中的密钥）";
+	lockBtn.hidden = !encrypted;
+	right.append(syncPillEl, themeButton(toggleTheme), lockBtn);
+	header.append(menuBtn, crumbs, right);
+	const body = el("div", "main-body");
 	contentEl = el("main", "content");
+	contentEl.id = "content";
 	outlineEl = el("aside", "outline");
-
-	// Footer
-	statusEl = el("footer");
-
-	layout.append(header, treeEl, contentEl, outlineEl, statusEl);
-	// 手机上文件树是抽屉：遮罩点一下就关（放在网格外，不占格子）
+	outlineEl.setAttribute("aria-label", "本页目录");
+	body.append(contentEl, outlineEl);
+	statusEl = el("footer", "app-footer");
+	mainEl.append(header, body, statusEl);
+	shell.append(sidebarEl, mainEl);
+	// 手机上侧栏是抽屉：遮罩点一下就关
 	const scrim = el("div", "sidebar-backdrop");
 	scrim.onclick = () => setSidebar(false);
-	app.append(layout, scrim);
+	app.append(shell, scrim);
 	syncSidebar();
+	// 顶栏状态跟着编辑器的真实保存状态走（.save-status 的 data-state）
+	new MutationObserver(() => updateSyncPill()).observe(contentEl, { subtree: true, attributes: true, attributeFilter: ["data-state"] });
 
 	renderTree();
 	updateStatus();
+	void refreshDraftCount();
 	window.onhashchange = onRoute;
 }
 
+/** 顶栏面包屑里「当前位置」那一段。 */
+function setHere(text: string): void {
+	if (crumbHereEl) {
+		crumbHereEl.textContent = text;
+		crumbHereEl.title = text;
+	}
+	// 侧栏里对应当前页面的入口（概览、回收站、实例管理）标成当前位置
+	const here = location.hash === "" ? "#/" : location.hash;
+	sidebarEl?.querySelectorAll<HTMLAnchorElement>("a.side-link").forEach((a) => {
+		const on = a.getAttribute("href") === here;
+		a.classList.toggle("active", on);
+		if (on) a.setAttribute("aria-current", "page");
+		else a.removeAttribute("aria-current");
+	});
+}
+
+// ---------- 顶栏的保存同步状态（真实来源：编辑器状态、后台上传、本机草稿、最近一次与服务器通信） ----------
+let pollOffline = false;
+let draftCount = 0;
+
+interface PillView {
+	tone: "ok" | "warn" | "danger" | "info" | "";
+	icon: IconName;
+	text: string;
+	title: string;
+}
+
+function pillView(): PillView {
+	if (!canEdit()) {
+		return { tone: "", icon: "eye", text: "只读", title: readOnlyMember() ? "你在这个仓库里是只读成员：可以阅读和搜索，不能修改" : "这里只能阅读（网页编辑没有开启，或仓库暂时只读）" };
+	}
+	const st = S?.editor ? contentEl?.querySelector<HTMLElement>(".save-status")?.dataset.state : undefined;
+	switch (st) {
+		case "dirty":
+			return { tone: "warn", icon: "clock", text: "未保存", title: "这篇笔记有还没保存的修改" };
+		case "drafted":
+			return { tone: "warn", icon: "clock", text: "本机草稿", title: "修改已加密保存在这台设备上，等待同步到服务器" };
+		case "uploading":
+			return { tone: "info", icon: "refresh", text: "同步中", title: "正在上传到服务器" };
+		case "offline":
+			return { tone: "warn", icon: "cloud", text: "离线", title: "网络断开：修改留在本机，恢复后自动同步" };
+		case "conflict":
+			return { tone: "danger", icon: "warn", text: "有冲突", title: "这篇笔记有冲突，需要处理" };
+		case "quota":
+			return { tone: "danger", icon: "warn", text: "容量不足", title: "存储配额已满，修改没有上传" };
+		case "auth":
+			return { tone: "danger", icon: "warn", text: "需重新登录", title: "登录已过期，修改没有上传" };
+		case "error":
+			return { tone: "danger", icon: "warn", text: "保存失败", title: "保存失败，修改还在编辑器里" };
+	}
+	if (backgroundSaves.size > 0) return { tone: "info", icon: "refresh", text: "同步中", title: "正在把刚离开的笔记上传到服务器" };
+	if (pollOffline) return { tone: "warn", icon: "cloud", text: "离线", title: "连不上服务器：显示的是上一次载入的内容" };
+	if (draftCount > 0) return { tone: "warn", icon: "clock", text: "本机草稿", title: `有 ${draftCount} 篇笔记的修改只在这台设备上，打开即可继续同步` };
+	return { tone: "ok", icon: "check", text: "已同步", title: "这台浏览器里的修改都已保存到服务器" };
+}
+
+function updateSyncPill(): void {
+	if (!syncPillEl) return;
+	const v = pillView();
+	const key = `${v.tone}|${v.text}|${v.title}`;
+	if (syncPillEl.dataset.key === key) return;
+	syncPillEl.dataset.key = key;
+	syncPillEl.className = "pill sync-pill" + (v.tone ? " " + v.tone : "");
+	syncPillEl.replaceChildren(icon(v.icon), el("span", "", v.text));
+	syncPillEl.title = v.title;
+}
+
+/** 本机还有未同步的加密草稿的笔记数（不算正在后台上传的）。 */
+async function refreshDraftCount(): Promise<void> {
+	const ds = S?.drafts;
+	if (!ds) return;
+	const alive = fence();
+	const all = await ds.listFiles().catch(() => []);
+	if (!alive()) return;
+	draftCount = all.filter((d) => !backgroundSaves.has(d.fileKey)).length;
+	updateSyncPill();
+}
+window.addEventListener("offline", () => {
+	pollOffline = true;
+	updateSyncPill();
+});
+window.addEventListener("online", () => void pollRemote());
+
 function updateStatus(extra?: string): void {
-	const e2ee = S!.vaultDoc?.enabled ? "已解锁（端到端加密）" : "未加密的旧仓库";
-	const latest = S!.files.reduce((m, f) => Math.max(m, f.mtime), 0);
-	statusEl.textContent =
-		`${e2ee} · ${S!.files.length} 个文件` +
+	if (!statusEl || !S) return;
+	const latest = S.files.reduce((m, f) => Math.max(m, f.mtime), 0);
+	const left = el("span", "footer-main",
+		`${S.files.length} 个文件 · ${currentVaultName()}` +
 		(latest ? ` · 更新于 ${fmtTime(latest)}` : "") +
-		(extra ? ` · ${extra}` : "");
+		(extra ? ` · ${extra}` : ""));
+	const right = el("span", "footer-session");
+	right.append(icon(S.vaultDoc?.enabled ? "lock" : "info"), el("span", "", S.vaultDoc?.enabled ? "仅本次会话已解锁 · 离开工作台会锁定" : "未加密的旧仓库"));
+	statusEl.replaceChildren(left, right);
+	updateSyncPill();
 }
 
 // ---------- 文件树 ----------
@@ -1435,18 +1635,12 @@ function buildTreeModel(): TreeDir {
 
 function renderTree(): void {
 	treeEl.innerHTML = "";
-	if (canEdit()) {
-		const add = el("button", "ghost tree-new", "＋ 新建笔记");
-		add.onclick = () => void showNewNote();
-		treeEl.append(add);
-	} else if (readOnlyMember()) {
-		treeEl.append(el("p", "muted small tree-readonly", "你在这个仓库里是只读成员：可以阅读和搜索，不能新建或修改。"));
-	}
-	const root = buildTreeModel();
-	treeEl.append(renderDirChildren(root));
-	const trash = el("a", "tree-trash", "🗑 回收站") as HTMLAnchorElement;
-	trash.href = "#/trash";
-	treeEl.append(trash);
+	if (S!.files.length === 0) treeEl.append(el("p", "muted small tree-empty", "还没有笔记"));
+	treeEl.append(renderDirChildren(buildTreeModel()));
+}
+
+function fileIcon(path: string): IconName {
+	return path.toLowerCase().endsWith(".md") ? "file" : IMAGE_EXT.test(path) ? "image" : "attachment";
 }
 
 function renderDirChildren(dir: TreeDir): HTMLElement {
@@ -1456,7 +1650,8 @@ function renderDirChildren(dir: TreeDir): HTMLElement {
 		const details = document.createElement("details");
 		details.open = true;
 		const summary = document.createElement("summary");
-		summary.textContent = `📁 ${sub.name}`;
+		summary.append(icon("chevron", "chev"), icon("folder"), el("span", "", sub.name));
+		summary.title = sub.name;
 		details.append(summary, renderDirChildren(sub));
 		box.append(details);
 	}
@@ -1464,7 +1659,8 @@ function renderDirChildren(dir: TreeDir): HTMLElement {
 	for (const f of files) {
 		const a = el("a", "tree-file") as HTMLAnchorElement;
 		a.href = `#/n/${encodeURIComponent(f.path)}`;
-		a.textContent = `${f.path.toLowerCase().endsWith(".md") ? "📄" : "📎"} ${noteTitle(f.path)}`;
+		a.append(icon(fileIcon(f.path)), el("span", "", noteTitle(f.path)));
+		a.title = f.path;
 		a.dataset.path = f.path;
 		box.append(a);
 	}
@@ -1472,43 +1668,82 @@ function renderDirChildren(dir: TreeDir): HTMLElement {
 }
 
 function markActive(path: string | null): void {
-	treeEl.querySelectorAll(".tree-file.active").forEach((n) => n.classList.remove("active"));
+	treeEl.querySelectorAll(".tree-file.active").forEach((n) => {
+		n.classList.remove("active");
+		n.removeAttribute("aria-current");
+	});
 	if (path) {
 		const node = treeEl.querySelector(`.tree-file[data-path="${CSS.escape(path)}"]`);
 		node?.classList.add("active");
+		node?.setAttribute("aria-current", "page");
 		node?.scrollIntoView({ block: "nearest" });
 	}
 }
 
-// ---------- 搜索（文件名） ----------
-function renderSearch(query: string): void {
-	searchResults.innerHTML = "";
-	if (!query) {
-		searchResults.hidden = true;
-		return;
-	}
-	const q = query.toLowerCase();
-	const hits = S!.files.filter((f) => f.path.toLowerCase().includes(q)).slice(0, 20);
-	for (const f of hits) {
-		const item = el("a", "search-item") as HTMLAnchorElement;
-		item.href = `#/n/${encodeURIComponent(f.path)}`;
-		item.append(el("div", "", noteTitle(f.path)), el("div", "muted small", f.path));
-		item.onclick = () => {
-			searchResults.hidden = true;
-			searchInput.value = "";
-		};
-		searchResults.append(item);
-	}
-	if (hits.length === 0) searchResults.append(el("div", "search-item muted", "没有匹配的文件"));
-	// 正文全文搜索（需求 §7.2）：在本机建索引，不把明文发给服务器
-	const full = el("a", "search-item search-fulltext") as HTMLAnchorElement;
-	full.href = `#/search/${encodeURIComponent(query)}`;
-	full.append(el("div", "", `🔎 在正文中搜索「${query}」`), el("div", "muted small", "在本机解密建索引（回车也可以）"));
-	full.onclick = () => {
-		searchResults.hidden = true;
+// ---------- 搜索（V2：侧栏「搜索笔记」/ Ctrl+K 打开的对话框；标题与路径即时匹配，回车在正文中搜索） ----------
+function openSearchDialog(): void {
+	if (!S || document.querySelector(".dialog-backdrop")) return;
+	const dlg = openDialog("搜索笔记");
+	const field = el("label", "field search-field");
+	field.append(el("span", "", `在已解锁的「${currentVaultName()}」中查找`));
+	const input = el("input", "search") as HTMLInputElement;
+	input.type = "search";
+	input.placeholder = "标题或路径；回车在正文中搜索";
+	input.autocomplete = "off";
+	input.spellcheck = false;
+	field.append(input);
+	const results = el("div", "modal-list search-list");
+	const go = (hash: string) => {
+		dlg.close(true);
+		location.hash = hash;
 	};
-	searchResults.append(full);
-	searchResults.hidden = false;
+	const item = (f: FileEntry): HTMLElement => {
+		const a = el("a", "modal-item") as HTMLAnchorElement;
+		a.href = `#/n/${encodeURIComponent(f.path)}`;
+		const text = el("span", "modal-item-text");
+		text.append(el("strong", "", noteTitle(f.path)), el("small", "", f.path));
+		a.append(icon(fileIcon(f.path)), text, icon("chevron"));
+		a.onclick = (e) => {
+			e.preventDefault();
+			go(a.getAttribute("href")!);
+		};
+		return a;
+	};
+	const render = () => {
+		const q = input.value.trim();
+		results.innerHTML = "";
+		if (!q) {
+			const recent = [...S!.files].filter((f) => f.path.toLowerCase().endsWith(".md")).sort((a, b) => b.mtime - a.mtime).slice(0, 6);
+			if (recent.length) results.append(el("p", "side-label", "最近编辑"), ...recent.map(item));
+			else results.append(el("p", "empty-note", "这个仓库还没有笔记。"));
+			return;
+		}
+		const lower = q.toLowerCase();
+		const hits = S!.files.filter((f) => f.path.toLowerCase().includes(lower)).slice(0, 20);
+		if (hits.length) results.append(...hits.map(item));
+		else results.append(el("p", "empty-note", "没有匹配的标题或路径。"));
+		// 正文全文搜索（需求 §7.2）：在本机建索引，不把明文发给服务器
+		const full = el("a", "modal-item search-fulltext") as HTMLAnchorElement;
+		full.href = `#/search/${encodeURIComponent(q)}`;
+		const text = el("span", "modal-item-text");
+		text.append(el("strong", "", `在正文中搜索「${q}」`), el("small", "", "在这台设备上解密建索引（回车也可以）"));
+		full.append(icon("search"), text, icon("chevron"));
+		full.onclick = (e) => {
+			e.preventDefault();
+			go(full.getAttribute("href")!);
+		};
+		results.append(full);
+	};
+	input.oninput = render;
+	input.onkeydown = (e) => {
+		if (e.key === "Enter" && !e.isComposing && input.value.trim()) {
+			e.preventDefault();
+			go(`#/search/${encodeURIComponent(input.value.trim())}`);
+		}
+	};
+	dlg.body.append(field, results, el("p", "muted small", "正文搜索只在这台设备上解密建索引，搜索词不会发给服务器。"));
+	render();
+	setTimeout(() => input.focus(), 0);
 }
 
 // ---------- 正文全文搜索（需求 §7.2；验收 KY-03） ----------
@@ -1528,6 +1763,7 @@ async function showSearchPage(q: string): Promise<void> {
 	contentEl.innerHTML = "";
 	const wrap = el("div", "note-wrap");
 	contentEl.append(wrap);
+	setHere("搜索");
 	wrap.append(el("h1", "", `搜索「${q}」`));
 	wrap.append(el("p", "muted small", "正文索引只在这个浏览器的内存里建立，锁定、刷新或离开仓库即清除；搜索时不会把任何明文发给服务器。"));
 	const progress = el("p", "muted small search-progress");
@@ -1673,69 +1909,111 @@ async function routeTo(): Promise<void> {
 	}
 }
 
-// ---------- 首页：最近笔记 ----------
+/** 笔记所在的文件夹（列表里的第二行）。 */
+function folderLabel(path: string): string {
+	return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "仓库根目录";
+}
+
+/** 最近编辑里的一行：标题、位置、相对时间（数据来自文件列表的真实修改时间）。 */
+function noteRow(f: FileEntry): HTMLElement {
+	const a = el("a", "note-row") as HTMLAnchorElement;
+	a.href = `#/n/${encodeURIComponent(f.path)}`;
+	const sym = el("span", "note-symbol");
+	sym.append(icon("file"));
+	const meta = el("span", "note-meta");
+	meta.append(el("strong", "", noteTitle(f.path)), el("small", "", `${folderLabel(f.path)} · ${fmtRelative(f.mtime)}`));
+	a.append(sym, meta, icon("chevron", "row-chev"));
+	return a;
+}
+
+/** 两个次要任务：连接 Obsidian、管理仓库（离开工作台，先说明会锁定）。 */
+function quickActions(vaultName: string): HTMLElement {
+	const box = el("div", "quick-actions");
+	if (S!.account) {
+		const connect = el("button", "action-card") as HTMLButtonElement;
+		connect.type = "button";
+		const t = el("span", "action-text");
+		t.append(el("strong", "", "连接 Obsidian"), el("small", "", "在设备之间继续你的笔记"));
+		connect.append(icon("logo", "lead-icon"), t, icon("arrow"));
+		connect.onclick = () => void openConnectDialog(S!.account!, { id: currentVaultId(), name: vaultName || "当前仓库" });
+		box.append(connect);
+	}
+	const vaults = el("button", "action-card") as HTMLButtonElement;
+	vaults.type = "button";
+	const t2 = el("span", "action-text");
+	t2.append(el("strong", "", "管理仓库"), el("small", "", "新建仓库，或换一个仓库（会锁定当前仓库）"));
+	vaults.append(icon("folder", "lead-icon"), t2, icon("arrow"));
+	vaults.onclick = () => confirmLeave("#/vaults");
+	box.append(vaults);
+	return box;
+}
+
+const RECENT_FIRST = 6;
+const RECENT_MORE = 12;
+
+// ---------- 首页（概览）：标题、最近编辑、两个次要任务 ----------
 function showHome(): void {
 	revokeAllBlobs();
 	markActive(null);
+	setHere("概览");
 	outlineEl.innerHTML = "";
 	contentEl.innerHTML = "";
-	const wrap = el("div", "note-wrap");
-	const hour = new Date().getHours();
-	const greeting = hour < 6 ? "夜深了" : hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好";
-	const recent = [...S!.files]
+	const wrap = el("div", "overview");
+	const notes = [...S!.files]
 		.filter((f) => f.path.toLowerCase().endsWith(".md"))
-		.sort((a, b) => b.mtime - a.mtime)
-		.slice(0, 12);
+		.sort((a, b) => b.mtime - a.mtime);
 	const vaultName = S!.vaults.find((v) => v.current)?.name ?? "";
-	if (recent.length === 0) {
-		// UI 焕新 U4（审查 02）：刚建好的空仓库，首页直接给下一步，而不是一页空白。
-		const empty = el("div", "home-empty");
-		empty.append(el("h1", "", vaultName ? `「${vaultName}」还没有笔记` : "还没有笔记"));
-		empty.append(el("p", "muted", canEdit() ? "在网页里写第一篇，或者连接 Obsidian，把这个仓库同步到你的电脑和手机。已有本地笔记的，连接时可以选择怎么导入。" : "连接 Obsidian 后，这里会显示同步上来的笔记。网页编辑在这个仓库里不可用（只读成员、未开启网页编辑，或者仓库还没有解锁）。"));
-		const actions = el("div", "home-actions");
-		if (canEdit()) {
-			const first = el("button", "primary", "新建第一篇笔记");
-			first.onclick = () => showNewNote();
-			actions.append(first);
-		}
-		if (S!.account) {
-			const connect = el("button", canEdit() ? "" : "primary", "连接 Obsidian");
-			connect.onclick = () => void openConnectDialog(S!.account!, { id: currentVaultId(), name: vaultName || "当前仓库" });
-			actions.append(connect);
-		}
-		empty.append(actions);
+	const writable = canEdit();
+	const head = el("div", "headline");
+	const text = el("div", "headline-text");
+	text.append(el("p", "eyebrow", "继续你的思考"));
+	head.append(text);
+	if (notes.length === 0) {
+		// 空仓库：短空态 + 唯一的创建动作（审查 02）；不能新建时如实说明为什么
+		text.append(el("h1", "", vaultName ? `「${vaultName}」还没有笔记` : "还没有笔记"),
+			el("p", "lead", writable ? "写下第一篇，或者连接 Obsidian，把这个仓库同步到你的电脑和手机。" : "连接 Obsidian 后，这里会显示同步上来的笔记。"));
+		wrap.append(head);
+		const empty = el("section", "empty-card");
+		empty.append(icon("file", "empty-icon"), el("p", "", writable
+			? "已经有本地笔记的，连接 Obsidian 时可以选择怎么导入。"
+			: "网页编辑在这个仓库里不可用（只读成员、未开启网页编辑，或者仓库还没有解锁）。"));
+		if (writable) empty.append(labelButton("plus", "新建第一篇笔记", "btn primary", () => showNewNote()));
 		wrap.append(empty);
-		contentEl.append(wrap);
-		updateStatus();
-		return;
+	} else {
+		text.append(el("h1", "", "把想法，写成下一步。"), el("p", "lead", "最近的笔记和常用操作，都在这里。"));
+		if (writable) head.append(labelButton("plus", "新建笔记", "btn primary home-new", () => showNewNote()));
+		wrap.append(head);
+		const sec = el("section", "recent");
+		const title = el("div", "section-title");
+		const h2 = el("h2", "", "最近编辑");
+		h2.id = "recent-title";
+		sec.setAttribute("aria-labelledby", h2.id);
+		title.append(h2, el("span", "small muted", `共 ${notes.length} 篇`));
+		const list = el("div", "note-list");
+		let shown = Math.min(RECENT_FIRST, notes.length);
+		const more = labelButton("down", "", "btn text more-notes");
+		const renderRows = () => {
+			list.replaceChildren(...notes.slice(0, shown).map(noteRow));
+			const left = notes.length - shown;
+			more.hidden = left <= 0;
+			more.replaceChildren(icon("down"), el("span", "", `再显示 ${Math.min(RECENT_MORE, left)} 篇`));
+		};
+		more.onclick = () => {
+			const first = shown;
+			shown = Math.min(notes.length, shown + RECENT_MORE);
+			renderRows();
+			list.querySelectorAll<HTMLElement>(".note-row")[first]?.focus();
+		};
+		renderRows();
+		sec.append(title, list, more);
+		wrap.append(sec);
+		if (writable) {
+			const drafts = el("div", "draft-list");
+			drafts.id = "draft-list";
+			wrap.append(drafts);
+		}
 	}
-	const head = el("div", "home-head");
-	head.append(el("h1", "", greeting));
-	if (canEdit()) {
-		const add = el("button", "primary", "新建笔记");
-		add.onclick = () => showNewNote();
-		head.append(add);
-	}
-	wrap.append(head);
-	wrap.append(el("p", "muted", "最近的笔记"));
-	const list = el("div", "recent-list");
-	for (const f of recent) {
-		const card = el("a", "recent-card") as HTMLAnchorElement;
-		card.href = `#/n/${encodeURIComponent(f.path)}`;
-		const dir = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "/";
-		card.append(
-			el("div", "recent-title", noteTitle(f.path)),
-			el("div", "muted small", dir),
-			el("div", "muted small", `更新于 ${fmtTime(f.mtime)}`),
-		);
-		list.append(card);
-	}
-	wrap.append(list);
-	if (canEdit()) {
-		const drafts = el("div", "draft-list");
-		drafts.id = "draft-list";
-		wrap.append(drafts);
-	}
+	wrap.append(quickActions(vaultName));
 	contentEl.append(wrap);
 	void renderDraftList();
 	updateStatus();
@@ -1753,6 +2031,7 @@ async function showNote(path: string): Promise<void> {
 	if (!current()) return;
 	revokeAllBlobs();
 	markActive(path);
+	setHere(noteTitle(path));
 	contentEl.innerHTML = "";
 	outlineEl.innerHTML = "";
 	const wrap = el("div", "note-wrap");
@@ -1769,7 +2048,7 @@ async function showNote(path: string): Promise<void> {
 	headRow.append(...noteHeadParts(path, entry.fileId));
 	wrap.append(headRow);
 	wrap.append(el("h1", "note-title", noteTitle(path)));
-	wrap.append(el("p", "muted small", `最后修改 ${fmtTime(entry.mtime)} · 版本 ${entry.revision}`));
+	wrap.append(el("p", "muted small note-meta-line", `最后修改 ${fmtTime(entry.mtime)} · 版本 ${entry.revision}`));
 
 	const body = el("div", "markdown-body");
 	wrap.append(body);
@@ -1951,6 +2230,7 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 	const wrap = el("div", "note-wrap");
 	contentEl.append(wrap);
 
+	setHere(`${noteTitle(path)} · 版本 ${v.revision}`);
 	const banner = el("div", "banner");
 	banner.append(el("span", "", `正在查看版本 ${v.revision} · ${fmtTime(v.createdAt * 1000)}`));
 	const cmpBtn = el("button", "ghost", "与当前版本对比");
@@ -2075,6 +2355,7 @@ async function showTrash(): Promise<void> {
 	contentEl.innerHTML = "";
 	const wrap = el("div", "note-wrap");
 	contentEl.append(wrap);
+	setHere("回收站");
 	wrap.append(el("h1", "", "回收站"));
 	wrap.append(el("p", "muted", "删除的文件在这里保留一段时间。恢复会沿用原来的文件身份和全部历史，并生成一个新版本，所有设备都会收到。"));
 	const list = el("div", "trash-list");
@@ -2300,8 +2581,9 @@ async function showBackupSettings(): Promise<void> {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
+	setHere("备份");
 	head.append(el("h1", "note-title", "备份"));
-	const backBtn = el("button", "ghost", "← 返回");
+	const backBtn = labelButton("back", "返回", "btn ghost");
 	backBtn.onclick = () => {
 		location.hash = "#/";
 	};
@@ -2726,8 +3008,9 @@ async function showOpsSettings(): Promise<void> {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
+	setHere("运维");
 	head.append(el("h1", "note-title", "运维"));
-	const backBtn = el("button", "ghost", "← 返回");
+	const backBtn = labelButton("back", "返回", "btn ghost");
 	backBtn.onclick = () => {
 		location.hash = "#/";
 	};
@@ -3105,8 +3388,9 @@ function showAccount(): void {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
+	setHere("API Token");
 	head.append(el("h1", "note-title", "账户"));
-	const backBtn = el("button", "ghost", "← 返回");
+	const backBtn = labelButton("back", "返回", "btn ghost");
 	backBtn.onclick = () => {
 		location.hash = "#/";
 	};
@@ -3312,8 +3596,9 @@ async function showUsersAdmin(): Promise<void> {
 	const wrap = el("div", "note-wrap settings-wrap");
 	contentEl.append(wrap);
 	const head = el("div", "note-head");
+	setHere("用户管理");
 	head.append(el("h1", "note-title", "用户管理"));
-	const backBtn = el("button", "ghost", "← 返回");
+	const backBtn = labelButton("back", "返回", "btn ghost");
 	backBtn.onclick = () => {
 		location.hash = "#/";
 	};

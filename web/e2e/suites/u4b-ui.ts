@@ -35,7 +35,7 @@ await new Suite().run(async (s) => {
 	await waitState(page, "synced");
 	await page.locator(".note-more summary").waitFor({ timeout: 10000 });
 	const sameEditor = await page.evaluate(() => (document.querySelector(".cm-content") as any)?.__u4b === 1);
-	s.check("新笔记第一次保存后就地出现「更多」与「历史版本」，编辑器没有重建", sameEditor && (await page.getByRole("button", { name: "🕘 历史版本" }).count()) === 1);
+	s.check("新笔记第一次保存后就地出现「更多」与「历史版本」，编辑器没有重建", sameEditor && (await page.getByRole("button", { name: "历史版本" }).count()) === 1);
 	await page.keyboard.insertText("，接着输入");
 	const typingState = await page.locator(".save-status").getAttribute("data-state");
 	s.check("已同步之后继续输入：状态立刻变成「未保存」或「已存本机草稿」，不再显示「已同步」", typingState === "dirty" || typingState === "drafted", `state=${typingState}`);
@@ -71,7 +71,7 @@ await new Suite().run(async (s) => {
 	await page.setViewportSize({ width: 1280, height: 800 });
 
 	// ---- 3. 历史抽屉（W08）：键盘打开、焦点进出、Tab 不出抽屉、Esc / 遮罩关闭 ----
-	const hist = page.getByRole("button", { name: "🕘 历史版本" });
+	const hist = page.getByRole("button", { name: "历史版本" });
 	await hist.focus();
 	await page.keyboard.press("Enter");
 	await page.locator(".drawer button.drawer-item").first().waitFor({ timeout: 10000 });
@@ -93,37 +93,46 @@ await new Suite().run(async (s) => {
 	await page.setViewportSize({ width: 390, height: 844 });
 	await sleep(300);
 	const menu = page.locator(".menu-btn");
-	const treeInert = () => page.evaluate(() => (document.getElementById("tree") as any)?.inert === true);
-	s.check("手机：文件树收起时整棵树 inert，☰ 的 aria-expanded=false", (await treeInert()) && (await menu.getAttribute("aria-expanded")) === "false");
+	// UI v2：手机上整个侧栏（仓库选择器、搜索、文件树、账号）是抽屉；收起时整个侧栏 inert，打开时正文 inert
+	const treeInert = () => page.evaluate(() => (document.getElementById("sidebar") as any)?.inert === true);
+	s.check("手机：侧栏收起时整个抽屉 inert，菜单按钮 aria-expanded=false", (await treeInert()) && (await menu.getAttribute("aria-expanded")) === "false");
 	await menu.click();
-	await until(async () => page.evaluate(() => !!document.activeElement?.closest("#tree")), 3000);
-	s.check("手机：点 ☰ 打开文件树，焦点进入树，aria-expanded=true",
-		(await page.evaluate(() => !!document.activeElement?.closest("#tree"))) && (await menu.getAttribute("aria-expanded")) === "true" && !(await treeInert()));
+	await until(async () => page.evaluate(() => !!document.activeElement?.closest("#sidebar")), 3000);
+	s.check("手机：点菜单按钮打开侧栏，焦点进入抽屉，aria-expanded=true，正文 inert",
+		(await page.evaluate(() => !!document.activeElement?.closest("#sidebar"))) && (await menu.getAttribute("aria-expanded")) === "true" && !(await treeInert())
+		&& (await page.evaluate(() => (document.querySelector(".main") as any)?.inert === true)));
+	for (let i = 0; i < 12; i++) await page.keyboard.press("Tab");
+	const trapped = await page.evaluate(() => !!document.activeElement?.closest("#sidebar"));
 	await page.keyboard.press("Escape");
 	await sleep(250);
-	s.check("手机：Esc 关闭文件树，焦点回到 ☰，树重新 inert",
-		(await page.evaluate(() => !!document.activeElement?.classList.contains("menu-btn"))) && (await treeInert()));
+	s.check("手机：抽屉里连按 Tab 不离开抽屉；Esc 关闭，焦点回到菜单按钮，侧栏重新 inert",
+		trapped && (await page.evaluate(() => !!document.activeElement?.classList.contains("menu-btn"))) && (await treeInert()));
 	const chip = page.locator(".vault-chip");
 	s.check("手机：顶栏一直显示当前仓库名，且没有横向溢出",
 		(await chip.isVisible()) && ((await chip.textContent()) ?? "").includes(VAULT) && (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)));
 	await page.setViewportSize({ width: 1280, height: 800 });
 
 	// ---- 5. 离开工作台（W03）：动作之前说明会锁定；回来时写明仓库与原因 ----
-	await page.getByRole("button", { name: "我的仓库" }).click();
+	// UI v2：去「我的仓库」的入口在侧栏的仓库选择器里（「切换仓库」对话框 → 我的仓库）
+	const toVaults = async () => {
+		await page.locator(".vault-select").click();
+		await page.getByRole("dialog", { name: "切换仓库" }).getByRole("button", { name: "我的仓库" }).click();
+	};
+	await toVaults();
 	const leave = page.getByRole("dialog");
 	await leave.waitFor({ timeout: 5000 });
 	const leaveText = (await leave.textContent()) ?? "";
 	await leave.getByRole("button", { name: "留在这里" }).click();
 	s.check("点「我的仓库」先说明会锁定、回来要再输仓库密码；「留在这里」不离开",
 		leaveText.includes("锁定") && leaveText.includes("仓库密码") && (await page.locator(".tree").isVisible()) && !(await page.locator(".dialog").count()));
-	await page.getByRole("button", { name: "我的仓库" }).click();
+	await toVaults();
 	await page.getByRole("dialog").getByRole("button", { name: "锁定并前往" }).click();
 	await page.getByRole("heading", { name: "我的仓库" }).waitFor({ timeout: 20000 });
 	const card = page.locator(".vault-card", { hasText: VAULT });
 	s.check("仓库列表里标出「上次打开」", (await card.locator(".chip", { hasText: "上次打开" }).count()) === 1);
-	await card.getByRole("button", { name: "解锁并打开" }).click();
-	await page.locator('input[placeholder="仓库密码"]').waitFor({ timeout: 20000 });
-	const unlockText = (await page.locator(".center-card").textContent()) ?? "";
+	await card.getByRole("button", { name: "打开仓库" }).click();
+	await page.locator("#vault-password").waitFor({ timeout: 20000 });
+	const unlockText = (await page.locator(".unlock-card").textContent()) ?? "";
 	s.check("回来时的解锁页写明仓库名与锁定原因，并有「返回我的仓库」",
 		unlockText.includes(`解锁「${VAULT}」`) && unlockText.includes("离开工作台时已锁定") && (await page.getByRole("link", { name: "返回我的仓库" }).count()) === 1, unlockText.slice(0, 120));
 	await unlock(page, PW);
@@ -228,16 +237,18 @@ await new Suite().run(async (s) => {
 	const loginCard = async (mode: string, query = "") => {
 		await p2.route("**/auth/config", (route: any) => route.fulfill({ json: { oidc: true, legacyTokenLogin: false, registrationMode: mode } }));
 		await p2.goto(E2E.base + "/" + query);
-		await p2.locator(".login-card").waitFor({ timeout: 15000 });
-		const text = (await p2.locator(".login-card").textContent()) ?? "";
+		await p2.locator(".welcome-form").waitFor({ timeout: 15000 });
+		const text = (await p2.locator(".welcome-form").textContent()) ?? "";
 		const create = p2.getByRole("link", { name: /创建账号/ });
 		const href = (await create.count()) ? await create.getAttribute("href") : null;
 		await p2.unroute("**/auth/config");
 		return { text, href };
 	};
 	const open = await loginCard("open");
-	s.check("登录页：标题与说明与账号中心一致，开放注册时有「创建账号」",
-		open.text.includes("登录你的账号") && open.text.includes("一个账号可用于 LiteSync 和 Nexus") && !!open.href && open.href.includes("intent=register") && (await p2.getByRole("link", { name: "登录", exact: true }).count()) === 1);
+	s.check("欢迎页（UI v2）：标题与说明、「登录账号」走统一登录，开放注册时有「创建账号」",
+		open.text.includes("继续你的想法") && open.text.includes("一个账号，连接 LiteSync 与 Nexus") && open.text.includes("打开仓库还需输入独立的仓库密码") && !!open.href && open.href.includes("intent=register")
+		&& (await p2.getByRole("link", { name: "登录账号", exact: true }).count()) === 1
+		&& ((await p2.getByRole("link", { name: "登录账号", exact: true }).getAttribute("href")) ?? "").startsWith("/auth/login?"));
 	const inviteNoCode = await loginCard("invite");
 	s.check("登录页：只接受邀请时没有邀请码就不摆注册按钮，说明要用邀请链接", !inviteNoCode.href && inviteNoCode.text.includes("邀请链接"));
 	const invited = await loginCard("invite", "?invite=demo-code");
