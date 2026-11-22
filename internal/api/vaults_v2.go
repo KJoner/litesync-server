@@ -104,7 +104,7 @@ func (h *handlers) createVaultV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if name == "" || len(name) > 64 {
+	if !vaultNameOK(name) {
 		writeCoded(w, http.StatusBadRequest, CodeInvalidBody, "仓库名需为 1–64 个字符", false)
 		return
 	}

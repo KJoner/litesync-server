@@ -7,9 +7,16 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/KJoner/litesync-server/internal/db"
 )
+
+// vaultNameOK：仓库名 1–64 个字符，按 Unicode 码点计数——与网页（[...name].length）和报错文案同一口径。
+// 以前按字节判断，22 个以上的汉字就被拒，报错却写着「1–64 个字符」。
+func vaultNameOK(name string) bool {
+	return name != "" && utf8.RuneCountInString(name) <= 64
+}
 
 // 单用户多仓库（v0.19）：
 //
@@ -84,7 +91,7 @@ func (h *handlers) createVault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if name == "" || len(name) > 64 {
+	if !vaultNameOK(name) {
 		writeErr(w, http.StatusBadRequest, "仓库名需为 1–64 个字符")
 		return
 	}
@@ -129,7 +136,7 @@ func (h *handlers) renameVault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if name == "" || len(name) > 64 {
+	if !vaultNameOK(name) {
 		writeErr(w, http.StatusBadRequest, "仓库名需为 1–64 个字符")
 		return
 	}
