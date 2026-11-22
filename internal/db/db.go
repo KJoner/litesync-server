@@ -226,6 +226,10 @@ func migrateColumns(d *sql.DB) error {
 		// 路径加密仓库的墓碑保留删除前最后一份 LSM1（客户端加密的元数据，服务器看不到里面的路径），
 		// 新设备只凭服务器上的密文与仓库密码就能看到原路径并恢复。存量墓碑为空串：客户端走「手动选择路径」
 		{"tombstones", "encrypted_metadata", `ALTER TABLE tombstones ADD COLUMN encrypted_metadata TEXT NOT NULL DEFAULT ''`, false},
+		// --- UI v2 / I1：账号中心的「用户名」与「昵称」分开（纯新增，默认空串） ---
+		// 登录用户名（preferred_username）快照，只给账号页展示；存量映射在下次登录时补上。
+		// 和邮箱、显示名一样不参与匹配——身份仍然只认 (issuer, subject)。
+		{"external_identities", "username", `ALTER TABLE external_identities ADD COLUMN username TEXT NOT NULL DEFAULT ''`, false},
 	}
 
 	for _, m := range migrations {

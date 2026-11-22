@@ -49,29 +49,35 @@ type ExternalIdentity struct {
 	Email         string
 	EmailVerified bool
 	DisplayName   string
-	CreatedAt     int64
-	LastLoginAt   int64
+	// Username 是身份服务里的登录用户名（preferred_username）快照，只用于账号页展示。
+	// 旧账号的用户名本身就是邮箱；它和昵称、邮箱一样永远不参与匹配。
+	Username    string
+	CreatedAt   int64
+	LastLoginAt int64
 }
 
 // IdentityProfile 是一次登录时从 ID Token 取到的资料快照（不参与匹配）。
 type IdentityProfile struct {
 	Email         string
 	EmailVerified bool
-	DisplayName   string
+	// DisplayName：昵称 → 旧的 name → 不像邮箱的 preferred_username，见 api.idClaims.profile。
+	DisplayName string
+	// Username：preferred_username 原样（去首尾空白），账号页的「登录用户名」只认它，不从昵称推断。
+	Username string
 }
 
 func scanIdentity(sc interface{ Scan(...any) error }) (*ExternalIdentity, error) {
 	e := &ExternalIdentity{}
 	var verified int
 	if err := sc.Scan(&e.Issuer, &e.Subject, &e.UserID, &e.Email, &verified,
-		&e.DisplayName, &e.CreatedAt, &e.LastLoginAt); err != nil {
+		&e.DisplayName, &e.Username, &e.CreatedAt, &e.LastLoginAt); err != nil {
 		return nil, err
 	}
 	e.EmailVerified = verified != 0
 	return e, nil
 }
 
-const identityColumns = `issuer, subject, user_id, email, email_verified, display_name, created_at, last_login_at`
+const identityColumns = `issuer, subject, user_id, email, email_verified, display_name, username, created_at, last_login_at`
 
 // GetIdentity 按 (issuer, subject) 查映射；查不到返回 (nil, nil)。
 func GetIdentity(q dbtx, issuer, subject string) (*ExternalIdentity, error) {
@@ -105,9 +111,10 @@ func IdentitiesOfUser(q dbtx, userID string) ([]ExternalIdentity, error) {
 // TouchIdentity 刷新资料快照与最近登录时间（不改变映射本身）。
 func TouchIdentity(q dbtx, issuer, subject string, p IdentityProfile, now int64) error {
 	_, err := q.Exec(`UPDATE external_identities
-		SET email = ?, email_verified = ?, display_name = ?, last_login_at = ?
+		SET email = ?, email_verified = ?, display_name = ?, username = ?, last_login_at = ?
 		WHERE issuer = ? AND subject = ?`,
-		truncate(p.Email, 254), boolInt(p.EmailVerified), truncate(p.DisplayName, 128), now, issuer, subject)
+		truncate(p.Email, 254), boolInt(p.EmailVerified), truncate(p.DisplayName, 128),
+		truncate(p.Username, 255), now, issuer, subject)
 	return err
 }
 
@@ -140,10 +147,10 @@ func LinkIdentity(q dbtx, issuer, subject, userID string, p IdentityProfile, now
 		return err
 	}
 	_, err = q.Exec(`INSERT INTO external_identities
-		(issuer, subject, user_id, email, email_verified, display_name, created_at, last_login_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		(issuer, subject, user_id, email, email_verified, display_name, username, created_at, last_login_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		issuer, subject, userID, truncate(p.Email, 254), boolInt(p.EmailVerified),
-		truncate(p.DisplayName, 128), now, now)
+		truncate(p.DisplayName, 128), truncate(p.Username, 255), now, now)
 	if err != nil && IsUniqueViolation(err) {
 		// 并发：另一个请求刚抢先建立了映射——按冲突处理，绝不覆盖
 		return ErrIdentityTaken
@@ -190,10 +197,10 @@ func CreateOIDCUserWithInvite(d *sql.DB, issuer, subject string, p IdentityProfi
 		return "", false, err
 	}
 	if _, err := tx.Exec(`INSERT INTO external_identities
-		(issuer, subject, user_id, email, email_verified, display_name, created_at, last_login_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		(issuer, subject, user_id, email, email_verified, display_name, username, created_at, last_login_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		issuer, subject, userID, truncate(p.Email, 254), boolInt(p.EmailVerified),
-		truncate(p.DisplayName, 128), now, now); err != nil {
+		truncate(p.DisplayName, 128), truncate(p.Username, 255), now, now); err != nil {
 		if IsUniqueViolation(err) {
 			tx.Rollback() //nolint:errcheck
 			existing, gerr := GetIdentity(d, issuer, subject)

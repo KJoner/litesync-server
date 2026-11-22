@@ -369,20 +369,33 @@ type idClaims struct {
 	Email             string `json:"email"`
 	EmailVerified     *bool  `json:"email_verified"`
 	Name              string `json:"name"`
+	Nickname          string `json:"nickname"`
 	PreferredUsername string `json:"preferred_username"`
 	Azp               string `json:"azp"`
 	Sid               string `json:"sid"`
 }
 
+// profile 取一次登录的资料快照（UI v2 / I1：用户名、昵称、邮箱各司其职）。
+//
+//   - 显示名：昵称（可重复、可改）→ 旧账号的 name（姓名）→ preferred_username（与改动前相同的兜底，
+//     旧账号不会因此变成空名字）；email 声明从不拿来当显示名。
+//   - 用户名：preferred_username 原样，只给账号页「登录用户名」展示，不从昵称推断。
+//
+// 这些都只是快照：身份永远只认 (issuer, subject)，昵称相同的两个人是两个账号。
 func (c idClaims) profile() db.IdentityProfile {
-	name := strings.TrimSpace(c.Name)
-	if name == "" {
-		name = strings.TrimSpace(c.PreferredUsername)
+	username := strings.TrimSpace(c.PreferredUsername)
+	display := strings.TrimSpace(c.Nickname)
+	if display == "" {
+		display = strings.TrimSpace(c.Name)
+	}
+	if display == "" {
+		display = username
 	}
 	return db.IdentityProfile{
 		Email:         strings.TrimSpace(c.Email),
 		EmailVerified: c.EmailVerified != nil && *c.EmailVerified,
-		DisplayName:   name,
+		DisplayName:   display,
+		Username:      username,
 	}
 }
 
@@ -731,9 +744,9 @@ func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, "me", err)
 		return
 	}
-	display, email, verified := u.Name, "", !me.Restricted
+	display, email, verified, username := u.Name, "", !me.Restricted, ""
 	if len(ids) > 0 {
-		email, verified = ids[0].Email, ids[0].EmailVerified
+		email, verified, username = ids[0].Email, ids[0].EmailVerified, ids[0].Username
 		if ids[0].DisplayName != "" {
 			display = ids[0].DisplayName
 		}
@@ -757,10 +770,15 @@ func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 	case me.ViaOIDC:
 		kind = "oidc"
 	}
+	account := map[string]any{
+		"id": owner, "displayName": display, "email": email, "emailVerified": verified,
+	}
+	if username != "" {
+		// 登录用户名：身份服务给的 preferred_username 快照，只用于展示（存量映射下次登录后才有）
+		account["username"] = username
+	}
 	out := map[string]any{
-		"account": map[string]any{
-			"id": owner, "displayName": display, "email": email, "emailVerified": verified,
-		},
+		"account":     account,
 		"product":     "litesync",
 		"role":        role,
 		"permissions": perms,
