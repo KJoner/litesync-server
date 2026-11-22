@@ -34,6 +34,7 @@ import {
 	VaultKeyDoc,
 } from "./vendor/litesync-core/crypto/crypto";
 import { openDialog } from "./dialog";
+import { confirmDialog, fieldsDialog, noticeDialog, typedConfirmDialog } from "./forms";
 
 export interface PortalHost {
 	root: HTMLElement;
@@ -295,16 +296,50 @@ function vaultCard(host: PortalHost, me: Me, v: VaultCard): HTMLElement {
 	const more = h("details", "vault-more");
 	more.append(h("summary", "", "更多"));
 	const menu = h("div", "vault-menu");
+	// 低频操作也用产品内的表单（UI 焕新 U4b / W04）：错误留在表单里，Esc / 取消不提交
 	menu.append(
-		button("重命名", "ghost", () => {
-			const name = prompt("新的仓库名称（1–64 个字符）", v.name);
-			if (!name || name.trim() === v.name) return;
-			void accountApi.renameVault(v.id, name.trim()).then(() => renderVaultCenter(host, me), (e) => alert(errText(e)));
+		button("重命名…", "ghost", () => {
+			more.open = false;
+			fieldsDialog({
+				title: "重命名仓库",
+				message: "只改显示名，不影响同步与加密。",
+				fields: [{ label: "仓库名称", value: v.name, hint: "1–64 个字符" }],
+				okLabel: "重命名",
+				validate: ([name]) => (!name ? "请填写仓库名称。" : [...name].length > 64 ? "仓库名称最多 64 个字符。" : null),
+				submit: async ([name]) => {
+					if (name === v.name) return null;
+					try {
+						await accountApi.renameVault(v.id, name);
+					} catch (e) {
+						return errText(e);
+					}
+					void renderVaultCenter(host, me);
+					return null;
+				},
+			});
 		}),
 		button("删除仓库…", "ghost danger-text", () => {
-			const name = prompt(`删除仓库会清除服务器上的全部密文与历史，且不可恢复（设备上的本地文件不受影响）。\n请输入仓库名称「${v.name}」确认：`);
-			if (name === null) return;
-			void accountApi.deleteVault(v.id, name).then(() => renderVaultCenter(host, me), (e) => alert(errText(e)));
+			more.open = false;
+			if (!v.name) {
+				noticeDialog("先给这个仓库起个名字", "删除需要输入仓库名称确认，这个仓库还没有名字。请先用「重命名…」起一个名字。");
+				return;
+			}
+			typedConfirmDialog({
+				title: `删除仓库「${v.name}」？`,
+				message: "会清除服务器上这个仓库的全部密文、历史版本、分享与设备授权，不能恢复。\n已经同步到设备上的本地文件不受影响。",
+				expect: v.name,
+				label: `输入仓库名称「${v.name}」确认`,
+				okLabel: "删除仓库",
+				confirm: async (typed) => {
+					try {
+						await accountApi.deleteVault(v.id, typed);
+					} catch (e) {
+						return errText(e);
+					}
+					void renderVaultCenter(host, me);
+					return null;
+				},
+			});
 		}),
 	);
 	more.append(menu);
@@ -722,9 +757,22 @@ export async function renderAccountCenter(host: PortalHost, me: Me, cfg: AuthCon
 			const info = h("div");
 			info.append(h("strong", "", d.name || d.id), h("div", "muted small",
 				`${d.platform || "未知平台"} · 仓库「${d.vaultName || d.vaultId}」 · ${d.lastSeenAt ? "最近活动 " + new Date(d.lastSeenAt * 1000).toLocaleString() : "尚未联网"}${d.clientVersion ? " · 插件 " + d.clientVersion : ""}`));
-			const rev = button("撤销", "ghost danger-text", () => {
-				if (!confirm(`撤销「${d.name || d.id}」？它下一次联网时将无法再同步。`)) return;
-				void accountApi.revokeDevice(d.id).then(() => renderAccountCenter(host, me, cfg), (e) => alert(errText(e)));
+			const rev = button("撤销…", "ghost danger-text", () => {
+				confirmDialog({
+					title: `撤销「${d.name || d.id}」？`,
+					message: "它下一次联网时就不能再同步，要重新连接才能继续使用。已经下载到它上面的笔记不会被远程删除。",
+					okLabel: "撤销设备",
+					danger: true,
+					confirm: async () => {
+						try {
+							await accountApi.revokeDevice(d.id);
+						} catch (e) {
+							return errText(e);
+						}
+						void renderAccountCenter(host, me, cfg);
+						return null;
+					},
+				});
 			});
 			row.append(info, rev);
 			list.append(row);
@@ -848,16 +896,27 @@ function revocationSection(me: Me): HTMLElement {
 		? "你现在用 API Token 登录：这个 API Token 也会一起作废。之后需要用统一账号登录后重置，或由管理员在服务器上运行 obsync token reset。"
 		: "";
 	const b = button("退出 LiteSync 的全部设备…", "danger", () => {
-		if (!confirm(bScope + (tokenNote ? "\n\n" + tokenNote : "") + "\n\n确定继续？")) return;
-		b.disabled = true;
-		void accountApi.logoutDevices().then((r) => {
-			alert(`已完成：撤销 ${r.local.revokedDevices} 台设备、${r.local.revokedGrants} 个尚未使用的连接链接；所有浏览器里的 LiteSync 登录已结束。`);
-			announceAccount("");
-			location.hash = "";
-			location.reload();
-		}, (e) => {
-			b.disabled = false;
-			alert(errText(e));
+		confirmDialog({
+			title: "退出 LiteSync 的全部设备？",
+			message: bScope + (tokenNote ? "\n\n" + tokenNote : ""),
+			okLabel: "全部退出",
+			danger: true,
+			confirm: async () => {
+				let r: Awaited<ReturnType<typeof accountApi.logoutDevices>>;
+				try {
+					r = await accountApi.logoutDevices();
+				} catch (e) {
+					return errText(e);
+				}
+				noticeDialog("已退出 LiteSync 的全部设备",
+					`撤销了 ${r.local.revokedDevices} 台设备、${r.local.revokedGrants} 个尚未使用的连接链接；所有浏览器里的 LiteSync 登录已结束。`,
+					() => {
+						announceAccount("");
+						location.hash = "";
+						location.reload();
+					});
+				return null;
+			},
 		});
 	});
 	const bBlock = scopeBlock("退出 LiteSync 的全部设备", bScope, b);
@@ -869,11 +928,21 @@ function revocationSection(me: Me): HTMLElement {
 	const cScope = "包括上一项的全部，并且：结束你在身份中心所有浏览器里的登录；通知 Nexus Portal 撤销它那边的全部网页登录、设备与扩展授权。" +
 		"每一步的结果都会如实显示，没送达的可以重新发送。";
 	const c = button("退出所有产品与设备…", "danger", () => {
-		if (!confirm(cScope + "\n\n确定继续？")) return;
-		c.disabled = true;
-		void accountApi.logoutAll().then((r) => openRevocationResult(r), (e) => {
-			c.disabled = false;
-			alert(errText(e));
+		confirmDialog({
+			title: "退出所有产品与设备？",
+			message: cScope,
+			okLabel: "全部退出",
+			danger: true,
+			confirm: async () => {
+				let r: RevocationView;
+				try {
+					r = await accountApi.logoutAll();
+				} catch (e) {
+					return errText(e);
+				}
+				openRevocationResult(r);
+				return null;
+			},
 		});
 	});
 	const cBlock = scopeBlock("退出所有产品与设备", cScope, c);
@@ -957,17 +1026,20 @@ function openRevocationResult(first: RevocationView): void {
 			const extra: HTMLElement[] = [];
 			if ((p.state === "pending" || p.state === "failed") && token) {
 				pending = pending || p.state === "pending";
+				const failed = h("span", "error small");
+				failed.setAttribute("role", "alert");
 				const resend = button("重新发送", "small-btn", () => {
 					resend.disabled = true;
+					failed.textContent = "";
 					void accountApi.resendRevocation(current.eventId, token).then((r) => {
 						current = r;
 						render();
 					}, (e) => {
 						resend.disabled = false;
-						alert(errText(e));
+						failed.textContent = " " + errText(e);
 					});
 				});
-				extra.push(resend);
+				extra.push(resend, failed);
 			}
 			stepRow(list, productName(p.product), text, cls, detail, extra);
 		}
@@ -1020,14 +1092,17 @@ async function renderRevocationHistory(list: HTMLElement): Promise<void> {
 			const [text, cls, detail] = peerView(p);
 			const extra: HTMLElement[] = [];
 			if (p.state === "pending" || p.state === "failed") {
+				const failed = h("span", "error small");
+				failed.setAttribute("role", "alert");
 				const retry = button("重新发送", "small-btn", () => {
 					retry.disabled = true;
+					failed.textContent = "";
 					void accountApi.retryRevocation(r.eventId).then(() => renderRevocationHistory(list), (e) => {
 						retry.disabled = false;
-						alert(errText(e));
+						failed.textContent = " " + errText(e);
 					});
 				});
-				extra.push(retry);
+				extra.push(retry, failed);
 			}
 			stepRow(facts, productName(p.product), text, cls, detail, extra);
 		}

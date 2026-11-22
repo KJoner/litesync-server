@@ -34,7 +34,7 @@ import {
 import { openConnectDialog, PortalHost, renderAccountCenter, renderLoginPage, renderVaultCenter } from "./portal";
 import { DrawerHandle, openDialog, openDrawer } from "./dialog";
 import { followSystemTheme, toggleTheme } from "./theme";
-import { confirmDialog, folderOf, foldersOf, noteLocationDialog, titleOf } from "./forms";
+import { confirmDialog, fieldsDialog, folderOf, foldersOf, noteLocationDialog, titleOf, typedConfirmDialog } from "./forms";
 import {
 	deriveMetaKeys as coreDeriveMetaKeys,
 	exportVmkRaw as coreExportVmkRaw,
@@ -1971,7 +1971,7 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
 		const data = await decodeContent(path, dlVer.data, { fileId: dlVer.fileId, historical: true });
 		if (canEdit() && v.revision !== S!.byPath.get(path)?.revision) {
 			restoreBtn.hidden = false;
-			restoreBtn.onclick = () => void restoreVersion(path, v, data, restoreBtn);
+			restoreBtn.onclick = () => restoreVersion(path, v, data);
 		}
 		if (!path.toLowerCase().endsWith(".md")) {
 			body.innerHTML = "";
@@ -1993,9 +1993,16 @@ async function showRevision(path: string, v: VersionEntry): Promise<void> {
  * 恢复到历史版本 = 以该版本的内容写一个**新**版本（需求 §7.3：revision 只前进、fileId 不变，
  * 当前内容仍留在历史里）。以当前 HEAD 为 CAS 前提、已见世代为下限；期间被别处改动则如实失败。
  */
-async function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer, btn: HTMLButtonElement): Promise<void> {
-	if (!confirm(`把「${noteTitle(path)}」恢复到 rev ${v.revision} 的内容？\n这会生成一个新版本，当前内容仍保留在历史里。`)) return;
-	btn.disabled = true;
+function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer): void {
+	confirmDialog({
+		title: `恢复到版本 ${v.revision}？`,
+		message: `把「${noteTitle(path)}」的内容恢复成版本 ${v.revision}。这会生成一个新版本，当前内容仍保留在历史里。`,
+		okLabel: "恢复",
+		confirm: () => restoreVersionNow(path, v, plain),
+	});
+}
+
+async function restoreVersionNow(path: string, v: VersionEntry, plain: ArrayBuffer): Promise<string | null> {
 	try {
 		const entry = S!.byPath.get(path);
 		if (!entry) throw new Error("文件已不存在");
@@ -2013,9 +2020,9 @@ async function restoreVersion(path: string, v: VersionEntry, plain: ArrayBuffer,
 		}
 		recordSaved({ ...tracked, revision: out.revision, generation: out.generation, fileId: out.fileId, metaGeneration: out.metaGeneration ?? tracked.metaGeneration }, false);
 		void showNote(path);
+		return null;
 	} catch (e) {
-		alert(`恢复失败：${e instanceof Error ? e.message : String(e)}`);
-		btn.disabled = false;
+		return `恢复失败：${e instanceof Error ? e.message : String(e)}`;
 	}
 }
 
@@ -2909,18 +2916,24 @@ function renderDeviceCard(box: HTMLElement, devices: AdminDevice[]): void {
 		);
 		row.append(info);
 		if (!d.revoked) {
-			const btn = el("button", "danger", "撤销");
+			const btn = el("button", "danger", "撤销…");
 			btn.onclick = () => {
 				// 撤销不可逆，值得一次确认——但只要一次：事故当天多一层弹窗就是多一分钟
-				if (!confirm(`撤销「${d.name || d.id}」？该设备将立刻无法同步。`)) return;
-				btn.disabled = true;
-				void S!.api
-					.adminRevokeDevice(d.id)
-					.then(() => renderOpsInto(box))
-					.catch((e: unknown) => {
-						btn.disabled = false;
-						alert(`撤销失败：${e instanceof Error ? e.message : String(e)}`);
-					});
+				confirmDialog({
+					title: `撤销「${d.name || d.id}」？`,
+					message: "这台设备立刻无法同步：长期凭据作废，它换出去的短期 access token 也一起失效。已经下载到它上面的笔记不会被远程删除。",
+					okLabel: "撤销设备",
+					danger: true,
+					confirm: async () => {
+						try {
+							await S!.api.adminRevokeDevice(d.id);
+						} catch (e) {
+							return `撤销失败：${e instanceof Error ? e.message : String(e)}`;
+						}
+						void renderOpsInto(box);
+						return null;
+					},
+				});
 			};
 			row.append(btn);
 		}
@@ -2975,10 +2988,14 @@ function renderShareCard(box: HTMLElement, shares: AdminShare[]): void {
 			custom.hidden = true;
 			sel.onchange = () => (custom.hidden = sel.value !== "custom");
 			const btn = el("button", "ghost", "设置新的到期时间");
+			const failed = el("span", "error small");
+			failed.setAttribute("role", "alert");
 			btn.onclick = () => {
+				failed.textContent = "";
 				const days = sel.value === "custom" ? Number(custom.value) : Number(sel.value);
 				if (!Number.isInteger(days) || days <= 0) {
-					alert("自定义天数必须是正整数");
+					failed.textContent = "自定义天数必须是正整数。";
+					custom.focus();
 					return;
 				}
 				btn.disabled = true;
@@ -2988,26 +3005,32 @@ function renderShareCard(box: HTMLElement, shares: AdminShare[]): void {
 					.then(() => renderOpsInto(box))
 					.catch((e: unknown) => {
 						btn.disabled = false;
-						alert(`设置失败：${e instanceof Error ? e.message : String(e)}`);
+						failed.textContent = `设置失败：${e instanceof Error ? e.message : String(e)}`;
 					});
 			};
-			row.append(sel, custom, btn);
+			row.append(sel, custom, btn, failed);
 		} else if (!s.revoked) {
 			row.append(el("span", "muted small", "密文已回收，无法恢复"));
 		}
 		if (!s.revoked) {
-			const revokeBtn = el("button", "danger", "撤销");
+			const revokeBtn = el("button", "danger", "撤销…");
 			revokeBtn.onclick = () => {
 				// 撤销不可逆且密文一并回收，值得一次确认——但只要一次
-				if (!confirm(`撤销分享「${s.id.slice(0, 12)}…」？链接将立刻失效，密文一并回收，不可恢复。`)) return;
-				revokeBtn.disabled = true;
-				void S!.api
-					.adminRevokeShare(s.id)
-					.then(() => renderOpsInto(box))
-					.catch((e: unknown) => {
-						revokeBtn.disabled = false;
-						alert(`撤销失败：${e instanceof Error ? e.message : String(e)}`);
-					});
+				confirmDialog({
+					title: `撤销分享「${s.id.slice(0, 12)}…」？`,
+					message: "链接立刻失效，密文一并回收，不能恢复。",
+					okLabel: "撤销分享",
+					danger: true,
+					confirm: async () => {
+						try {
+							await S!.api.adminRevokeShare(s.id);
+						} catch (e) {
+							return `撤销失败：${e instanceof Error ? e.message : String(e)}`;
+						}
+						void renderOpsInto(box);
+						return null;
+					},
+				});
 			};
 			row.append(revokeBtn);
 		}
@@ -3158,19 +3181,20 @@ function showAccount(): void {
 			errEl.textContent = "请先解锁 E2EE 再重置。";
 			return;
 		}
-		if (!confirm("确认重置 API Token？\n\n· 旧 Token 立即失效，所有设备断开同步\n· 每台设备需填入新 Token 并点「测试连接」\n· 此操作不能追回已泄露窗口内被下载的密文")) {
-			return;
-		}
-		btn.disabled = true;
-		btn.textContent = "重置中…";
-		void S!.api
-			.resetToken(S!.resetAuth ?? "")
-			.then((res) => renderNewToken(box, res))
-			.catch((e) => {
-				errEl.textContent = e instanceof Error ? e.message : String(e);
-				btn.disabled = false;
-				btn.textContent = "重置 API Token";
-			});
+		confirmDialog({
+			title: "重置 API Token？",
+			message: "· 旧 Token 立即失效，所有设备断开同步\n· 每台设备需填入新 Token 并点「测试连接」\n· 这一步不能追回泄露期间已被下载的密文",
+			okLabel: "重置 API Token",
+			danger: true,
+			confirm: async () => {
+				try {
+					renderNewToken(box, await S!.api.resetToken(S!.resetAuth ?? ""));
+				} catch (e) {
+					return e instanceof Error ? e.message : String(e);
+				}
+				return null;
+			},
+		});
 	};
 	card.append(btn, errEl);
 	box.append(card);
@@ -3195,36 +3219,55 @@ async function renderVaultList(listEl: HTMLElement, errEl: HTMLElement): Promise
 			`${v.fileCount} 个文件 · ${fmtBytes(v.bytesUsed)}` + (v.current ? " · 当前查看" : "")));
 		row.append(left);
 		const btns = el("div", "");
-		const rn = el("button", "ghost", "重命名");
+		const rn = el("button", "ghost", "重命名…");
 		rn.onclick = () => {
-			const name = prompt("新名字（1–64 字符）；只改显示名，不影响同步与加密：", v.name);
-			if (name === null || !name.trim()) return;
-			void S!.api.renameVault(v.id, name.trim())
-				.then(() => renderVaultList(listEl, errEl))
-				.catch((e) => { errEl.textContent = e instanceof Error ? e.message : String(e); });
+			fieldsDialog({
+				title: "重命名仓库",
+				message: "只改显示名，不影响同步与加密。",
+				fields: [{ label: "仓库名称", value: v.name, hint: "1–64 个字符" }],
+				okLabel: "重命名",
+				validate: ([name]) => (!name ? "请填写仓库名称。" : [...name].length > 64 ? "仓库名称最多 64 个字符。" : null),
+				submit: async ([name]) => {
+					if (name === v.name) return null;
+					try {
+						await S!.api.renameVault(v.id, name);
+					} catch (e) {
+						return e instanceof Error ? e.message : String(e);
+					}
+					void renderVaultList(listEl, errEl);
+					return null;
+				},
+			});
 		};
-		const del = el("button", "danger", "删除");
+		const del = el("button", "danger", "删除…");
 		del.onclick = () => {
 			if (!v.name) {
 				errEl.textContent = "此仓库尚未命名：请先重命名，删除确认需要输入仓库名。";
 				return;
 			}
-			const confirmName = prompt(
-				`删除不可逆：仓库「${v.name}」的全部内容、历史、分享与设备凭据将被清除。\n` +
-				`输入仓库名确认删除：`);
-			if (confirmName === null) return;
-			void S!.api.deleteVault(v.id, confirmName)
-				.then(() => {
+			typedConfirmDialog({
+				title: `删除仓库「${v.name}」？`,
+				message: "不能恢复：这个仓库的全部内容、历史、分享与设备凭据都会被清除。",
+				expect: v.name,
+				label: `输入仓库名称「${v.name}」确认`,
+				okLabel: "删除仓库",
+				confirm: async (typed) => {
+					try {
+						await S!.api.deleteVault(v.id, typed);
+					} catch (e) {
+						return e instanceof Error ? e.message : String(e);
+					}
 					if (v.current) {
 						forgetVault();
 						location.hash = "";
 						location.reload();
-						return;
+						return null;
 					}
 					errEl.textContent = "";
-					return renderVaultList(listEl, errEl);
-				})
-				.catch((e) => { errEl.textContent = e instanceof Error ? e.message : String(e); });
+					void renderVaultList(listEl, errEl);
+					return null;
+				},
+			});
 		};
 		btns.append(rn, del);
 		row.append(btns);
@@ -3439,42 +3482,78 @@ function renderUserListCard(box: HTMLElement, users: AdminUser[]): void {
 		const quotaBtn = el("button", "ghost", "配额…");
 		quotaBtn.onclick = () => {
 			const cur = u.usage;
-			const b = prompt(
-				`${u.name} 的存储上限（含历史版本）\n例如 2GB、500MB；0 = 跟随服务器默认；-1 = 不限`,
-				cur ? overrideText(cur.overrideBytes, true) : "0");
-			if (b === null) return;
-			const v = prompt(`${u.name} 的仓库数上限\n0 = 跟随服务器默认；-1 = 不限`, cur ? String(cur.overrideVaults) : "0");
-			if (v === null) return;
-			const bytes = parseSizeInput(b);
-			const vaults = /^-?\d+$/.test(v.trim()) ? Number(v.trim()) : NaN;
-			if (bytes === null || !(vaults >= -1)) return void alert("格式不对：存储写成 2GB / 500MB / 0 / -1，仓库数写整数、0 或 -1。");
-			void S!.api
-				.setUserQuota(u.userId, bytes, vaults)
-				.then(() => renderUsersInto(box))
-				.catch((e) => alert(`设置配额失败：${e instanceof Error ? e.message : String(e)}`));
+			fieldsDialog({
+				title: `${u.name} 的配额`,
+				fields: [
+					{ label: "存储上限（含历史版本）", value: cur ? overrideText(cur.overrideBytes, true) : "0", hint: "例如 2GB、500MB；0 = 跟随服务器默认；-1 = 不限" },
+					{ label: "仓库数上限", value: cur ? String(cur.overrideVaults) : "0", hint: "整数；0 = 跟随服务器默认；-1 = 不限", inputMode: "numeric" },
+				],
+				okLabel: "保存",
+				validate: ([b, v]) => {
+					if (parseSizeInput(b) === null) return "存储上限的格式不对：写成 2GB、500MB、0 或 -1。";
+					if (!/^-?\d+$/.test(v) || Number(v) < -1) return "仓库数上限要写整数、0 或 -1。";
+					return null;
+				},
+				submit: async ([b, v]) => {
+					try {
+						await S!.api.setUserQuota(u.userId, parseSizeInput(b)!, Number(v));
+					} catch (e) {
+						return `设置配额失败：${e instanceof Error ? e.message : String(e)}`;
+					}
+					void renderUsersInto(box);
+					return null;
+				},
+			});
 		};
 		item.append(quotaBtn);
 		if (!u.isAdmin) {
 			const disBtn = el("button", "ghost", u.disabled ? "解禁" : "禁用");
+			const failed = el("span", "error small");
+			failed.setAttribute("role", "alert");
 			disBtn.onclick = () => {
 				const verb = u.disabled ? "解禁" : "禁用";
-				if (!u.disabled && !confirm(`禁用 ${u.name}？其全部设备凭据与登录会话立即失效；数据保留，解禁后需重新接入设备。`)) return;
-				void S!.api
-					.setUserDisabled(u.userId, !u.disabled)
-					.then(() => renderUsersInto(box))
-					.catch((e) => alert(`${verb}失败：${e instanceof Error ? e.message : String(e)}`));
+				const apply = async (): Promise<string | null> => {
+					try {
+						await S!.api.setUserDisabled(u.userId, !u.disabled);
+					} catch (e) {
+						return `${verb}失败：${e instanceof Error ? e.message : String(e)}`;
+					}
+					void renderUsersInto(box);
+					return null;
+				};
+				if (u.disabled) {
+					failed.textContent = "";
+					void apply().then((err) => (failed.textContent = err ?? ""));
+					return;
+				}
+				confirmDialog({
+					title: `禁用 ${u.name}？`,
+					message: "其全部设备凭据与登录会话立即失效；数据保留，解禁后需要重新接入设备。",
+					okLabel: "禁用",
+					danger: true,
+					confirm: apply,
+				});
 			};
-			const delBtn = el("button", "danger", "删除");
+			const delBtn = el("button", "danger", "删除…");
 			delBtn.onclick = () => {
-				const typed = prompt(
-					`删除 ${u.name}？此操作不可逆：其全部笔记、历史、分享一并永久删除。\n\n请输入用户名确认：`);
-				if (typed === null) return;
-				void S!.api
-					.deleteUser(u.userId, typed)
-					.then(() => renderUsersInto(box))
-					.catch((e) => alert(`删除失败：${e instanceof Error ? e.message : String(e)}`));
+				typedConfirmDialog({
+					title: `删除 ${u.name}？`,
+					message: "不能恢复：其全部笔记、历史、分享一并永久删除。",
+					expect: u.name,
+					label: `输入用户名「${u.name}」确认`,
+					okLabel: "删除用户",
+					confirm: async (typed) => {
+						try {
+							await S!.api.deleteUser(u.userId, typed);
+						} catch (e) {
+							return `删除失败：${e instanceof Error ? e.message : String(e)}`;
+						}
+						void renderUsersInto(box);
+						return null;
+					},
+				});
 			};
-			item.append(disBtn, delBtn);
+			item.append(disBtn, delBtn, failed);
 		}
 		list.append(item);
 	}

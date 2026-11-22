@@ -238,12 +238,17 @@ await new Suite().run(async (s) => {
 		await page.getByRole("button", { name: "🕘 历史版本" }).click();
 		await page.locator(".drawer-item", { hasText: "版本 3 " }).click();
 		await page.getByRole("button", { name: "恢复到此版本" }).click();
+		// UI 焕新 U4b：确认改成产品内对话框（不再是浏览器原生 confirm）
+		const restoreDlg = page.getByRole("dialog");
+		await restoreDlg.waitFor({ timeout: 10000 });
+		const restoreMsg = (await restoreDlg.textContent()) ?? "";
+		await restoreDlg.getByRole("button", { name: "恢复", exact: true }).click();
 		await page.locator(".edit-bar").waitFor({ timeout: 20000 });
 		r = await dev.read(P2);
 		s.check("恢复到 rev 3：内容回到当时、revision 前进、世代 +1、fileId 不变",
 			r.text === merged && r.revision > beforeRestore.revision && r.generation === (beforeRestore.generation ?? 0) + 1 && r.fileId === fileId,
 			`rev ${beforeRestore.revision}→${r.revision} gen ${beforeRestore.generation}→${r.generation}`);
-		s.check("恢复前弹出确认说明", confirms.some((m) => m.includes("恢复到 rev 3") && m.includes("新版本")));
+		s.check("恢复前弹出确认说明", restoreMsg.includes("版本 3") && restoreMsg.includes("新版本"), restoreMsg);
 
 		// ---- 7d. 附件：按钮上传 + 粘贴截图，预览从密文解密显示 ----
 		await openNote(page, P2, "edit");

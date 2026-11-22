@@ -211,9 +211,9 @@ export function confirmDialog(o: ConfirmOptions): void {
 	setTimeout(() => (o.danger ? cancel : ok).focus(), 0);
 }
 
-/** 只是告知（代替 alert）：一句话 + 「知道了」。 */
-export function noticeDialog(title: string, message: string): void {
-	const dlg = openDialog(title);
+/** 只是告知（代替 alert）：一句话 + 「知道了」。onClose：关闭之后要做的事（例如整页重载）。 */
+export function noticeDialog(title: string, message: string, onClose?: () => void): void {
+	const dlg = openDialog(title, onClose);
 	const msg = el("p", "", message);
 	msg.style.whiteSpace = "pre-line";
 	const actions = el("div", "dialog-actions");
@@ -222,4 +222,160 @@ export function noticeDialog(title: string, message: string): void {
 	ok.onclick = () => dlg.close();
 	actions.append(ok);
 	dlg.body.append(msg, actions);
+}
+
+export interface FieldSpec {
+	label: string;
+	value?: string;
+	hint?: string;
+	inputMode?: "text" | "numeric";
+	placeholder?: string;
+}
+
+/**
+ * 一到多个文本框的小表单（代替 prompt，UI 焕新 U4b / W04）：错误留在表单里、已填内容不丢、
+ * Esc / 取消不提交。validate 返回要显示的错误（null = 通过）；submit 返回服务器侧的错误。
+ */
+export function fieldsDialog(o: {
+	title: string;
+	message?: string;
+	fields: FieldSpec[];
+	okLabel: string;
+	danger?: boolean;
+	validate?(values: string[]): string | null;
+	submit(values: string[]): Promise<string | null>;
+}): void {
+	const dlg = openDialog(o.title);
+	const form = el("form", "note-form");
+	form.noValidate = true;
+	const errId = uid("fields-err");
+	if (o.message) {
+		const m = el("p", "", o.message);
+		m.style.whiteSpace = "pre-line";
+		form.append(m);
+	}
+	const inputs = o.fields.map((f) => {
+		const input = el("input");
+		input.type = "text";
+		input.value = f.value ?? "";
+		input.autocomplete = "off";
+		input.spellcheck = false;
+		if (f.inputMode) input.inputMode = f.inputMode;
+		if (f.placeholder) input.placeholder = f.placeholder;
+		input.setAttribute("aria-describedby", errId);
+		const field = el("label", "field");
+		field.append(el("span", "", f.label), input);
+		if (f.hint) field.append(el("span", "muted small", f.hint));
+		form.append(field);
+		return input;
+	});
+	const error = el("p", "error small note-form-error");
+	error.id = errId;
+	error.setAttribute("role", "alert");
+	const actions = el("div", "dialog-actions");
+	const cancel = el("button", "ghost", "取消");
+	cancel.type = "button";
+	cancel.onclick = () => dlg.close();
+	const ok = el("button", o.danger ? "danger-solid" : "primary", o.okLabel);
+	ok.type = "submit";
+	actions.append(cancel, ok);
+	form.append(error, actions);
+	dlg.body.append(form);
+	form.onsubmit = async (e) => {
+		e.preventDefault();
+		error.textContent = "";
+		const values = inputs.map((i) => i.value.trim());
+		const bad = o.validate?.(values) ?? null;
+		if (bad) {
+			error.textContent = bad;
+			inputs[0]?.focus();
+			return;
+		}
+		ok.disabled = true;
+		cancel.disabled = true;
+		try {
+			const failed = await o.submit(values);
+			if (failed) {
+				error.textContent = failed;
+				inputs[0]?.focus();
+				return;
+			}
+			dlg.close(true);
+		} finally {
+			ok.disabled = false;
+			cancel.disabled = false;
+		}
+	};
+	setTimeout(() => {
+		inputs[0]?.focus();
+		inputs[0]?.select();
+	}, 0);
+}
+
+/**
+ * 不可逆的操作：要求输入名字确认（删除仓库、删除用户）。名字对上之前确认按钮不可用；
+ * 服务器仍会再核对一次（这里只防手滑）。
+ */
+export function typedConfirmDialog(o: {
+	title: string;
+	message: string;
+	expect: string;
+	label: string;
+	okLabel: string;
+	confirm(typed: string): Promise<string | null>;
+}): void {
+	const dlg = openDialog(o.title);
+	const form = el("form", "note-form");
+	form.noValidate = true;
+	const msg = el("p", "", o.message);
+	msg.style.whiteSpace = "pre-line";
+	const input = el("input");
+	input.type = "text";
+	input.autocomplete = "off";
+	input.spellcheck = false;
+	const errId = uid("typed-err");
+	input.setAttribute("aria-describedby", errId);
+	const field = el("label", "field");
+	field.append(el("span", "", o.label), input);
+	const error = el("p", "error small note-form-error");
+	error.id = errId;
+	error.setAttribute("role", "alert");
+	const actions = el("div", "dialog-actions");
+	const cancel = el("button", "ghost", "取消");
+	cancel.type = "button";
+	cancel.onclick = () => dlg.close();
+	const ok = el("button", "danger-solid", o.okLabel);
+	ok.type = "submit";
+	ok.disabled = true;
+	actions.append(cancel, ok);
+	form.append(msg, field, error, actions);
+	dlg.body.append(form);
+	const matches = () => input.value.trim() === o.expect;
+	input.oninput = () => {
+		ok.disabled = !matches();
+		error.textContent = "";
+	};
+	form.onsubmit = async (e) => {
+		e.preventDefault();
+		if (!matches()) {
+			error.textContent = `名字不一致：请输入「${o.expect}」。`;
+			input.focus();
+			return;
+		}
+		ok.disabled = true;
+		cancel.disabled = true;
+		try {
+			const failed = await o.confirm(input.value.trim());
+			if (failed) {
+				error.textContent = failed;
+				input.focus();
+				return;
+			}
+			dlg.close(true);
+		} finally {
+			ok.disabled = !matches();
+			cancel.disabled = false;
+		}
+	};
+	setTimeout(() => input.focus(), 0);
 }
