@@ -2,6 +2,7 @@
  *  Share Key 在 URL fragment 中，浏览器不会把 fragment 发给服务器。 */
 import { b64urlDecode, decryptShare, subtleAvailable, unbundleShare } from "./crypto";
 import { renderSharedNote } from "./share-render";
+import { followSystemTheme } from "./theme";
 
 const app = document.getElementById("app")!;
 
@@ -14,7 +15,7 @@ function esc(s: string): string {
 }
 
 async function boot(): Promise<void> {
-	document.documentElement.dataset.theme = localStorage.getItem("litesync-theme") ?? "dark";
+	followSystemTheme();
 	const frag = location.hash.slice(1);
 	const dot = frag.indexOf(".");
 	if (dot <= 0) {

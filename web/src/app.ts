@@ -31,7 +31,9 @@ import {
 	Me,
 	Usage,
 } from "./api";
-import { openDialog, PortalHost, renderAccountCenter, renderLoginPage, renderVaultCenter } from "./portal";
+import { openConnectDialog, openDialog, PortalHost, renderAccountCenter, renderLoginPage, renderVaultCenter } from "./portal";
+import { followSystemTheme, toggleTheme } from "./theme";
+import { confirmDialog, folderOf, foldersOf, noteLocationDialog, titleOf } from "./forms";
 import {
 	deriveMetaKeys as coreDeriveMetaKeys,
 	exportVmkRaw as coreExportVmkRaw,
@@ -73,7 +75,6 @@ import {
 import { DiffLine, diffLines } from "./diff";
 import { buildOutline, preprocessWiki, renderMarkdown } from "./markdown";
 
-const THEME_KEY = "litesync-theme";
 const VAULT_KEY = "litesync-vault";
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
@@ -152,14 +153,8 @@ function revokeAllBlobs(): void {
 }
 
 // ---------- 主题 ----------
-function applyTheme(): void {
-	document.documentElement.dataset.theme = localStorage.getItem(THEME_KEY) ?? "dark";
-}
-function toggleTheme(): void {
-	const cur = localStorage.getItem(THEME_KEY) ?? "dark";
-	localStorage.setItem(THEME_KEY, cur === "dark" ? "light" : "dark");
-	applyTheme();
-}
+// UI 焕新 U4：没有手动选择时跟随系统（theme.ts，网页、分享页、加入页共用）。
+const applyTheme = followSystemTheme;
 
 // ---------- 工具 ----------
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -849,75 +844,114 @@ function writeError(code: string, message: string): string {
 	}
 }
 
-/** 笔记的「更多」菜单：改名/移动、删除（都走同步协议，保留 fileId 与历史）。 */
+/** 笔记的「更多」菜单：重命名、移动到、删除（都走同步协议，保留 fileId 与历史）。UI 焕新 U4：产品内对话框。 */
 function noteMenu(tracked: TrackedFile): HTMLElement {
 	const more = el("details", "note-more");
 	more.append(el("summary", "", "更多"));
 	const menu = el("div", "vault-menu");
-	const rename = el("button", "ghost", "改名 / 移动…");
-	rename.onclick = async () => {
+	const clash = (to: string): string | null => {
+		const canon = (p: string) => p.normalize("NFC").toLowerCase();
+		const other = S!.files.find((f) => f.path !== tracked.path && canon(f.path) === canon(to));
+		return other ? `已有同名笔记「${other.path}」（大小写或 Unicode 归一后同名也算），请换一个名字。` : null;
+	};
+	const rename = el("button", "ghost", "重命名…");
+	rename.onclick = () => {
 		more.open = false;
-		const input = prompt("新的路径（可以包含文件夹，例如「工作/周记.md」）", tracked.path);
-		if (input === null) return;
-		const to = normalizeNotePath(input);
-		if (!to) return alert("路径不合法：不能为空、不能以 / 开头、不能包含 .. 或以 . 开头的段。");
-		if (to === tracked.path) return;
-		if (S!.byPath.has(to)) return alert("目标位置已有同名文件。");
-		await S!.editor?.flush();
-		const r = await renameFile(repoBinding(), S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null, S!.editor?.file ?? tracked, to);
-		if (!r.ok) return alert(writeError(r.code, r.message));
-		// 编辑器里的跟踪状态同步更新：之后的内容保存要寻址新位置、以新的对象版本为 CAS 前提
-		if (S!.editor) S!.editor.file = { ...S!.editor.file, path: to, serverPath: r.serverPath, metaGeneration: r.metaGeneration, revision: r.revision };
-		const entry = S!.byPath.get(tracked.path);
-		if (entry) {
-			S!.byPath.delete(tracked.path);
-			entry.path = to;
-			entry.serverPath = r.serverPath;
-			entry.metaGeneration = r.metaGeneration;
-			entry.revision = r.revision;
-			S!.byPath.set(to, entry);
-		}
-		renderTree();
-		markActive(to);
-		const title = contentEl.querySelector(".note-title");
-		if (title) title.textContent = noteTitle(to);
-		const crumb = contentEl.querySelector(".crumb");
-		if (crumb) crumb.textContent = to.replace(/\.md$/i, "").split("/").join(" / ");
-		location.hash = "#/n/" + encodeURIComponent(to);
+		noteLocationDialog({ title: "重命名笔记", okLabel: "重命名", name: titleOf(tracked.path), folder: folderOf(tracked.path), folders: foldersOf(S!.files.map((f) => f.path)), askName: true, askFolder: false, normalize: normalizeNotePath, check: clash, submit: (to) => moveNote(tracked, to) });
+	};
+	const move = el("button", "ghost", "移动到…");
+	move.onclick = () => {
+		more.open = false;
+		noteLocationDialog({ title: "移动到", okLabel: "移动", name: titleOf(tracked.path), folder: folderOf(tracked.path), folders: foldersOf(S!.files.map((f) => f.path)), askName: false, askFolder: true, normalize: normalizeNotePath, check: clash, submit: (to) => moveNote(tracked, to) });
 	};
 	const del = el("button", "ghost danger-text", "删除…");
-	del.onclick = async () => {
+	del.onclick = () => {
 		more.open = false;
-		if (!confirm(`删除「${noteTitle(tracked.path)}」？\n删除会同步到所有设备；历史版本仍保留，可以在其他设备或通过恢复找回。`)) return;
-		const f = S!.editor?.file ?? tracked;
-		const r = await deleteFile(repoBinding(), f);
-		if (r.kind !== "saved") {
-			return alert(r.kind === "conflict" ? "这篇笔记刚在别处被修改过，请刷新后再删除。" : r.kind === "rejected" ? writeError(r.code, r.message) : "网络连接失败，请稍后重试。");
-		}
-		// 只删本编辑器自己的草稿：别的标签页里同一篇的未同步输入留着（保存时会走「远端已删除」另存为新笔记）
-		if (S!.editor) await S!.drafts?.remove(f.fileId, S!.editor.draftId).catch(() => undefined);
-		S!.editor = undefined;
-		S!.files = S!.files.filter((x) => x.path !== tracked.path);
-		S!.byPath.delete(tracked.path);
-		renderTree();
-		location.hash = "#/";
+		confirmDialog({
+			title: `删除「${noteTitle(tracked.path)}」？`,
+			message: "删除会同步到所有设备。历史版本仍保留：可以在回收站或其他设备上找回。",
+			okLabel: "删除笔记",
+			danger: true,
+			confirm: async () => {
+				const f = S!.editor?.file ?? tracked;
+				const r = await deleteFile(repoBinding(), f);
+				if (r.kind !== "saved") return r.kind === "conflict" ? "这篇笔记刚在别处被修改过，请刷新后再删除。" : r.kind === "rejected" ? writeError(r.code, r.message) : "网络连接失败，请稍后重试。";
+				// 只删本编辑器自己的草稿：别的标签页里同一篇的未同步输入留着（保存时会走「远端已删除」另存为新笔记）
+				if (S!.editor) await S!.drafts?.remove(f.fileId, S!.editor.draftId).catch(() => undefined);
+				S!.editor = undefined;
+				S!.files = S!.files.filter((x) => x.path !== tracked.path);
+				S!.byPath.delete(tracked.path);
+				renderTree();
+				location.hash = "#/";
+				return null;
+			},
+		});
 	};
-	menu.append(rename, del);
+	menu.append(rename, move, del);
 	more.append(menu);
 	return more;
 }
 
-/** 新建笔记：只在编辑器里存在，第一次保存时才在服务器上创建（新 fileId，revision 0）。 */
-async function showNewNote(): Promise<void> {
-	const input = prompt("新笔记的路径（可以包含文件夹）", `未命名 ${new Date().toISOString().slice(0, 10)}.md`);
-	if (input === null) return;
-	const path = normalizeNotePath(input);
-	if (!path) return void alert("路径不合法：不能为空、不能以 / 开头、不能包含 .. 或以 . 开头的段。");
-	if (S!.byPath.has(path)) return void (location.hash = "#/n/" + encodeURIComponent(path));
-	// 撞名按最严解释判断（大小写、Unicode 归一后同名即视为同一文件；服务器同样会拒绝）
+/** 改名 / 移动一篇笔记（同一个同步操作）：成功返回 null，失败返回给表单显示的错误。 */
+async function moveNote(tracked: TrackedFile, to: string): Promise<string | null> {
+	if (to === tracked.path) return null;
+	if (S!.byPath.has(to)) return "目标位置已有同名文件。";
+	await S!.editor?.flush();
+	const r = await renameFile(repoBinding(), S?.writeKey ? { vmk: S.writeKey, meta: S.coreMeta } : null, S!.editor?.file ?? tracked, to);
+	if (!r.ok) return writeError(r.code, r.message);
+	// 编辑器里的跟踪状态同步更新：之后的内容保存要寻址新位置、以新的对象版本为 CAS 前提
+	if (S!.editor) S!.editor.file = { ...S!.editor.file, path: to, serverPath: r.serverPath, metaGeneration: r.metaGeneration, revision: r.revision };
+	const entry = S!.byPath.get(tracked.path);
+	if (entry) {
+		S!.byPath.delete(tracked.path);
+		entry.path = to;
+		entry.serverPath = r.serverPath;
+		entry.metaGeneration = r.metaGeneration;
+		entry.revision = r.revision;
+		S!.byPath.set(to, entry);
+	}
+	renderTree();
+	markActive(to);
+	const title = contentEl.querySelector(".note-title");
+	if (title) title.textContent = noteTitle(to);
+	const crumb = contentEl.querySelector(".crumb");
+	if (crumb) crumb.textContent = to.replace(/\.md$/i, "").split("/").join(" / ");
+	location.hash = "#/n/" + encodeURIComponent(to);
+	return null;
+}
+
+/** 新建笔记：只在编辑器里存在，第一次保存时才在服务器上创建（新 fileId，revision 0）。
+ * UI 焕新 U4：填标题、选位置（默认当前笔记所在的文件夹），不要求手写路径。 */
+function showNewNote(): void {
+	const here = S?.editor?.file.path ? folderOf(S.editor.file.path) : "";
 	const canon = (p: string) => p.normalize("NFC").toLowerCase();
-	const clash = S!.files.find((f) => canon(f.path) === canon(path));
-	if (clash) return void alert(`已有同名文件「${clash.path}」（大小写或 Unicode 归一后同名），请换一个名字。`);
+	noteLocationDialog({
+		title: "新建笔记",
+		okLabel: "新建",
+		name: `未命名 ${new Date().toISOString().slice(0, 10)}`,
+		folder: here,
+		folders: foldersOf(S!.files.map((f) => f.path)),
+		askName: true,
+		askFolder: true,
+		normalize: normalizeNotePath,
+		// 撞名按最严解释判断（大小写、Unicode 归一后同名即视为同一文件；服务器同样会拒绝）
+		check: (path) => {
+			if (S!.byPath.has(path)) return null; // the same note: it just opens
+			const clash = S!.files.find((f) => canon(f.path) === canon(path));
+			return clash ? `已有同名笔记「${clash.path}」（大小写或 Unicode 归一后同名也算），请换一个名字。` : null;
+		},
+		submit: async (path) => {
+			if (S!.byPath.has(path)) {
+				location.hash = "#/n/" + encodeURIComponent(path);
+				return null;
+			}
+			await openNewNote(path);
+			return null;
+		},
+	});
+}
+
+async function openNewNote(path: string): Promise<void> {
 	await leaveEditor();
 	revokeAllBlobs();
 	markActive(null);
@@ -1509,12 +1543,42 @@ function showHome(): void {
 	const wrap = el("div", "note-wrap");
 	const hour = new Date().getHours();
 	const greeting = hour < 6 ? "夜深了" : hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好";
-	wrap.append(el("h1", "", greeting));
-	wrap.append(el("p", "muted", "最近的笔记"));
 	const recent = [...S!.files]
 		.filter((f) => f.path.toLowerCase().endsWith(".md"))
 		.sort((a, b) => b.mtime - a.mtime)
 		.slice(0, 12);
+	const vaultName = S!.vaults.find((v) => v.current)?.name ?? "";
+	if (recent.length === 0) {
+		// UI 焕新 U4（审查 02）：刚建好的空仓库，首页直接给下一步，而不是一页空白。
+		const empty = el("div", "home-empty");
+		empty.append(el("h1", "", vaultName ? `「${vaultName}」还没有笔记` : "还没有笔记"));
+		empty.append(el("p", "muted", canEdit() ? "在网页里写第一篇，或者连接 Obsidian，把这个仓库同步到你的电脑和手机。已有本地笔记的，连接时可以选择怎么导入。" : "连接 Obsidian 后，这里会显示同步上来的笔记。网页编辑在这个仓库里不可用（只读成员、未开启网页编辑，或者仓库还没有解锁）。"));
+		const actions = el("div", "home-actions");
+		if (canEdit()) {
+			const first = el("button", "primary", "新建第一篇笔记");
+			first.onclick = () => showNewNote();
+			actions.append(first);
+		}
+		if (S!.account) {
+			const connect = el("button", canEdit() ? "" : "primary", "连接 Obsidian");
+			connect.onclick = () => void openConnectDialog(S!.account!, { id: currentVaultId(), name: vaultName || "当前仓库" });
+			actions.append(connect);
+		}
+		empty.append(actions);
+		wrap.append(empty);
+		contentEl.append(wrap);
+		updateStatus();
+		return;
+	}
+	const head = el("div", "home-head");
+	head.append(el("h1", "", greeting));
+	if (canEdit()) {
+		const add = el("button", "primary", "新建笔记");
+		add.onclick = () => showNewNote();
+		head.append(add);
+	}
+	wrap.append(head);
+	wrap.append(el("p", "muted", "最近的笔记"));
 	const list = el("div", "recent-list");
 	for (const f of recent) {
 		const card = el("a", "recent-card") as HTMLAnchorElement;

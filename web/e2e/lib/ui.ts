@@ -152,3 +152,61 @@ export function collectErrors(page: Page, benign: RegExp): string[] {
 	page.on("pageerror", (e: any) => errs.push(String(e)));
 	return errs;
 }
+
+// ---- UI 焕新 U4：新建 / 重命名 / 移动 / 删除改成产品内对话框（不再是浏览器原生 prompt / confirm） ----
+
+const splitPath = (path: string) => {
+	const at = path.lastIndexOf("/");
+	return { folder: at < 0 ? "" : path.slice(0, at), title: (at < 0 ? path : path.slice(at + 1)).replace(/\.md$/i, "") };
+};
+
+/** 在「位置」里选一个文件夹；没有就用「新建文件夹…」填上。 */
+async function chooseFolder(page: Page, folder: string): Promise<void> {
+	const select = page.getByRole("dialog").getByLabel("位置");
+	const has = await select.locator(`option[value="${folder.replace(/"/g, '\\"')}"]`).count();
+	if (has) await select.selectOption(folder);
+	else {
+		await select.selectOption({ label: "新建文件夹…" });
+		await page.getByRole("dialog").getByLabel("新文件夹名称").fill(folder);
+	}
+}
+
+/** 文件树的「新建笔记」→ 填标题、选位置 → 新建（打开编辑器）。 */
+export async function createNote(page: Page, path: string, trigger = page.locator(".tree-new")): Promise<void> {
+	const { folder, title } = splitPath(path);
+	await trigger.click();
+	const dlg = page.getByRole("dialog", { name: "新建笔记" });
+	await dlg.waitFor({ timeout: 10000 });
+	await dlg.getByLabel("标题").fill(title);
+	await chooseFolder(page, folder);
+	await dlg.getByRole("button", { name: "新建", exact: true }).click();
+	await dlg.waitFor({ state: "detached", timeout: 15000 });
+}
+
+/** 当前笔记的「更多」→ 重命名 / 移动到（两者都变时依次做两次，各是一次同步操作）。 */
+export async function renameNote(page: Page, from: string, to: string): Promise<void> {
+	const a = splitPath(from);
+	const b = splitPath(to);
+	if (a.folder !== b.folder) {
+		await page.locator(".note-more summary").click();
+		await page.getByRole("button", { name: "移动到…" }).click();
+		await chooseFolder(page, b.folder);
+		await page.getByRole("dialog", { name: "移动到" }).getByRole("button", { name: "移动", exact: true }).click();
+		await page.waitForFunction((p: string) => location.hash === "#/n/" + encodeURIComponent(p), `${b.folder ? `${b.folder}/` : ""}${a.title}.md`, { timeout: 15000 });
+	}
+	if (a.title !== b.title) {
+		await page.locator(".note-more summary").click();
+		await page.getByRole("button", { name: "重命名…" }).click();
+		const dlg = page.getByRole("dialog", { name: "重命名笔记" });
+		await dlg.getByLabel("标题").fill(b.title);
+		await dlg.getByRole("button", { name: "重命名", exact: true }).click();
+	}
+	await page.waitForFunction((p: string) => location.hash === "#/n/" + encodeURIComponent(p), to, { timeout: 15000 });
+}
+
+/** 当前笔记的「更多」→ 删除… → 确认框「删除笔记」。 */
+export async function deleteNote(page: Page): Promise<void> {
+	await page.locator(".note-more summary").click();
+	await page.getByRole("button", { name: "删除…" }).click();
+	await page.getByRole("dialog").getByRole("button", { name: "删除笔记" }).click();
+}

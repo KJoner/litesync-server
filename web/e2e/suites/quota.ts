@@ -1,7 +1,7 @@
 // 配额在网页上的表现（需求 §12）：编辑器保存遇到永久超限时如实说明且不丢内容；账号页显示用量与上限；
 // 管理员放开后同一份修改能正常保存。本机隔离服务端，合成数据。
 import { api, E2E, Suite } from "../lib/harness";
-import { createVault, tokenLogin } from "../lib/ui";
+import { createNote, createVault, tokenLogin } from "../lib/ui";
 
 const PASSWORD = "配额测试密码 · 2026-11-21";
 
@@ -19,7 +19,7 @@ await new Suite().run(async (s) => {
 		await createVault(page, "配额测试", PASSWORD);
 		await page.locator(".tree-new").waitFor({ timeout: 30000 });
 
-		await page.locator(".tree-new").click();
+		await createNote(page, "配额/长笔记.md");
 		await page.locator(".cm-content").click();
 		await page.keyboard.insertText("短内容");
 		await page.keyboard.press("Control+s");

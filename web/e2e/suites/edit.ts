@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 import { api, E2E, Suite } from "../lib/harness";
 import { PluginDevice, rawMagic, snapshotPaths } from "../lib/plugin";
-import { collectErrors, createVault, editorText, openNote, tokenLogin, typeLines, unlock, waitState } from "../lib/ui";
+import { collectErrors, createNote, createVault, deleteNote, editorText, openNote, renameNote, tokenLogin, typeLines, unlock, waitState } from "../lib/ui";
 
 const PASSWORD = "编辑联调密码 · 2026-11-21";
 const VAULT_NAME = `编辑联调-${Date.now().toString(36)}`;
@@ -39,8 +39,7 @@ await new Suite().run(async (s) => {
 
 		// ---- 1. 新建笔记 → Ctrl+S → 插件解密 ----
 		const P = "联调/网页新建.md";
-		prompts.push(P);
-		await page.locator(".tree-new").click();
+		await createNote(page, P);
 		await page.locator(".cm-content").waitFor({ timeout: 15000 });
 		await page.locator(".cm-content").click();
 		const v1 = "# 网页新建\n\n第一段\n\n第二段\n";
@@ -185,10 +184,7 @@ await new Suite().run(async (s) => {
 
 		// ---- 6. 改名：fileId 与历史保持，内容零重传 ----
 		const P2 = "联调/改名后.md";
-		prompts.push(P2);
-		await page.locator(".note-more summary").click();
-		await page.getByRole("button", { name: "改名 / 移动…" }).click();
-		await page.waitForFunction((p: string) => location.hash === "#/n/" + encodeURIComponent(p), P2, { timeout: 15000 });
+		await renameNote(page, P, P2);
 		const files6 = await snapshotPaths(vaultId);
 		const moved = files6.find((f) => f.path === P2);
 		s.check("改名后服务器上是新路径、同一个 fileId，旧路径消失", moved?.fileId === fileId && !files6.some((f) => f.path === P), moved?.path);
@@ -209,8 +205,7 @@ await new Suite().run(async (s) => {
 		// ---- 7. 删除冲突副本 ----
 		if (copy) {
 			await openNote(page, copy.path, "read");
-			await page.locator(".note-more summary").click();
-			await page.getByRole("button", { name: "删除…" }).click();
+			await deleteNote(page);
 			await page.waitForFunction(() => location.hash === "#/", undefined, { timeout: 15000 });
 			s.check("删除后服务器快照里不再有它", !(await snapshotPaths(vaultId)).some((f) => f.path === copy.path));
 

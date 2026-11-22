@@ -8,6 +8,7 @@
  * - Token 明文只在注册响应里出现一次，页面强制「我已保存」确认；
  * - 本页不触碰任何密钥材料——E2EE 密码在 Obsidian 插件里设置，永不经过浏览器。
  */
+import { followSystemTheme } from "./theme";
 
 function el<K extends keyof HTMLElementTagNameMap>(
 	tag: K,
@@ -23,7 +24,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
 const app = document.getElementById("app")!;
 
 function applyTheme(): void {
-	document.documentElement.dataset.theme = localStorage.getItem("litesync-theme") ?? "dark";
+	followSystemTheme();
 }
 
 function centered(children: HTMLElement[]): void {

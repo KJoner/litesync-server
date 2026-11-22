@@ -1,21 +1,25 @@
-/* LiteSync Web —— 设计 Token 按《UI 规格》§6（v0.20 公开化）：
- * 强调色只用于主动作与选择态；成功/警示/错误同时配文字或图标，不只靠颜色。 */
+/* LiteSync Web —— 设计 Token 按《UI 规格》§6（v0.20 公开化），UI 焕新 U4 起取
+ * ui-refresh design-tokens.json：中性石灰底、不透明表面；强调色只用于主动作与选择态；
+ * 成功/警示/错误同时配文字或图标，不只靠颜色。文字对比度均 ≥ 4.5:1（见 design/contrast-check.json）。 */
 :root,
 :root[data-theme="dark"] {
-	--bg: #111318;
-	--bg-side: #191c23;
-	--bg-panel: #191c23;
-	--bg-float: #222631;
-	--bg-hover: #222631;
-	--border: #303642;
-	--text: #e8eaf0;
-	--muted: #a6adbb;
-	--accent: #a58bff;
-	--accent-text: #111318;
-	--accent-dim: rgba(165, 139, 255, 0.16);
-	--ok: #25a976;
-	--warn: #e8a43b;
-	--danger: #df5c6a;
+	--bg: #17181b;
+	--bg-side: #1c1d21;
+	--bg-panel: #202126;
+	--bg-float: #28292f;
+	--bg-hover: #28292f;
+	--border: #35363e;
+	--text: #efeff2;
+	--muted: #b3b4bd;
+	--accent: #b4a1f3;
+	--accent-text: #211c32;
+	--accent-dim: rgba(180, 161, 243, 0.16);
+	--ok: #94cfab;
+	--warn: #e8c17d;
+	--danger: #f4a49d;
+	--ok-bg: #203429;
+	--warn-bg: #392f20;
+	--danger-bg: #3b2528;
 	--add: rgba(37, 169, 118, 0.2);
 	--del: rgba(223, 92, 106, 0.18);
 	--code-bg: #191c23;
@@ -26,20 +30,23 @@
 	color-scheme: dark;
 }
 :root[data-theme="light"] {
-	--bg: #f6f7fb;
+	--bg: #f7f7f5;
 	--bg-side: #ffffff;
 	--bg-panel: #ffffff;
 	--bg-float: #ffffff;
-	--bg-hover: #eef0f6;
-	--border: #dfe2ea;
-	--text: #1c1f26;
-	--muted: #5d6474;
-	--accent: #7c5cfc;
+	--bg-hover: #efefec;
+	--border: #e3e3df;
+	--text: #232428;
+	--muted: #62646d;
+	--accent: #6854bc;
 	--accent-text: #ffffff;
-	--accent-dim: rgba(124, 92, 252, 0.1);
-	--ok: #1d8a5f;
-	--warn: #a86a0f;
-	--danger: #c43d4c;
+	--accent-dim: rgba(104, 84, 188, 0.1);
+	--ok: #286746;
+	--warn: #8a5100;
+	--danger: #b42318;
+	--ok-bg: #e9f3ed;
+	--warn-bg: #fff4db;
+	--danger-bg: #feeceb;
 	--add: rgba(29, 138, 95, 0.14);
 	--del: rgba(196, 61, 76, 0.12);
 	--code-bg: #f0f2f7;
@@ -117,7 +124,7 @@ a {
 	font-size: 12px;
 }
 .error {
-	color: #e06060;
+	color: var(--danger);
 	min-height: 1em;
 }
 .spacer {
@@ -629,13 +636,13 @@ footer {
 }
 .settings-pw-warn {
 	border: 1px solid var(--border);
-	border-left: 3px solid #d9a53f;
+	border-left: 3px solid var(--warn);
 	border-radius: var(--radius);
 	padding: 8px 12px;
 	margin-top: 8px;
 }
 .warn {
-	color: #d9a53f;
+	color: var(--warn);
 }
 .usage-bar {
 	height: 8px;
@@ -650,10 +657,10 @@ footer {
 	transition: width 0.2s ease;
 }
 .usage-fill.yellow {
-	background: #d9a53f;
+	background: var(--warn);
 }
 .usage-fill.red {
-	background: #d05050;
+	background: var(--danger);
 }
 .snapshot-row {
 	display: flex;
@@ -672,13 +679,16 @@ footer {
 	top: 0;
 	z-index: 50;
 	padding: 10px 16px;
-	background: #7a5b00;
-	color: #fff;
+	/* 成对的警示色（文字 + 底色），浅色与深色都 ≥ 4.5:1；不只靠颜色：横幅本身就是一句话 */
+	background: var(--warn-bg);
+	color: var(--warn);
+	border-bottom: 1px solid var(--border);
 	font-size: 13px;
 	text-align: center;
 }
 .repo-banner-error {
-	background: #8a1f1f;
+	background: var(--danger-bg);
+	color: var(--danger);
 }
 
 /* 运维页（v0.17 / §11.3） */
@@ -699,15 +709,15 @@ footer {
 }
 button.danger {
 	background: transparent;
-	color: #e5534b;
-	border: 1px solid #e5534b;
+	color: var(--danger);
+	border: 1px solid var(--danger);
 	border-radius: 6px;
 	padding: 4px 12px;
 	cursor: pointer;
 }
 button.danger:hover:not(:disabled) {
-	background: #e5534b;
-	color: #fff;
+	background: var(--danger-bg);
+	color: var(--danger);
 }
 button.danger:disabled {
 	opacity: 0.5;
@@ -1597,3 +1607,90 @@ button.recent-card {
 .md-source { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei", monospace; font-size: 13px; max-height: 70vh; overflow: auto; }
 .trash-pending { margin-top: 6px; }
 .tree-readonly { padding: 6px 10px; }
+
+/* UI 焕新 U4：空仓库首页的下一步、首页的新建按钮、产品内的笔记表单与危险确认。 */
+.home-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	flex-wrap: wrap;
+}
+.home-empty {
+	max-width: 560px;
+	margin: 12vh auto 0;
+	text-align: left;
+}
+.home-empty h1 {
+	font-size: 26px;
+	line-height: 1.35;
+	margin: 0 0 8px;
+}
+.home-empty p {
+	line-height: 1.7;
+	margin: 0 0 20px;
+}
+.home-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+.home-actions button,
+.home-head button {
+	min-height: 44px;
+	padding: 0 18px;
+}
+.note-form .field select,
+.note-form .field input {
+	width: 100%;
+	min-height: 44px;
+	font-size: 15px;
+}
+@media (max-width: 600px) {
+	.note-form .field select,
+	.note-form .field input {
+		font-size: 16px;
+	}
+}
+.note-form-preview {
+	word-break: break-all;
+	margin: 4px 0 0;
+}
+.note-form-error:empty {
+	display: none;
+}
+button.danger-solid {
+	background: var(--danger);
+	border: 1px solid var(--danger);
+	color: var(--bg-panel);
+	border-radius: var(--radius);
+	padding: 0 16px;
+	min-height: 40px;
+	font-weight: 600;
+	cursor: pointer;
+}
+button.danger-solid:hover:not(:disabled) {
+	filter: brightness(1.08);
+}
+
+/* UI 焕新 U4：没有大纲（首页、新笔记、没有标题的笔记）时不留空的右栏，正文拿到这块宽度（W05 / 审查 04）。 */
+@media (min-width: 1101px) {
+	.layout:has(> .outline:empty) {
+		grid-template-columns: 250px minmax(0, 1fr);
+		grid-template-areas:
+			"header header"
+			"tree content"
+			"footer footer";
+	}
+	.layout:has(> .outline:empty) > .outline {
+		display: none;
+	}
+}
+/* The location select looks like the other fields. */
+.note-form .field select {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--bg-panel);
+	color: var(--text);
+	padding: 0 10px;
+}

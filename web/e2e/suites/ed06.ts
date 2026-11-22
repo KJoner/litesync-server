@@ -1,7 +1,7 @@
 // 验收 ED-06（LiteSync 网页部分）：恶意 Markdown / HTML / 脚本 URL / SVG / 远程追踪图片在预览中
 // 不执行任何脚本、不向第三方发出请求；合法代码块只当文本显示。本机隔离服务端，合成数据。
 import { E2E, Suite } from "../lib/harness";
-import { createVault, tokenLogin } from "../lib/ui";
+import { createNote, createVault, tokenLogin } from "../lib/ui";
 
 const PASSWORD = "ED06 仓库密码 · 2026-11-21";
 const EVIL = [
@@ -37,7 +37,7 @@ await new Suite().run(async (s) => {
 		page.on("dialog", (d: any) => d.accept(d.type() === "prompt" ? "ED06/恶意夹具.md" : undefined));
 		await tokenLogin(page);
 		await createVault(page, "ED06-" + Date.now().toString(36), PASSWORD);
-		await page.locator(".tree-new").click();
+		await createNote(page, "ED06/恶意夹具.md");
 		await page.locator(".cm-content").click();
 		await page.keyboard.insertText(EVIL);
 		await page.keyboard.press("Control+s");

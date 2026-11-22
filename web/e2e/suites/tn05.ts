@@ -1,7 +1,7 @@
 // 验收 TN-05（LiteSync 网页部分）：同一浏览器两个标签页；一个标签页退出 / 换成另一个账号时，
 // 另一个标签页立刻清掉已解锁的明文；仓库选择等本地记忆按账号分区。本机隔离服务端，合成数据。
 import { api, E2E, Suite } from "../lib/harness";
-import { createVault, tokenLogin, unlock } from "../lib/ui";
+import { createNote, createVault, tokenLogin, unlock } from "../lib/ui";
 
 const PASSWORD = "TN05 仓库密码 · 2026-11-21";
 const SECRET_TEXT = "甲的秘密内容-" + Date.now().toString(36);
@@ -16,7 +16,7 @@ await new Suite().run(async (s) => {
 		tab1.on("dialog", (d: any) => d.accept(d.type() === "prompt" ? "TN05/甲的笔记.md" : undefined));
 		await tokenLogin(tab1);
 		await createVault(tab1, "TN05-" + Date.now().toString(36), PASSWORD);
-		await tab1.locator(".tree-new").click();
+		await createNote(tab1, "TN05/甲的笔记.md");
 		await tab1.locator(".cm-content").click();
 		await tab1.keyboard.insertText(SECRET_TEXT);
 		await tab1.keyboard.press("Control+s");

@@ -9,7 +9,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as core from "../../src/vendor/litesync-core/crypto/crypto";
 import { api, E2E, sleep, Suite, until } from "../lib/harness";
-import { createVault, enterVault, openNote, tokenLogin, unlock } from "../lib/ui";
+import { createNote, createVault, deleteNote, enterVault, openNote, renameNote, tokenLogin, unlock } from "../lib/ui";
 
 const PASSWORD = "W5 路径加密测试密码 · 2026-11-21";
 const DEVICE = "e2e-meta-migrator";
@@ -56,8 +56,7 @@ await new Suite().run(async (s) => {
 
 		// ---- 网页上新建 → 改名 → 删除；新建 → 删除 → 别的文件改名占住原位置；新建 → 删除 → 清理历史 ----
 		const newNote = async (path: string, text: string) => {
-			prompts.push(path);
-			await page.locator(".tree-new").click();
+			await createNote(page, path);
 			await page.locator(".cm-content").waitFor({ timeout: 15000 });
 			await page.locator(".cm-content").click();
 			await page.keyboard.insertText(text);
@@ -76,14 +75,12 @@ await new Suite().run(async (s) => {
 		};
 		const del = async (path: string) => {
 			await reopen(path);
-			await menu("删除…");
+			await deleteNote(page);
 			await page.waitForFunction(() => location.hash === "#/", undefined, { timeout: 15000 });
 		};
 		const rename = async (from: string, to: string) => {
 			await reopen(from);
-			prompts.push(to);
-			await menu("改名 / 移动…");
-			await page.waitForFunction((p: string) => location.hash === "#/n/" + encodeURIComponent(p), to, { timeout: 15000 });
+			await renameNote(page, from, to);
 		};
 		await newNote("私密/改名前.md", "改名测试的正文");
 		const renamed = await rename("私密/改名前.md", "私密/改名后.md").then(() => true, () => false);
