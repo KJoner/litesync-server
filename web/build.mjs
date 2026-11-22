@@ -1,6 +1,6 @@
 // 构建 Web 只读端并输出到 internal/web/dist（产物提交进仓库，服务器无需 Node）
 import esbuild from "esbuild";
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -27,6 +27,11 @@ await esbuild.build({
 const lf = (p) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 for (const f of ["index.html", "share.html", "pair.html", "join.html", "styles.css"]) {
 	writeFileSync(join(outdir, f), lf(join(root, f)));
+}
+// 静态图片（UI 焕新 v2：欢迎页装饰图，来源见 web/assets/PROVENANCE.md）：二进制原样复制，同源提供
+mkdirSync(join(outdir, "assets"), { recursive: true });
+for (const f of readdirSync(join(root, "assets"))) {
+	if (/\.(webp|png|jpe?g|svg)$/i.test(f)) copyFileSync(join(root, "assets", f), join(outdir, "assets", f));
 }
 console.log("web dist ->", outdir);
 

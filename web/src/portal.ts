@@ -8,8 +8,14 @@
  *   - sessionStorage 里只放**非秘密**的幂等键（clientRequestId / opId），用于刷新后续接，
  *     保证「重复点击、网络中断、刷新重试」不会建出两个仓库或换掉密钥。
  *   - 配对链接只含一次性 enrollment 与本地加密的配置包，密钥在 #fragment 里。
+ *
+ * UI 焕新 v2（v12.0.3 V1/V2）：欢迎页两栏构图、仓库门户与账号页按定稿原型重排。只改展示——
+ * 登录入口仍是 /auth/login（带 invite / returnTo / intent），注册按真实的开放状态显示，
+ * Token 登录只在服务器开放时出现；建库、配对、撤销的流程与文字承诺不变。
  */
 import qrcode from "qrcode-generator";
+import { icon, IconName, withIcon } from "./icons";
+import { brand, labelButton, themeButton } from "./ui";
 import {
 	accountApi,
 	announceAccount,
@@ -21,6 +27,7 @@ import {
 	PairingGrantResp,
 	PeerDelivery,
 	RevocationView,
+	Usage,
 	VaultCard,
 } from "./api";
 import {
@@ -134,17 +141,13 @@ export { openDialog };
 
 type Section = "vaults" | "me";
 
-function shell(host: PortalHost, me: Me, active: Section): HTMLElement {
-	host.root.innerHTML = "";
-	const page = h("div", "portal");
-	const top = h("header", "portal-top");
-	const brand = h("a", "portal-brand", "◈ LiteSync");
-	brand.href = "#/vaults";
-	const spacer = h("div", "spacer");
-	const theme = button("切换主题", "ghost small-btn", () => host.toggleTheme());
-	const who = h("span", "portal-who", me.account.displayName || me.account.email || "我的账号");
-	top.append(brand, spacer, theme, who);
-
+/**
+ * 账号级页面的页头：品牌、我的仓库、账号与设备、主题。顶栏不显示用户名、昵称或邮箱
+ * （身份资料只在「账号与设备」里）。解锁页也用这一条页头。
+ */
+export function portalHeader(host: Pick<PortalHost, "toggleTheme">, active: Section | ""): HTMLElement {
+	const top = h("header", "portal-header");
+	top.append(brand("#/vaults", "LiteSync 我的仓库"));
 	const nav = h("nav", "portal-nav");
 	nav.setAttribute("aria-label", "主导航");
 	for (const [key, label, hash] of [
@@ -156,58 +159,152 @@ function shell(host: PortalHost, me: Me, active: Section): HTMLElement {
 		if (active === key) a.setAttribute("aria-current", "page");
 		nav.append(a);
 	}
-	const main = h("main", "portal-main");
-	page.append(top, nav, main);
+	nav.append(themeButton(() => host.toggleTheme()));
+	top.append(nav);
+	return top;
+}
+
+function shell(host: PortalHost, active: Section): HTMLElement {
+	host.root.innerHTML = "";
+	const page = h("div", "portal");
+	const main = h("main", "portal-content");
+	page.append(portalHeader(host, active), main);
 	host.root.append(page);
 	return main;
 }
 
+/** 页面标题区：小标题、标题、一行说明，右侧一个动作（可选）。 */
+function headline(eyebrow: string, title: string, lead: string, action?: HTMLElement | null): HTMLElement {
+	const head = h("div", "headline");
+	const text = h("div", "headline-text");
+	text.append(h("p", "eyebrow", eyebrow), h("h1", "", title), h("p", "lead", lead));
+	head.append(text);
+	if (action) head.append(action);
+	return head;
+}
+
+function pill(tone: "" | "ok" | "warn" | "danger", name: IconName, text: string): HTMLElement {
+	const p = h("span", "pill" + (tone ? " " + tone : ""));
+	p.append(icon(name), h("span", "", text));
+	return p;
+}
+
 // ---------------------------------------------------------------- 登录
 
+/** 欢迎页左侧的小窗口：纯装饰（aria-hidden），只有通用的示例文字，不含任何真实笔记或账号。 */
+function miniWindow(): HTMLElement {
+	const w = h("div", "mini-window");
+	w.setAttribute("aria-hidden", "true");
+	const top = h("div", "mini-top");
+	const a = h("span");
+	a.append(icon("folder"), "工作笔记");
+	const b = h("span");
+	b.append(icon("lock"), "本次会话已解锁");
+	top.append(a, b);
+	const body = h("div", "mini-body");
+	const side = h("div", "mini-sidebar");
+	for (const t of ["概览", "项目笔记", "灵感收集", "资料"]) side.append(h("span", "", t));
+	const doc = h("div", "mini-doc");
+	doc.append(h("strong", "", "把想法，写成下一步。"), h("span", "mini-line"), h("span", "mini-line"), h("span", "mini-line"));
+	const note = h("span", "mini-note");
+	note.append(icon("lock"), "每个仓库，用独立密码保护");
+	doc.append(note);
+	body.append(side, doc);
+	w.append(top, body);
+	return w;
+}
+
+/**
+ * LiteSync 自己的欢迎页（V1 / L1）：左侧品牌与说明，右侧入口。账号密码只在账号中心填写——这里只有
+ * 「登录账号」（既有的 /auth/login，带 invite / returnTo）和按真实开放状态显示的「创建账号」；
+ * Token 登录只在服务器开放时出现（同时开了统一登录时折叠在「自托管与管理员连接」里）。
+ */
 export function renderLoginPage(host: PortalHost, cfg: AuthConfig, error?: string): void {
 	host.root.innerHTML = "";
-	const wrap = h("div", "center-screen");
-	const card = h("div", "center-card login-card");
-	card.append(h("div", "brand", "◈ LiteSync"));
+	const page = h("main", "welcome");
+
+	const art = h("section", "welcome-art");
+	art.setAttribute("aria-label", "LiteSync 简介");
+	art.append(brand());
+	const story = h("div", "welcome-story");
+	const headline = h("p", "welcome-headline");
+	headline.append("你的笔记，", h("br"), "始终与你同在。");
+	const sub = h("p", "welcome-sub");
+	sub.append("在电脑上开始，在手机上继续。", h("br"), "让每一个值得保留的想法，都有自己的位置。");
+	story.append(h("p", "eyebrow", "A quiet place for your thoughts"), headline, sub, miniWindow());
+	art.append(story);
+	const foot = h("ul", "welcome-foot");
+	for (const [name, text] of [["folder", "多个仓库"], ["cloud", "设备同步"], ["shield", "独立仓库密码"]] as const) {
+		const li = h("li");
+		li.append(icon(name), h("span", "", text));
+		foot.append(li);
+	}
+	art.append(foot);
+
+	const right = h("section", "welcome-right");
+	const util = h("div", "utility-top");
+	util.append(h("span", "lang-label", "简体中文"), themeButton(() => host.toggleTheme()));
+	right.append(util);
+	const card = h("div", "welcome-form login-card");
 	const invite = new URLSearchParams(location.search).get("invite") ?? "";
-	const errEl = h("p", "error", error ?? "");
+	const errEl = h("p", "error welcome-error", error ?? "");
 	errEl.setAttribute("role", "alert");
+	const title = h("h1", "welcome-title");
+	title.append("从这里，", h("br"), "继续你的想法。");
+	card.append(h("p", "eyebrow", "Welcome to LiteSync"), title);
 
 	if (cfg.oidc) {
-		// 与账号中心主题同一套说法（U3）：登录你的账号 / 一个账号可用于 LiteSync 和 Nexus；
 		// 注册按真实的开放状态说清楚，不摆一个点了也注册不成的按钮（只改展示，登录流程不变）
-		card.append(h("h1", "login-title", "登录你的账号"), h("p", "muted", "一个账号可用于 LiteSync 和 Nexus。"));
+		const intro = h("p", "intro");
+		intro.append("一个账号，连接 LiteSync 与 Nexus。", h("br"), "登录后，即可打开你的笔记仓库。");
+		card.append(intro);
 		const q = new URLSearchParams({ returnTo: "/#/vaults" });
 		if (invite) q.set("invite", invite);
-		const signIn = h("a", "button primary block", "登录");
+		const signIn = h("a", "btn primary wide");
 		signIn.href = "/auth/login?" + q.toString();
+		withIcon(signIn, "arrow", "登录账号", true);
 		card.append(signIn);
 		const rq = new URLSearchParams(q);
 		rq.set("intent", "register");
 		if (cfg.registrationMode === "open" || (cfg.registrationMode === "invite" && invite)) {
-			if (invite) card.append(h("p", "muted small", "你收到了邀请：用这个页面创建账号，之后就能新建仓库、连接 Obsidian。"));
-			const reg = h("a", "button block", invite ? "用邀请创建账号" : "创建账号");
+			const reg = h("a", "btn wide", invite ? "用邀请创建账号" : "创建账号");
 			reg.href = "/auth/login?" + rq.toString();
 			card.append(reg);
+			if (invite) card.append(h("p", "welcome-note", "你收到了邀请：用这个页面创建账号，之后就能新建仓库、连接 Obsidian。"));
 		} else if (cfg.registrationMode === "invite") {
-			card.append(h("p", "muted small", "LiteSync 目前只接受邀请注册：请用收到的邀请链接打开这个页面。已经有账号的，直接登录。"));
+			card.append(h("p", "welcome-note", "LiteSync 目前只接受邀请注册：请用收到的邀请链接打开这个页面。已经有账号的，直接登录。"));
 		} else {
-			card.append(h("p", "muted small", "LiteSync 暂未开放注册。已经有账号的，直接登录。"));
+			card.append(h("p", "welcome-note", "LiteSync 暂未开放注册。已经有账号的，直接登录。"));
 		}
-		card.append(h("p", "muted small", "登录与注册在账号中心完成，LiteSync 看不到你的账号密码。登录后，打开每个仓库还要输入它的仓库密码——它和账号密码不是同一个。"));
+		// 页面上只留一条短提示；细节放进可展开的帮助
+		const tip = h("p", "security-copy");
+		tip.append(icon("shield"), h("span", "", "登录账号后，打开仓库还需输入独立的仓库密码。"));
+		const help = h("details", "welcome-help");
+		const hs = h("summary");
+		hs.append(h("span", "", "账号密码和仓库密码有什么不同？"), icon("down"));
+		help.append(hs, h("p", "", "登录与注册在账号中心完成，LiteSync 看不到你的账号密码。仓库密码只在你的设备上用来解密笔记，服务器和邮件都无法找回它；重设账号密码也不会改变仓库密码。"));
+		card.append(tip, help);
+	} else if (cfg.legacyTokenLogin) {
+		card.append(h("p", "intro", "端到端加密的笔记同步。每个仓库都用你自己设置的仓库密码在本机加密；这台服务器用 API Token 登录。"));
 	} else {
-		card.append(h("p", "muted", "端到端加密的笔记同步。每个仓库都用你自己设置的仓库密码在本机加密。"));
+		card.append(h("p", "intro", "端到端加密的笔记同步。每个仓库都用你自己设置的仓库密码在本机加密。"));
 	}
 	if (cfg.legacyTokenLogin) {
-		const box = cfg.oidc ? h("details", "legacy-login") : h("div", "legacy-login");
-		if (cfg.oidc) box.append(h("summary", "", "管理员 / 自托管：使用 API Token 登录"));
+		const box = cfg.oidc ? h("details", "self-hosted") : h("div", "self-hosted token-only");
+		if (cfg.oidc) {
+			const s = h("summary");
+			s.append(h("span", "", "自托管与管理员连接"), icon("down"));
+			box.append(s);
+		}
 		const label = h("label", "field");
 		label.append(h("span", "", "API Token"));
 		const input = h("input");
 		input.type = "password";
 		input.autocomplete = "off";
-		label.append(input);
-		const go = h("button", "primary", "使用 Token 登录");
+		input.placeholder = "输入服务器提供的 Token";
+		label.append(input, h("small", "", "Token 只用于换取网页会话（HttpOnly Cookie），不会保存在浏览器中。"));
+		const go = h("button", cfg.oidc ? "btn wide" : "btn primary wide", "使用 Token 登录");
+		go.type = "button";
 		const submit = async () => {
 			go.disabled = true;
 			go.textContent = "登录中…";
@@ -225,26 +322,24 @@ export function renderLoginPage(host: PortalHost, cfg: AuthConfig, error?: strin
 		input.onkeydown = (e) => {
 			if (e.key === "Enter") void submit();
 		};
-		box.append(label, go, h("p", "muted small", "Token 只用于换取网页会话（HttpOnly Cookie），不会保存在浏览器中。"));
+		box.append(label, go);
 		card.append(box);
 	}
-	if (!cfg.oidc && !cfg.legacyTokenLogin) card.append(h("p", "muted", "此服务器没有开放网页登录。"));
+	if (!cfg.oidc && !cfg.legacyTokenLogin) card.append(h("p", "welcome-note", "此服务器没有开放网页登录。"));
 	card.append(errEl);
-	wrap.append(card);
-	host.root.append(wrap);
+	right.append(card, h("p", "legal-foot", "你的笔记由仓库密码在本机加密保护"));
+	page.append(art, right);
+	host.root.append(page);
 }
 
 // ---------------------------------------------------------------- 我的仓库
 
 export async function renderVaultCenter(host: PortalHost, me: Me): Promise<void> {
-	const main = shell(host, me, "vaults");
-	const head = h("div", "portal-head");
-	const titles = h("div");
-	titles.append(h("h1", "", "我的仓库"), h("p", "muted", "每个仓库都用独立的仓库密码在你的设备上加密，服务器只保存密文。"));
+	const main = shell(host, "vaults");
 	const canCreate = me.permissions.includes("vault:create");
-	const create = button("新建仓库", "primary", () => openCreateVaultDialog(host, me));
+	const create = labelButton("plus", "新建仓库", "btn primary", () => openCreateVaultDialog(host, me));
 	create.disabled = !canCreate;
-	head.append(titles, create);
+	const head = headline("Your space for every idea", "我的仓库", "为工作与生活，留出各自的空间。", create);
 	main.append(head);
 	if (!me.account.emailVerified) {
 		main.append(h("div", "banner warn", "邮箱尚未验证：验证之前可以浏览，但不能创建仓库或连接新设备。请到邮箱中点击验证链接。"));
@@ -258,52 +353,96 @@ export async function renderVaultCenter(host: PortalHost, me: Me): Promise<void>
 	} catch (e) {
 		if (e instanceof AuthError) return location.reload();
 		grid.innerHTML = "";
-		grid.append(h("div", "banner danger", "加载仓库失败：" + errText(e)), button("重试", "", () => void renderVaultCenter(host, me)));
+		grid.append(h("div", "banner danger", "加载仓库失败：" + errText(e)), button("重试", "btn", () => void renderVaultCenter(host, me)));
 		return;
 	}
 	grid.innerHTML = "";
 	if (vaults.length === 0) {
-		const empty = h("div", "empty-state");
-		empty.append(
-			h("h2", "", "还没有笔记仓库"),
-			h("p", "muted", "新建一个仓库，设置它的仓库密码，然后在网页里写笔记，或连接你的 Obsidian。"),
-		);
-		const b = button("新建第一个仓库", "primary", () => openCreateVaultDialog(host, me));
-		b.disabled = !canCreate;
-		empty.append(b, h("p", "muted small", "已经在用 Obsidian？先在这里新建一个空仓库，再在 Obsidian 里用「连接链接」接入并选择「用本地初始化」。"));
-		grid.append(empty);
+		// 没有仓库：主任务只有一个——创建第一个仓库（标题区不再重复放同一个按钮）
+		create.remove();
+		grid.replaceWith(emptyVaults(host, me, canCreate));
+		main.append(portalTip());
 		return;
 	}
 	for (const v of vaults) grid.append(vaultCard(host, me, v));
+	main.append(portalTip());
 }
 
-function stateChip(v: VaultCard): HTMLElement {
-	if (v.initState !== "ready") return h("span", "chip warn", "⚠ 待完成加密设置");
-	if (v.encryptionState === "encrypted") return h("span", "chip ok", "🔒 已加密");
-	if (v.encryptionState === "migrating") return h("span", "chip warn", "⟳ 加密迁移中");
-	return h("span", "chip", "未加密（旧仓库）");
+function emptyVaults(host: PortalHost, me: Me, canCreate: boolean): HTMLElement {
+	const box = h("section", "vault-empty");
+	box.setAttribute("aria-labelledby", "vault-empty-title");
+	const glyph = h("span", "vault-glyph");
+	glyph.append(icon("folder"));
+	const title = h("h2", "", "创建第一个仓库");
+	title.id = "vault-empty-title";
+	box.append(glyph, title, h("p", "muted", "创建第一个仓库，开始保存你的笔记。"));
+	const steps = h("ol", "empty-steps");
+	for (const [t, d] of [
+		["创建仓库", "给它起一个名字"],
+		["设置仓库密码", "只在你的设备上用来加密"],
+		["连接 Obsidian", "或者直接在网页里写"],
+	]) {
+		const li = h("li");
+		li.append(h("strong", "", t), h("span", "", d));
+		steps.append(li);
+	}
+	const b = labelButton("plus", "创建第一个仓库", "btn primary", () => openCreateVaultDialog(host, me));
+	b.disabled = !canCreate;
+	box.append(steps, b, h("p", "muted small", "已经在用 Obsidian？先在这里新建一个空仓库，再在 Obsidian 里用「连接链接」接入；本机已有的笔记可以在接入时加密上传。"));
+	return box;
+}
+
+function portalTip(): HTMLElement {
+	const tip = h("aside", "portal-tip");
+	const text = h("div");
+	text.append(h("strong", "", "每个仓库，都有自己的密码。"), h("span", "", "登录账号后仍需单独解锁仓库。仓库密码不会随账号密码重置，切换仓库时需要重新输入。"));
+	tip.append(icon("shield"), text);
+	return tip;
+}
+
+/** 仓库的真实状态：待完成加密设置 / 已锁定（这一页不持有任何仓库的钥匙）/ 迁移中 / 旧的未加密仓库。 */
+function statePill(v: VaultCard): HTMLElement {
+	if (v.initState !== "ready") return pill("warn", "warn", "待完成加密设置");
+	if (v.encryptionState === "encrypted") return pill("", "lock", "已锁定");
+	if (v.encryptionState === "migrating") return pill("warn", "refresh", "加密迁移中");
+	return pill("", "info", "未加密（旧仓库）");
 }
 
 function vaultCard(host: PortalHost, me: Me, v: VaultCard): HTMLElement {
 	const card = h("article", "vault-card");
 	const top = h("div", "vault-card-top");
-	top.append(h("h3", "vault-name", v.name || v.id), stateChip(v));
-	if (v.initState === "ready" && host.lastVault?.() === v.id) top.append(h("span", "chip", "上次打开"));
+	const glyph = h("span", "vault-glyph");
+	glyph.append(icon("folder"));
+	const marks = h("div", "vault-marks");
+	if (v.initState === "ready" && host.lastVault?.() === v.id) marks.append(h("span", "chip", "上次打开"));
+	marks.append(statePill(v));
+	top.append(glyph, marks);
 	card.append(top);
-	card.append(h("p", "muted small", v.initState === "ready"
-		? `${v.fileCount} 个文件 · ${fmtBytes(v.bytesUsed)} · ${fmtWhen(v.updatedAt)}`
-		: "这个仓库还没有设置仓库密码，完成之前不能写入任何内容。"));
+	const name = h("h2", "vault-name", v.name || "默认仓库");
+	card.append(name);
+	const stats = h("p", "vault-stats");
+	if (v.initState === "ready") {
+		for (const t of [`${v.fileCount} 个文件`, fmtBytes(v.bytesUsed), fmtWhen(v.updatedAt)]) stats.append(h("span", "", t));
+	} else {
+		stats.append(h("span", "", "这个仓库还没有设置仓库密码，完成之前不能写入任何内容。"));
+	}
+	card.append(stats);
+	const bottom = h("div", "vault-card-bottom");
 	const actions = h("div", "vault-actions");
 	if (v.initState === "ready") {
-		actions.append(button(v.encryptionState === "encrypted" ? "解锁并打开" : "打开", "primary", () => host.openVault(v.id)));
-		const connect = button("连接 Obsidian", "", () => void openConnectDialog(me, v));
+		bottom.append(h("span", "vault-foot muted small", v.encryptionState === "encrypted" ? "独立仓库密码" : "未设置仓库密码"));
+		const connect = labelButton(null, "连接 Obsidian", "btn ghost", () => void openConnectDialog(me, v));
 		connect.disabled = !me.permissions.includes("vault:create");
-		actions.append(connect);
+		actions.append(connect, labelButton("arrow", "打开仓库", "btn open-vault", () => host.openVault(v.id), true));
 	} else {
-		actions.append(button("完成加密设置", "primary", () => openCreateVaultDialog(host, me, v)));
+		bottom.append(h("span", "vault-foot muted small", "还差一步"));
+		actions.append(labelButton(null, "完成加密设置", "btn primary", () => openCreateVaultDialog(host, me, v)));
 	}
 	const more = h("details", "vault-more");
-	more.append(h("summary", "", "更多"));
+	const summary = h("summary");
+	summary.title = "更多操作";
+	summary.append(icon("more"), h("span", "sr-only", "更多操作"));
+	more.append(summary);
 	const menu = h("div", "vault-menu");
 	// 低频操作也用产品内的表单（UI 焕新 U4b / W04）：错误留在表单里，Esc / 取消不提交
 	menu.append(
@@ -353,7 +492,8 @@ function vaultCard(host: PortalHost, me: Me, v: VaultCard): HTMLElement {
 	);
 	more.append(menu);
 	actions.append(more);
-	card.append(actions);
+	bottom.append(actions);
+	card.append(bottom);
 	return card;
 }
 
@@ -657,7 +797,7 @@ export async function openConnectDialog(me: Me, vault: Pick<VaultCard, "id" | "n
 			return;
 		}
 		dlg.body.innerHTML = "";
-		const facts = h("dl", "facts");
+		const facts = h("dl", "facts connect-facts");
 		for (const [k, v] of [
 			["服务器", location.host],
 			["账号", grant.accountLabel || me.account.email],
@@ -681,47 +821,58 @@ export async function openConnectDialog(me: Me, vault: Pick<VaultCard, "id" | "n
 			copyNote.className = "warn-text small copy-note";
 			copyNote.textContent = `${why}链接已经选中，请按 Ctrl+C（Mac 上 ⌘+C；手机上长按选择「拷贝」）。`;
 		};
-		const copy = button("复制链接", touch ? "" : "primary", () => {
+		const copy = labelButton("copy", "复制链接", touch ? "btn" : "btn primary", () => {
 			if (!navigator.clipboard?.writeText) return manualCopy("这个浏览器不能直接复制：");
 			void navigator.clipboard.writeText(url).then(() => {
-				copy.textContent = "已复制 ✓";
+				copy.replaceChildren(icon("check"), h("span", "", "已复制"));
 				copyNote.className = "muted small copy-note";
 				copyNote.textContent = "已复制。把它发到新设备上打开，或者粘贴到那台设备的 LiteSync 插件里。";
 			}, () => manualCopy("浏览器没有允许复制："));
 		});
-		const open = h("a", touch ? "button primary" : "button", "在 Obsidian 中打开");
+		const open = h("a", touch ? "btn primary" : "btn");
+		withIcon(open, "external", "在 Obsidian 中打开");
 		open.href = deep;
 		open.title = "这台设备装了 Obsidian 与 LiteSync 插件时，直接在这里接入";
-		const status = h("p", "muted small");
+		// 规则紧挨着复制按钮：关窗即作废尚未使用的链接；有效时间按服务端返回的到期时间倒数
+		const code = h("div", "pair-code");
+		code.append(link, copy);
+		const warning = h("div", "pair-warning");
+		const warnText = h("div");
+		const status = h("p", "muted small pair-status");
 		status.setAttribute("aria-live", "polite");
+		warnText.append(h("strong", "", "新设备完成接入之前，请保持这个窗口打开。"),
+			h("span", "", "关闭窗口会立即作废还没用过的链接。链接只能使用一次。"), status);
+		warning.append(icon("info"), warnText);
 		const trustNote = grant.trust.mode === "new_vault_genesis"
 			? "这是一个新仓库：新设备会从空白状态开始，不需要继承任何历史信任。"
 			: "首次信任：新设备会信任服务器当前提供的历史起点（与在插件里手动连接时相同）。如需从已信任的设备转移信任，请在那台设备的插件里「添加新设备」。";
 		const actions = h("div", "dialog-actions connect-actions");
-		actions.append(touch ? open : copy, touch ? copy : open);
+		actions.append(open);
+		const grid = h("div", "connect-grid");
+		grid.append(qrWrap, facts);
 		dlg.body.append(
-			h("p", "", touch
+			h("p", "connect-intro", touch
 				? "在这台设备上：点「在 Obsidian 中打开」。要连接另一台设备：用那台设备扫码，或者把链接发过去打开。之后输入这个仓库的仓库密码即可开始同步。"
 				: "连接另一台设备：用它的相机扫码，或者复制链接发过去打开。这台电脑上装了 Obsidian：直接点「在 Obsidian 中打开」。之后输入这个仓库的仓库密码即可开始同步。"),
-			facts, qrWrap, link, actions, copyNote,
-			h("p", "muted small", "链接 5 分钟内有效，只能使用一次。新设备完成接入之前请不要关闭这个窗口：关闭会立即作废还没用过的链接。链接里不包含你的账号密码、仓库密码或任何长期凭据。需要 LiteSync 插件 0.20 或更高版本。"),
-			h("p", "muted small", trustNote), status,
+			grid, code, copyNote, warning, actions,
+			h("p", "muted small", "链接里不包含你的账号密码、仓库密码或任何长期凭据。需要 LiteSync 插件 0.20 或更高版本。"),
+			h("p", "muted small", trustNote),
 		);
 		/** 链接不能再用（过期 / 已被使用）：收起复制与打开，给出下一步。 */
 		const finished = (msg: string, again: string) => {
 			window.clearInterval(timer);
-			status.className = "warn-text small";
+			status.className = "warn-text small pair-status";
 			status.textContent = msg;
 			qrWrap.classList.add("expired");
 			qrWrap.setAttribute("aria-hidden", "true");
 			link.disabled = true;
-			copy.disabled = true;
+			copy.remove();
 			open.removeAttribute("href");
 			open.setAttribute("aria-disabled", "true");
 			copyNote.textContent = "";
 			actions.innerHTML = "";
-			const regen = button(again, "primary", () => void generate());
-			actions.append(button("完成", "ghost", () => dlg.close()), regen);
+			const regen = labelButton("refresh", again, "btn primary", () => void generate());
+			actions.append(button("完成", "btn ghost", () => dlg.close()), regen);
 			regen.focus();
 		};
 		const tick = async () => {
@@ -736,7 +887,7 @@ export async function openConnectDialog(me: Me, vault: Pick<VaultCard, "id" | "n
 				finished("链接已被使用（或已失效）。新设备接入后会出现在「账号与设备」里。", "再连接一台设备");
 				return;
 			}
-			status.className = "muted small";
+			status.className = "muted small pair-status";
 			status.textContent = `剩余有效时间 ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
 		};
 		void tick();
@@ -769,70 +920,145 @@ function qrCanvas(text: string): HTMLCanvasElement {
 
 // ---------------------------------------------------------------- 账号与设备
 
-export async function renderAccountCenter(host: PortalHost, me: Me, cfg: AuthConfig): Promise<void> {
-	const main = shell(host, me, "me");
-	main.append(h("h1", "", "账号与设备"));
+/** 头像里的一个字：昵称的第一个字符；没有昵称时用通用图标（不拿邮箱凑）。 */
+function avatar(displayName: string): HTMLElement {
+	const a = h("div", "avatar");
+	a.setAttribute("aria-hidden", "true");
+	const first = Array.from(displayName.trim())[0];
+	if (first) a.textContent = first.toUpperCase();
+	else a.append(icon("user"));
+	return a;
+}
 
-	const acct = h("section", "panel");
-	acct.append(h("h2", "", "账号"));
-	const facts = h("dl", "facts");
-	facts.append(h("dt", "", "名称"), h("dd", "", me.account.displayName || "—"));
-	facts.append(h("dt", "", "邮箱"), h("dd", "", (me.account.email || "—") + (me.account.email ? (me.account.emailVerified ? "（已验证）" : "（未验证）") : "")));
-	facts.append(h("dt", "", "角色"), h("dd", "", me.role === "admin" ? "实例管理员" : "普通用户"));
-	// 用量与上限（需求 §12：额度在用尽之前就看得到；历史版本计入存储）
-	if (me.usage) {
-		const u = me.usage;
-		facts.append(h("dt", "", "存储"), h("dd", "", `${fmtBytes(u.bytesUsed)} / ${u.bytesLimit > 0 ? fmtBytes(u.bytesLimit) : "不限"}（含历史版本）`));
-		facts.append(h("dt", "", "仓库"), h("dd", "", `${u.vaults} / ${u.vaultsLimit > 0 ? u.vaultsLimit : "不限"}`));
+/** 存储与仓库数（需求 §12：额度在用尽之前就看得到；历史版本计入存储）。只显示服务器返回的真实数值。 */
+function usagePanel(u: Usage): HTMLElement {
+	const p = h("section", "panel usage-panel");
+	p.append(h("h2", "", "仓库用量"));
+	const head = h("div", "capacity-head");
+	head.append(h("strong", "", fmtBytes(u.bytesUsed)), h("span", "", u.bytesLimit > 0 ? `/ ${fmtBytes(u.bytesLimit)}` : "/ 不限"));
+	p.append(head);
+	if (u.bytesLimit > 0) {
+		const bar = h("div", "capacity-bar");
+		bar.setAttribute("aria-hidden", "true");
+		const fill = h("span");
+		const ratio = Math.min(1, u.bytesUsed / u.bytesLimit);
+		fill.style.width = `${Math.max(ratio > 0 ? 2 : 0, Math.round(ratio * 100))}%`;
+		if (ratio >= 0.9) fill.className = "near-full";
+		bar.append(fill);
+		p.append(bar);
 	}
+	const facts = h("dl", "facts usage-facts");
+	facts.append(h("dt", "", "存储"), h("dd", "", `${fmtBytes(u.bytesUsed)} / ${u.bytesLimit > 0 ? fmtBytes(u.bytesLimit) : "不限"}（含历史版本）`));
+	facts.append(h("dt", "", "仓库"), h("dd", "", `${u.vaults} / ${u.vaultsLimit > 0 ? u.vaultsLimit : "不限"}`));
+	p.append(facts);
+	if (u.bytesLimit > 0 && u.bytesUsed >= u.bytesLimit * 0.9) {
+		p.append(h("p", "banner warn", "存储快用完了：超出后新的修改无法保存到服务器（已有内容仍可查看和导出）。可以删除不需要的文件、清理历史版本，或联系管理员调整配额。"));
+	}
+	const link = h("a", "btn text");
+	link.href = "#/vaults";
+	withIcon(link, "arrow", "管理仓库", true);
+	p.append(link);
+	return p;
+}
+
+export async function renderAccountCenter(host: PortalHost, me: Me, cfg: AuthConfig): Promise<void> {
+	const main = shell(host, "me");
+	const toVaults = h("a", "btn");
+	toVaults.href = "#/vaults";
+	withIcon(toVaults, "folder", "我的仓库");
+	main.append(headline("Your LiteSync account", "账号与设备", "管理 LiteSync 的仓库用量和已连接设备。", toVaults));
+	const grid = h("div", "account-grid");
+	const col = h("div", "account-main");
+	const side = h("aside", "account-side");
+	side.setAttribute("aria-label", "用量与账号中心");
+	grid.append(col, side);
+	main.append(grid);
+
+	// 个人资料：昵称（显示名）、邮箱与验证状态；登录用户名只在服务器给出时显示（不从昵称或邮箱推）
+	const acct = h("section", "panel profile-panel");
+	acct.setAttribute("aria-labelledby", "profile-title");
+	const label = h("p", "panel-eyebrow", "个人资料");
+	label.id = "profile-title";
+	const row = h("div", "profile-row");
+	const who = h("div", "profile-who");
+	who.append(h("h2", "", me.account.displayName || "我的账号"), h("p", "", me.account.email || "没有登记邮箱"));
+	row.append(avatar(me.account.displayName), who);
+	acct.append(label, row);
+	const facts = h("dl", "profile-grid");
+	const fact = (k: string, v: string) => {
+		const d = h("div");
+		d.append(h("dt", "", k), h("dd", "", v));
+		facts.append(d);
+	};
+	if (me.account.username) fact("登录用户名", me.account.username);
+	if (me.account.email) fact("邮箱状态", me.account.emailVerified ? "已验证" : "未验证");
+	fact("角色", me.role === "admin" ? "实例管理员" : "普通用户");
 	acct.append(facts);
-	if (me.usage && me.usage.bytesLimit > 0 && me.usage.bytesUsed >= me.usage.bytesLimit * 0.9) {
-		acct.append(h("p", "banner warn", "存储快用完了：超出后新的修改无法保存到服务器（已有内容仍可查看和导出）。可以删除不需要的文件、清理历史版本，或联系管理员调整配额。"));
-	}
 	if (cfg.oidc && !me.identity.linked) {
 		acct.append(h("p", "muted small", "当前用 API Token 登录。绑定统一账号后，可以用邮箱和登录密码进入 LiteSync 与 Nexus Portal；原有仓库、设备与历史全部保留。"));
-		const link = h("a", "button primary", "绑定统一账号");
+		const link = h("a", "btn primary", "绑定统一账号");
 		link.href = "/auth/link/start?returnTo=" + encodeURIComponent("/#/me");
 		acct.append(link);
 	}
 	if (me.accountConsoleUrl) {
-		const a = h("a", "button", "修改登录密码 / 两步验证 / 网页登录");
+		const action = h("div", "profile-action");
+		const a = h("a", "btn");
+		withIcon(a, "external", "管理账号资料", true);
 		a.href = me.accountConsoleUrl;
 		a.rel = "noopener";
+		action.append(h("p", "", "昵称、邮箱、账号密码、两步验证与网页登录在账号中心管理。"), a);
 		// 账号中心只管浏览器里的登录：它的「退出所有浏览器」不会断开 Obsidian（预发布真机验收，2026-11-22）
-		acct.append(a, h("p", "muted small",
-			"这些设置在账号中心管理。账号中心只列出、只退出浏览器里的登录；已连接的 Obsidian 在下面「已授权的设备」里，" +
+		acct.append(action, h("p", "muted small",
+			"账号中心只列出、只退出浏览器里的登录；已连接的 Obsidian 在下面「Obsidian 设备」里，" +
 			"要一次断开全部请用「退出所有产品与设备」。重置登录密码只恢复账号访问，不能解密忘记了仓库密码的仓库。"));
 	}
-	main.append(acct);
+	col.append(acct);
 
 	const devs = h("section", "panel");
-	devs.append(h("h2", "", "已授权的设备"), h("p", "muted small", "设备凭据只授权访问密文，不是解密密钥。撤销后该设备下一次联网即失效；已经下载到设备上的笔记无法远程删除。"));
+	const devTitle = h("div", "panel-title");
+	const devCount = h("span", "small muted");
+	devTitle.append(h("h2", "", "Obsidian 设备"), devCount);
+	devs.append(devTitle, h("p", "small muted panel-lead", "撤销后，这台设备下一次联网就不能再同步；已经下载到设备上的笔记不会被远程删除。设备凭据只能访问密文，不是解密密钥。"));
 	const list = h("div", "device-list");
 	list.append(h("p", "muted", "正在加载…"));
 	devs.append(list);
-	main.append(devs);
+	col.append(devs);
 
-	main.append(revocationSection(me));
+	col.append(revocationSection(me));
 	const history = h("section", "panel");
 	history.append(h("h2", "", "最近的撤销"));
 	const historyList = h("div", "revocation-list");
 	historyList.append(h("p", "muted small", "正在加载…"));
 	history.append(historyList);
-	main.append(history);
+	col.append(history);
 	void renderRevocationHistory(historyList);
+
+	if (me.usage) side.append(usagePanel(me.usage));
+	if (cfg.oidc) {
+		const p = h("section", "panel products-panel");
+		const chips = h("div", "connected-products");
+		for (const [name, text] of [["logo", "LiteSync"], ["box", "Nexus"]] as const) {
+			const c = h("span");
+			c.append(icon(name), h("span", "", text));
+			chips.append(c);
+		}
+		p.append(h("h2", "", "一个账号，两种日常"), h("p", "small muted", "登录资料由账号中心管理。仓库密码仍在 LiteSync 中独立使用。"), chips);
+		side.append(p);
+	}
 
 	try {
 		const devices = await accountApi.devices();
 		list.innerHTML = "";
 		const live = devices.filter((d) => !d.revoked);
-		if (live.length === 0) list.append(h("p", "muted", "还没有设备。在「我的仓库」里点「连接 Obsidian」添加第一台。"));
+		devCount.textContent = live.length ? `${live.length} 台已连接` : "";
+		if (live.length === 0) list.append(h("p", "empty-note", "还没有连接设备。在「我的仓库」里点「连接 Obsidian」添加第一台。"));
 		for (const d of live) {
 			const row = h("div", "device-row");
-			const info = h("div");
-			info.append(h("strong", "", d.name || d.id), h("div", "muted small",
+			const info = h("div", "device-info");
+			info.append(h("strong", "", d.name || d.id), h("small", "",
 				`${d.platform || "未知平台"} · 仓库「${d.vaultName || d.vaultId}」 · ${d.lastSeenAt ? "最近活动 " + new Date(d.lastSeenAt * 1000).toLocaleString() : "尚未联网"}${d.clientVersion ? " · 插件 " + d.clientVersion : ""}`));
-			const rev = button("撤销…", "ghost danger-text", () => {
+			row.append(icon(/ios|iphone|ipad|android|mobile/i.test(d.platform) ? "phone" : "monitor", "device-icon"));
+			const rev = button("撤销…", "btn text danger-text", () => {
 				confirmDialog({
 					title: `撤销「${d.name || d.id}」？`,
 					message: "它下一次联网时就不能再同步，要重新连接才能继续使用。已经下载到它上面的笔记不会被远程删除。",
@@ -948,11 +1174,11 @@ function scopeBlock(title: string, scope: string, action: HTMLElement): { row: H
 function revocationSection(me: Me): HTMLElement {
 	const rc = me.features.revocation;
 	const out = h("section", "panel");
-	out.append(h("h2", "", "退出与撤销"));
+	out.append(h("h2", "", "退出与安全"));
 	out.append(h("p", "muted small", "三种退出的影响范围不同，请按需要选择。任何一种都不会远程删除已经下载到设备上的笔记；设备上还没同步的修改会留在设备上。"));
 
 	// A：只退出这个浏览器
-	const a = button("退出此浏览器", "", () => {
+	const a = button("退出此浏览器", "btn", () => {
 		a.disabled = true;
 		void (me.session.kind === "oidc" ? accountApi.logout() : fetch("/web/session", { method: "DELETE" }))
 			.catch(() => undefined).then(() => {
@@ -970,7 +1196,7 @@ function revocationSection(me: Me): HTMLElement {
 	const tokenNote = me.session.kind === "token"
 		? "你现在用 API Token 登录：这个 API Token 也会一起作废。之后需要用统一账号登录后重置，或由管理员在服务器上运行 obsync token reset。"
 		: "";
-	const b = button("退出 LiteSync 的全部设备…", "danger", () => {
+	const b = button("退出 LiteSync 的全部设备…", "btn danger", () => {
 		confirmDialog({
 			title: "退出 LiteSync 的全部设备？",
 			message: bScope + (tokenNote ? "\n\n" + tokenNote : ""),
@@ -1002,7 +1228,7 @@ function revocationSection(me: Me): HTMLElement {
 	const linked = me.identity.linked && me.features.oidc;
 	const cScope = "包括上一项的全部，并且：结束你在身份中心所有浏览器里的登录；通知 Nexus Portal 撤销它那边的全部网页登录、设备与扩展授权。" +
 		"每一步的结果都会如实显示，没送达的可以重新发送。";
-	const c = button("退出所有产品与设备…", "danger", () => {
+	const c = button("退出所有产品与设备…", "btn danger", () => {
 		confirmDialog({
 			title: "退出所有产品与设备？",
 			message: cScope,
@@ -1030,7 +1256,7 @@ function revocationSection(me: Me): HTMLElement {
 	out.append(cBlock.row);
 
 	if (me.session.kind === "token") {
-		const adv = h("a", "button ghost", "API Token（高级）");
+		const adv = h("a", "btn ghost", "API Token（高级）");
 		adv.href = "#/account";
 		out.append(adv);
 	}

@@ -2,6 +2,7 @@
  * 产品内的对话框与抽屉（UI 规格 §6「焦点」，UI 焕新 U4 / U4b）：
  * 打开时焦点进入，Tab 不离开，Esc 或点遮罩关闭，关闭后焦点回到触发它的按钮。
  */
+import { icon } from "./icons";
 
 function h<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
 	const n = document.createElement(tag);
@@ -37,7 +38,8 @@ export function openDialog(title: string, onClose?: () => void): { body: HTMLEle
 	const t = h("h2", "dialog-title", title);
 	t.id = "dlg-" + Math.random().toString(36).slice(2);
 	dlg.setAttribute("aria-labelledby", t.id);
-	const x = h("button", "icon-btn dialog-close", "✕");
+	const x = h("button", "icon-btn dialog-close");
+	x.append(icon("close"));
 	x.type = "button";
 	x.onclick = () => close();
 	x.setAttribute("aria-label", "关闭");
@@ -90,7 +92,7 @@ export function openDrawer(o: { id: string; title: string; opener?: HTMLElement 
 	t.id = `${o.id}-title`;
 	t.tabIndex = -1;
 	panel.setAttribute("aria-labelledby", t.id);
-	const x = h("button", "ghost small-btn", "关闭");
+	const x = h("button", "btn ghost small-btn", "关闭");
 	x.type = "button";
 	x.onclick = () => close();
 	head.append(t, x);

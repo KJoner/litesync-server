@@ -648,7 +648,11 @@ export interface AuthConfig {
 }
 
 export interface Me {
-	account: { id: string; displayName: string; email: string; emailVerified: boolean };
+	/**
+	 * displayName：昵称 → 旧的姓名 → 登录用户名（服务端按此顺序取，可能为空）。
+	 * username：账号中心的登录用户名快照（只用于展示；旧账号就是邮箱；没有时不出现）——绝不从昵称或邮箱推出来。
+	 */
+	account: { id: string; displayName: string; email: string; emailVerified: boolean; username?: string };
 	role: "admin" | "user";
 	permissions: string[];
 	vaultCount: number;
