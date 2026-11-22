@@ -613,7 +613,7 @@ func TestRevocationActionCIdentityCenterFailureIsReported(t *testing.T) {
 	b1, _ := e.loginAs(t, "gwen-sub")
 	_, out := b1.do(http.MethodPost, "/api/v2/account/logout-all", nil, nil)
 	ic := out["identityCenter"].(map[string]any)
-	if out["ok"] != false || ic["state"] != "failed" || ic["error"] != "forbidden" || ic["accountConsoleUrl"] != e.idp.issuer+"/account" {
+	if out["ok"] != false || ic["state"] != "failed" || ic["error"] != "forbidden" || ic["accountConsoleUrl"] != e.idp.issuer+"/account?referrer=litesync-web" {
 		t.Fatalf("identity-center failure must be reported with the account console URL, got %v", out)
 	}
 	if es, _ := out["endSessionUrl"].(string); !strings.HasPrefix(es, e.idp.issuer+"/logout?") {

@@ -156,8 +156,9 @@ func (rp *oidcRP) ensure(ctx context.Context) error {
 	}
 	_ = p.Claims(&extra) //nolint:errcheck // 可选字段
 	rp.endSess = extra.EndSession
-	// Keycloak 的账号控制台（改密码、MFA、会话管理）；其他实现没有就不显示
-	rp.acctURL = strings.TrimRight(rp.opts.Issuer, "/") + "/account"
+	// Keycloak 的账号控制台（改密码、MFA、会话管理）；其他实现没有就不显示。
+	// ?referrer=<client>：账号中心页头显示「回到 LiteSync」（回到 client 的 baseUrl，Keycloak 自带）。
+	rp.acctURL = strings.TrimRight(rp.opts.Issuer, "/") + "/account?referrer=" + url.QueryEscape(rp.opts.ClientID)
 	rp.provider = p
 	return nil
 }
