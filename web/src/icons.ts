@@ -47,6 +47,13 @@ const PATHS = {
 	box: '<path d="m3 7 9-5 9 5v11l-9 5-9-5ZM3 7l9 5 9-5M12 12v11"/>',
 	link: '<path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
 	checksquare: '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="m7 12 3 3 7-7"/>',
+	// 编辑器格式栏（用户决定：emoji 换成图标；只换外观，按钮的动作与快捷行为不变）
+	heading: '<path d="M6 4v16M17 4v16M6 12h11"/>',
+	bold: '<path d="M7 4h6a4 4 0 0 1 0 8H7Z"/><path d="M7 12h7.5a4 4 0 0 1 0 8H7Z"/>',
+	italic: '<path d="M10 4h8M6 20h8M14.5 4l-5 16"/>',
+	list: '<path d="M10 6h10M10 12h10M10 18h10"/><circle cx="5" cy="6" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="5" cy="18" r="1"/>',
+	task: '<rect x="3" y="4" width="7" height="7" rx="1.5"/><path d="m4.5 17 1.8 1.8L9.5 15.5M14 7.5h7M14 17h7"/>',
+	code: '<path d="m8 7-5 5 5 5M16 7l5 5-5 5"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

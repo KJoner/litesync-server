@@ -31,6 +31,7 @@ import {
 	uploadPrepared,
 	WriteKeys,
 } from "./write";
+import { icon, type IconName } from "./icons";
 
 export interface EditorHandle {
 	getText(): string;
@@ -193,18 +194,23 @@ export class NoteEditor {
 		}
 		this.toolbarEl = document.createElement("div");
 		this.toolbarEl.className = "fmt-bar";
-		for (const [label, title, fn] of [
-			["H", "标题", () => this.editor?.prefixLines("## ")],
-			["B", "粗体", () => this.editor?.wrap("**", "**", "粗体")],
-			["I", "斜体", () => this.editor?.wrap("*", "*", "斜体")],
-			["•", "列表", () => this.editor?.prefixLines("- ")],
-			["☐", "任务", () => this.editor?.prefixLines("- [ ] ")],
-			["🔗", "链接", () => this.editor?.wrap("[", "](https://)", "链接文字")],
-			["</>", "代码", () => this.editor?.wrap("`", "`", "代码")],
-		] as const) {
+		this.toolbarEl.setAttribute("role", "toolbar");
+		this.toolbarEl.setAttribute("aria-label", "格式");
+		// 用户决定（UI v2）：格式栏的 emoji / 字母换成统一的线性图标（icons.ts）。只换外观：
+		// 每个按钮插入的 Markdown、可读名称（aria-label）与悬停提示都不变。
+		for (const [name, title, fn] of [
+			["heading", "标题", () => this.editor?.prefixLines("## ")],
+			["bold", "粗体", () => this.editor?.wrap("**", "**", "粗体")],
+			["italic", "斜体", () => this.editor?.wrap("*", "*", "斜体")],
+			["list", "列表", () => this.editor?.prefixLines("- ")],
+			["task", "任务", () => this.editor?.prefixLines("- [ ] ")],
+			["link", "链接", () => this.editor?.wrap("[", "](https://)", "链接文字")],
+			["code", "代码", () => this.editor?.wrap("`", "`", "代码")],
+		] as const satisfies readonly (readonly [IconName, string, () => void])[]) {
 			const b = document.createElement("button");
 			b.type = "button";
-			b.textContent = label;
+			b.className = "fmt-btn";
+			b.append(icon(name));
 			b.title = title;
 			b.setAttribute("aria-label", title);
 			b.onclick = fn;
@@ -222,7 +228,8 @@ export class NoteEditor {
 		};
 		const attachBtn = document.createElement("button");
 		attachBtn.type = "button";
-		attachBtn.textContent = "📎";
+		attachBtn.className = "fmt-btn";
+		attachBtn.append(icon("attachment"));
 		attachBtn.title = "上传附件（也可以直接粘贴或拖入）";
 		attachBtn.setAttribute("aria-label", "上传附件");
 		attachBtn.onclick = () => attachInput.click();

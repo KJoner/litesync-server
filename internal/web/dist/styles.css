@@ -2524,6 +2524,19 @@ input[aria-invalid="true"] {
 .fmt-bar button:hover:not(:disabled) {
 	background: var(--bg-hover);
 }
+.fmt-bar .fmt-btn {
+	display: inline-grid;
+	place-items: center;
+	color: var(--muted);
+}
+.fmt-bar .fmt-btn:hover:not(:disabled),
+.fmt-bar .fmt-btn:focus-visible {
+	color: var(--text);
+}
+.fmt-bar .fmt-btn svg.icon {
+	width: 17px;
+	height: 17px;
+}
 .save-status {
 	margin-left: auto;
 	font-size: 12.5px;

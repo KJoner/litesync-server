@@ -82,6 +82,8 @@ const g = globalThis as any;
 g.window = globalThis;
 g.document = {
 	createElement: (t: string) => new FakeEl(t),
+	// 格式栏的图标（icons.ts 的内联 SVG）
+	createElementNS: (_ns: string, t: string) => new FakeEl(t),
 	createTextNode: (d: string) => ({ data: d }),
 	head: { append() {} },
 	body: { append() {} },
